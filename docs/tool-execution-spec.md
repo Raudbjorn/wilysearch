@@ -1,10 +1,10 @@
-# Tool Execution Architecture for meilisearch-lib
+# Tool Execution Architecture for wilysearch
 
 ## Phase 1: Requirements
 
 ### Context
 
-The `meilisearch-lib` crate provides an embedded Rust API for Meilisearch. Currently, it has basic chat completion support but lacks tool/function calling capabilities that exist in the HTTP routes (`crates/meilisearch/src/routes/chats/`).
+The `wilysearch` crate provides an embedded Rust API wrapping milli (the Meilisearch indexing engine). This document specifies a future tool/function calling architecture for LLM integration.
 
 ### User Stories
 
@@ -80,7 +80,7 @@ The `meilisearch-lib` crate provides an embedded Rust API for Meilisearch. Curre
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     MeilisearchLib                          │
+│                     Wilysearch                          │
 ├─────────────────────────────────────────────────────────────┤
 │  chat_completion_with_tools(&self, request, tools, executor)│
 │                            │                                │

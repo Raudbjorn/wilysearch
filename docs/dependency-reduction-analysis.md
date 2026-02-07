@@ -1,10 +1,10 @@
-# Dependency Reduction Analysis: meilisearch-lib
+# Dependency Reduction Analysis: wilysearch
 
 ## Phase 1: Requirements Analysis
 
 ### Current State Assessment
 
-**meilisearch-lib** currently wraps `milli` directly, providing:
+**wilysearch** currently wraps `milli` directly, providing:
 - Index management (create, delete, list indexes)
 - Document CRUD operations
 - Keyword search with filters and ranking
@@ -204,7 +204,7 @@ Start with preprocessing extraction, then optionally replace vector backend.
 
 ## Recommendation
 
-### For TTTRPS Migration (1K-10K documents)
+### For Small-to-Medium Datasets (1K-10K documents)
 
 **Recommended: Scenario A + sqlite-vec (Scenario B)**
 
