@@ -35,12 +35,10 @@ rayon = "1.10"
 bumpalo = "3.16"
 fst = "0.4"
 
-# I/O
-tempfile = "3.15"
-
 # Query preprocessing
 symspell = "0.4"
 strsim = "0.11"
+unicode-normalization = "0.1"
 
 # candle-core 0.9.2 pulls in zip 7.x -> typed-path 0.12, which introduces an
 # ambiguous AsRef impl that breaks milli. Pin to 0.9.1 to match upstream's

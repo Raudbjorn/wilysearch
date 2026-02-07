@@ -141,14 +141,35 @@ pub struct SurrealDbVectorStore {
     runtime: Arc<Runtime>,
 }
 
+/// Validate that a SurrealDB identifier (table, namespace, database) contains
+/// only alphanumeric characters and underscores. This prevents query injection
+/// via format!-interpolated identifiers in SurrealQL strings.
+fn validate_identifier(name: &str, label: &str) -> Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("{label} must not be empty");
+    }
+    if !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        anyhow::bail!(
+            "{label} '{}' contains invalid characters; only alphanumeric and underscores are allowed",
+            name
+        );
+    }
+    Ok(())
+}
+
 impl SurrealDbVectorStore {
     /// Create a new SurrealDB vector store.
     ///
     /// This will:
-    /// 1. Connect to the SurrealDB instance
-    /// 2. Select the namespace and database
-    /// 3. Create/verify the table schema and HNSW index
+    /// 1. Validate identifier names (table, namespace, database)
+    /// 2. Connect to the SurrealDB instance
+    /// 3. Select the namespace and database
+    /// 4. Create/verify the table schema and HNSW index
     pub async fn new(config: SurrealDbVectorStoreConfig) -> Result<Self> {
+        validate_identifier(&config.table, "table")?;
+        validate_identifier(&config.namespace, "namespace")?;
+        validate_identifier(&config.database, "database")?;
+
         let db = connect(&config.connection_string)
             .await
             .context("Failed to connect to SurrealDB")?;
@@ -193,6 +214,10 @@ impl SurrealDbVectorStore {
         config: SurrealDbVectorStoreConfig,
         runtime: Arc<Runtime>,
     ) -> Result<Self> {
+        validate_identifier(&config.table, "table")?;
+        validate_identifier(&config.namespace, "namespace")?;
+        validate_identifier(&config.database, "database")?;
+
         let db = connect(&config.connection_string)
             .await
             .context("Failed to connect to SurrealDB")?;
@@ -230,8 +255,9 @@ impl SurrealDbVectorStore {
         let hnsw_ef = self.config.hnsw_ef;
 
         // Define the table and fields
+        // Quantized uses int (0/1) for binary quantization; standard uses float.
         let type_spec = if self.config.quantized {
-            "array<float>"
+            "array<int>"
         } else {
             "array<float>"
         };
@@ -244,7 +270,7 @@ impl SurrealDbVectorStore {
             DEFINE FIELD IF NOT EXISTS text_content ON {table} TYPE option<string>;
             DEFINE INDEX IF NOT EXISTS {table}_vec ON {table} FIELDS embedding
                 HNSW DIMENSION {dimensions} DIST COSINE TYPE F32 EFC {hnsw_ef} M {hnsw_m};
-            DEFINE INDEX IF NOT EXISTS {table}_doc ON {table} FIELDS doc_id UNIQUE;
+            DEFINE INDEX IF NOT EXISTS {table}_doc ON {table} FIELDS doc_id;
             "#
         );
 
@@ -263,12 +289,26 @@ impl SurrealDbVectorStore {
     }
 
     /// Add documents with their vectors asynchronously.
+    ///
+    /// For each document, this first deletes any existing vector records for that
+    /// `doc_id`, then inserts the new vectors. This prevents stale records when a
+    /// document is re-indexed with fewer vectors than before.
     pub async fn add_documents_async(&self, documents: &[(u32, Vec<Vec<f32>>)]) -> Result<()> {
         let table = &self.config.table;
 
         for (doc_id, vectors) in documents {
-            // For documents with multiple vectors, we store each with an index suffix
-            // or just the first one if there's only one
+            // Delete existing vectors for this doc_id to prevent stale records
+            // when a document is updated with fewer vectors than before.
+            let delete_query = format!(
+                r#"DELETE FROM {table} WHERE doc_id = $doc_id;"#
+            );
+            self.db
+                .query(&delete_query)
+                .bind(("doc_id", *doc_id))
+                .await
+                .with_context(|| format!("Failed to delete old vectors for document {}", doc_id))?;
+
+            // Insert new vectors
             for (vec_idx, vector) in vectors.iter().enumerate() {
                 let record_id = if vectors.len() == 1 {
                     format!("{}", doc_id)
@@ -276,10 +316,9 @@ impl SurrealDbVectorStore {
                     format!("{}_{}", doc_id, vec_idx)
                 };
 
-                // Use UPSERT to handle existing documents
                 let query = format!(
                     r#"
-                    UPSERT {table}:`{record_id}` CONTENT {{
+                    CREATE {table}:`{record_id}` CONTENT {{
                         doc_id: $doc_id,
                         embedding: $embedding
                     }};
@@ -291,7 +330,7 @@ impl SurrealDbVectorStore {
                     .bind(("doc_id", *doc_id))
                     .bind(("embedding", vector.clone()))
                     .await
-                    .with_context(|| format!("Failed to upsert document {}", doc_id))?;
+                    .with_context(|| format!("Failed to insert vector for document {}", doc_id))?;
             }
         }
 
@@ -331,16 +370,18 @@ impl SurrealDbVectorStore {
     ) -> Result<Vec<(u32, f32)>> {
         let table = &self.config.table;
 
-        // Build the query based on whether we have a filter
-        let query = if let Some(bitmap) = filter {
-            // Convert bitmap to a list of allowed doc_ids
-            let allowed_ids: Vec<u32> = bitmap.iter().collect();
+        // Convert bitmap once, reuse for both query building and binding
+        let allowed_ids: Option<Vec<u32>> = filter.map(|b| b.iter().collect());
 
-            if allowed_ids.is_empty() {
+        if let Some(ref ids) = allowed_ids {
+            if ids.is_empty() {
                 return Ok(Vec::new());
             }
+        }
 
-            format!(
+        // Build and execute the query
+        let mut response = if let Some(ref ids) = allowed_ids {
+            let query = format!(
                 r#"
                 SELECT doc_id, vector::distance::knn() AS distance
                 FROM {table}
@@ -349,9 +390,16 @@ impl SurrealDbVectorStore {
                 ORDER BY distance
                 LIMIT {limit};
                 "#
-            )
+            );
+
+            self.db
+                .query(&query)
+                .bind(("query_vec", vector.to_vec()))
+                .bind(("allowed_ids", ids.clone()))
+                .await
+                .context("Failed to execute vector search")?
         } else {
-            format!(
+            let query = format!(
                 r#"
                 SELECT doc_id, vector::distance::knn() AS distance
                 FROM {table}
@@ -359,18 +407,8 @@ impl SurrealDbVectorStore {
                 ORDER BY distance
                 LIMIT {limit};
                 "#
-            )
-        };
+            );
 
-        let mut response = if let Some(bitmap) = filter {
-            let allowed_ids: Vec<u32> = bitmap.iter().collect();
-            self.db
-                .query(&query)
-                .bind(("query_vec", vector.to_vec()))
-                .bind(("allowed_ids", allowed_ids))
-                .await
-                .context("Failed to execute vector search")?
-        } else {
             self.db
                 .query(&query)
                 .bind(("query_vec", vector.to_vec()))
@@ -543,7 +581,8 @@ impl SurrealDbVectorStore {
 
         let mut response = self.db.query(&query).await.context("Failed to get stats")?;
 
-        let stats: Vec<StatsResult> = response.take(0usize).unwrap_or_default();
+        let stats: Vec<StatsResult> = response.take(0usize)
+            .context("Failed to parse stats result")?;
 
         let stats_first = stats.into_iter().next();
 
@@ -576,6 +615,15 @@ impl VectorStore for SurrealDbVectorStore {
 
         self.runtime.block_on(async move {
             for (doc_id, vectors) in &documents {
+                // Delete existing vectors for this doc_id to prevent stale records
+                let delete_query = format!(
+                    r#"DELETE FROM {table} WHERE doc_id = $doc_id;"#
+                );
+                db.query(&delete_query)
+                    .bind(("doc_id", *doc_id))
+                    .await
+                    .with_context(|| format!("Failed to delete old vectors for document {}", doc_id))?;
+
                 for (vec_idx, vector) in vectors.iter().enumerate() {
                     let record_id = if vectors.len() == 1 {
                         format!("{}", doc_id)
@@ -585,7 +633,7 @@ impl VectorStore for SurrealDbVectorStore {
 
                     let query = format!(
                         r#"
-                        UPSERT {table}:`{record_id}` CONTENT {{
+                        CREATE {table}:`{record_id}` CONTENT {{
                             doc_id: $doc_id,
                             embedding: $embedding
                         }};
@@ -596,7 +644,7 @@ impl VectorStore for SurrealDbVectorStore {
                         .bind(("doc_id", *doc_id))
                         .bind(("embedding", vector.clone()))
                         .await
-                        .with_context(|| format!("Failed to upsert document {}", doc_id))?;
+                        .with_context(|| format!("Failed to insert vector for document {}", doc_id))?;
                 }
             }
             Ok(())

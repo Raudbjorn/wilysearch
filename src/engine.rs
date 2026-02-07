@@ -60,10 +60,9 @@ impl Engine {
 }
 
 fn now_iso8601() -> String {
-    let d = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("1970-01-01T00:00:00.000Z+{}s", d.as_secs())
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
 // ─── Type conversion helpers ─────────────────────────────────────────────────
@@ -268,8 +267,12 @@ fn convert_settings_to_lib(s: &Settings) -> crate::core::Settings {
                 m.iter()
                     .map(|(k, v)| {
                         let sort = match v.as_str() {
+                            "alpha" => crate::core::settings::FacetValuesSort::Alpha,
                             "count" => crate::core::settings::FacetValuesSort::Count,
-                            _ => crate::core::settings::FacetValuesSort::Alpha,
+                            _ => {
+                                log::warn!("unknown facet sort value '{v}', defaulting to alpha");
+                                crate::core::settings::FacetValuesSort::Alpha
+                            }
                         };
                         (k.clone(), sort)
                     })
@@ -289,8 +292,12 @@ fn convert_settings_to_lib(s: &Settings) -> crate::core::Settings {
     }
     if let Some(ref prec) = s.proximity_precision {
         let lib_prec = match prec.as_str() {
+            "byWord" => crate::core::settings::ProximityPrecision::ByWord,
             "byAttribute" => crate::core::settings::ProximityPrecision::ByAttribute,
-            _ => crate::core::settings::ProximityPrecision::ByWord,
+            _ => {
+                log::warn!("unknown proximity_precision '{prec}', defaulting to byWord");
+                crate::core::settings::ProximityPrecision::ByWord
+            }
         };
         ms = ms.with_proximity_precision(lib_prec);
     }
@@ -318,14 +325,7 @@ fn convert_settings_to_lib(s: &Settings) -> crate::core::Settings {
             .iter()
             .map(|(k, v)| {
                 let mut es = crate::core::EmbedderSettings::default();
-                let source = match v.source.as_str() {
-                    "openAi" => crate::core::EmbedderSource::OpenAi,
-                    "huggingFace" => crate::core::EmbedderSource::HuggingFace,
-                    "ollama" => crate::core::EmbedderSource::Ollama,
-                    "userProvided" => crate::core::EmbedderSource::UserProvided,
-                    "rest" => crate::core::EmbedderSource::Rest,
-                    _ => crate::core::EmbedderSource::default(),
-                };
+                let source = parse_embedder_source(&v.source);
                 es.source = Some(source);
                 es.api_key = v.api_key.clone();
                 es.model = v.model.clone();
@@ -337,6 +337,18 @@ fn convert_settings_to_lib(s: &Settings) -> crate::core::Settings {
         ms = ms.with_embedders(lib_embs);
     }
     ms
+}
+
+/// Parse an embedder source string, accepting both camelCase and lowercase variants.
+fn parse_embedder_source(s: &str) -> crate::core::EmbedderSource {
+    match s {
+        "openai" | "openAi" => crate::core::EmbedderSource::OpenAi,
+        "huggingface" | "huggingFace" => crate::core::EmbedderSource::HuggingFace,
+        "ollama" => crate::core::EmbedderSource::Ollama,
+        "userprovided" | "userProvided" => crate::core::EmbedderSource::UserProvided,
+        "rest" => crate::core::EmbedderSource::Rest,
+        _ => crate::core::EmbedderSource::default(),
+    }
 }
 
 fn convert_settings_from_lib(s: &crate::core::Settings) -> Settings {
@@ -1037,19 +1049,23 @@ impl traits::SettingsApi for Engine {
     }
     fn update_faceting(&self, index_uid: &str, config: &Faceting) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
+        let sort_map = if let Some(m) = config.sort_facet_values_by.as_ref() {
+            let mut result = std::collections::BTreeMap::new();
+            for (k, v) in m {
+                let sort = match v.as_str() {
+                    "alpha" => crate::core::settings::FacetValuesSort::Alpha,
+                    "count" => crate::core::settings::FacetValuesSort::Count,
+                    other => return Err(format!("invalid facet sort value: '{other}', expected 'alpha' or 'count'").into()),
+                };
+                result.insert(k.clone(), sort);
+            }
+            Some(result)
+        } else {
+            None
+        };
         idx.update_faceting(crate::core::settings::FacetingSettings {
             max_values_per_facet: config.max_values_per_facet.map(|v| v as usize),
-            sort_facet_values_by: config.sort_facet_values_by.as_ref().map(|m| {
-                m.iter()
-                    .map(|(k, v)| {
-                        let sort = match v.as_str() {
-                            "count" => crate::core::settings::FacetValuesSort::Count,
-                            _ => crate::core::settings::FacetValuesSort::Alpha,
-                        };
-                        (k.clone(), sort)
-                    })
-                    .collect()
-            }),
+            sort_facet_values_by: sort_map,
         })?;
         Ok(self.next_task("settingsUpdate", Some(index_uid)))
     }
@@ -1119,8 +1135,9 @@ impl traits::SettingsApi for Engine {
     fn update_proximity_precision(&self, index_uid: &str, precision: &str) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         let p = match precision {
+            "byWord" => crate::core::settings::ProximityPrecision::ByWord,
             "byAttribute" => crate::core::settings::ProximityPrecision::ByAttribute,
-            _ => crate::core::settings::ProximityPrecision::ByWord,
+            other => return Err(format!("invalid proximity_precision: '{other}', expected 'byWord' or 'byAttribute'").into()),
         };
         idx.update_proximity_precision(p)?;
         Ok(self.next_task("settingsUpdate", Some(index_uid)))
@@ -1251,14 +1268,7 @@ impl traits::SettingsApi for Engine {
             .iter()
             .map(|(k, v)| {
                 let mut es = crate::core::EmbedderSettings::default();
-                let source = match v.source.as_str() {
-                    "openai" | "openAi" => crate::core::EmbedderSource::OpenAi,
-                    "huggingface" | "huggingFace" => crate::core::EmbedderSource::HuggingFace,
-                    "ollama" => crate::core::EmbedderSource::Ollama,
-                    "userprovided" | "userProvided" => crate::core::EmbedderSource::UserProvided,
-                    "rest" => crate::core::EmbedderSource::Rest,
-                    _ => crate::core::EmbedderSource::default(),
-                };
+                let source = parse_embedder_source(&v.source);
                 es.source = Some(source);
                 es.api_key = v.api_key.clone();
                 es.model = v.model.clone();

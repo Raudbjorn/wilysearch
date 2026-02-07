@@ -477,7 +477,9 @@ impl DocumentLike for String {
 
     fn snippet(&self) -> String {
         if self.len() > 200 {
-            format!("{}...", &self[..200])
+            // Find a char boundary at or before byte 200 to avoid panicking on multi-byte UTF-8
+            let end = self.floor_char_boundary(200);
+            format!("{}...", &self[..end])
         } else {
             self.clone()
         }
@@ -502,7 +504,8 @@ impl DocumentLike for serde_json::Value {
         for field in ["content", "text", "body", "description", "summary"] {
             if let Some(text) = self.get(field).and_then(|v| v.as_str()) {
                 if text.len() > 200 {
-                    return format!("{}...", &text[..200]);
+                    let end = text.floor_char_boundary(200);
+                    return format!("{}...", &text[..end]);
                 } else {
                     return text.to_string();
                 }
@@ -512,7 +515,8 @@ impl DocumentLike for serde_json::Value {
         // Fall back to stringified JSON
         let s = self.to_string();
         if s.len() > 200 {
-            format!("{}...", &s[..200])
+            let end = s.floor_char_boundary(200);
+            format!("{}...", &s[..end])
         } else {
             s
         }

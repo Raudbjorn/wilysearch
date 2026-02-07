@@ -16,14 +16,14 @@ use wilysearch::core::{
     QueryPipeline, QueryPipelineBuilder, SynonymMap, TypoConfig, TypoCorrector,
 };
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ======================================================================
     // 1. Manual pipeline construction
     // ======================================================================
     println!("=== 1. Manual pipeline construction ===\n");
 
     // -- Create a typo corrector with a small dictionary --
-    let mut typo_corrector = TypoCorrector::new(TypoConfig::default());
+    let mut typo_corrector = TypoCorrector::new(TypoConfig::default())?;
     // Load some words so the corrector can suggest corrections.
     // In production, you would load a full dictionary file.
     typo_corrector.load_dictionary([
@@ -117,7 +117,7 @@ fn main() {
         .one_way_synonyms("filter", &["where clause", "predicate"])
         .max_expansions(5)
         .lowercase()
-        .build();
+        .build()?;
 
     let processed = pipeline.process("  SEARCH Filter  ");
     println!("Input:     \"{}\"", processed.original);
@@ -190,4 +190,5 @@ fn main() {
     );
 
     println!("\nDone.");
+    Ok(())
 }

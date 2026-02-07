@@ -128,7 +128,7 @@ Start with preprocessing extraction, then optionally replace vector backend.
 ```
 - [ ] 1. Query Preprocessing Module
   - [ ] 1.1 Add SymSpell dependency and create TypoCorrector
-    - Add `symspell = "0.5"` to Cargo.toml
+    - Add `symspell = "0.4"` to Cargo.toml
     - Create `src/preprocessing/typo.rs`
     - Implement TypoCorrector with TTRPG corpus support
     - Implement Meilisearch-compatible length rules (5 chars = 1 typo, 9 chars = 2 typos)

@@ -79,8 +79,23 @@ impl Index {
     ///
     /// Returns an error if a document is not a JSON object or if the indexing
     /// operation fails.
-    pub fn add_documents(&self, documents: Vec<Value>, _primary_key: Option<&str>) -> Result<()> {
+    pub fn add_documents(&self, documents: Vec<Value>, primary_key: Option<&str>) -> Result<()> {
         let mut wtxn = self.inner.write_txn().map_err(|e| Error::Heed(e))?;
+
+        // If a primary key is provided and the index doesn't have one yet, set it
+        if let Some(pk) = primary_key {
+            let existing_pk = self.inner.primary_key(&wtxn).map_err(Error::Heed)?;
+            if existing_pk.is_none() {
+                let indexer_config = IndexerConfig::default();
+                let mut settings = milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
+                settings.set_primary_key(pk.to_string());
+                let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
+                let embedder_stats = Arc::new(EmbedderStats::default());
+                let progress = milli::progress::Progress::default();
+                settings.execute(&|| false, &progress, &ip_policy, embedder_stats)
+                    .map_err(Error::Milli)?;
+            }
+        }
 
         let config = milli::update::IndexDocumentsConfig::default();
         let indexer_config = IndexerConfig::default();
@@ -137,10 +152,25 @@ impl Index {
     /// which merges the provided fields into existing documents rather than
     /// replacing them entirely. Only the fields present in the new document
     /// are overwritten; other existing fields are preserved.
-    pub fn update_documents(&self, documents: Vec<Value>, _primary_key: Option<&str>) -> Result<()> {
+    pub fn update_documents(&self, documents: Vec<Value>, primary_key: Option<&str>) -> Result<()> {
         use milli::update::IndexDocumentsMethod;
 
         let mut wtxn = self.inner.write_txn().map_err(|e| Error::Heed(e))?;
+
+        // If a primary key is provided and the index doesn't have one yet, set it
+        if let Some(pk) = primary_key {
+            let existing_pk = self.inner.primary_key(&wtxn).map_err(Error::Heed)?;
+            if existing_pk.is_none() {
+                let indexer_config = IndexerConfig::default();
+                let mut settings = milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
+                settings.set_primary_key(pk.to_string());
+                let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
+                let embedder_stats = Arc::new(EmbedderStats::default());
+                let progress = milli::progress::Progress::default();
+                settings.execute(&|| false, &progress, &ip_policy, embedder_stats)
+                    .map_err(Error::Milli)?;
+            }
+        }
 
         let config = milli::update::IndexDocumentsConfig {
             update_method: IndexDocumentsMethod::UpdateDocuments,
@@ -375,7 +405,8 @@ impl Index {
         // ------------------------------------------------------------------
         let result = search.execute().map_err(Error::Milli)?;
 
-        // Get the documents
+        // Get the documents -- preserve milli IDs for hybrid search merging
+        let returned_doc_ids = result.documents_ids.clone();
         let documents = self.inner.documents(&rtxn, result.documents_ids.clone()).map_err(Error::Milli)?;
         let fields_ids_map = self.inner.fields_ids_map(&rtxn).map_err(Error::Heed)?;
 
@@ -536,17 +567,20 @@ impl Index {
         // Build result (page-based or offset/limit)
         // ------------------------------------------------------------------
         let mut search_result = if use_page_pagination {
-            SearchResult::new_paginated(
+            let mut r = SearchResult::new_paginated(
                 hits,
                 query_string,
                 processing_time_ms,
                 total_hits,
                 page_val,
                 hpp_val,
-            )
+            );
+            r.document_ids = returned_doc_ids;
+            r
         } else {
-            SearchResult::new(
+            SearchResult::with_document_ids(
                 hits,
+                returned_doc_ids,
                 query_string,
                 processing_time_ms,
                 total_hits,
@@ -800,14 +834,13 @@ impl Index {
         let mut score_map: std::collections::HashMap<u32, ScoredEntry> =
             std::collections::HashMap::new();
 
-        // Add keyword results
-        // Note: we need to get document IDs from keyword search
-        // Since keyword_result.hits contains documents, we need to extract IDs
-        // For now, we'll use the index in the hits list as a proxy
+        // Add keyword results using the actual milli document IDs
         for (idx, hit) in keyword_result.hits.iter().enumerate() {
-            // Extract document ID from the hit if possible
-            // This is a simplification - in production you'd want to track IDs properly
-            let doc_id = idx as u32; // placeholder - we need the actual doc ID
+            let doc_id = keyword_result
+                .document_ids
+                .get(idx)
+                .copied()
+                .unwrap_or(idx as u32);
 
             let keyword_score = hit.ranking_score.unwrap_or(1.0);
             let combined = keyword_score * keyword_weight;

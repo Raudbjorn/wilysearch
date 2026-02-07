@@ -227,26 +227,28 @@ impl TypoCorrector {
     ///
     /// Note: You must load a dictionary before using the corrector.
     /// Use `load_dictionary` or `load_dictionary_from_file` to load words.
-    pub fn new(config: TypoConfig) -> Self {
+    pub fn new(config: TypoConfig) -> Result<Self> {
         let symspell: SymSpell<AsciiStringStrategy> = SymSpellBuilder::default()
             .max_dictionary_edit_distance(config.max_edit_distance)
             .prefix_length(7)
             .count_threshold(1)
             .build()
-            .unwrap();
+            .map_err(|e| PreprocessingError::InvalidConfig(
+                format!("Failed to build SymSpell engine: {}", e),
+            ))?;
 
-        Self {
+        Ok(Self {
             symspell,
             config,
             protected_words: HashSet::new(),
             dictionary_loaded: false,
             dictionary_path: None,
             bigram_path: None,
-        }
+        })
     }
 
     /// Create a typo corrector with default configuration.
-    pub fn with_defaults() -> Self {
+    pub fn with_defaults() -> Result<Self> {
         Self::new(TypoConfig::default())
     }
 
@@ -266,7 +268,7 @@ impl TypoCorrector {
         use super::config::PreprocessingConfig;
 
         let config = PreprocessingConfig::from_toml(config_path)?;
-        let mut corrector = Self::new(config.typo);
+        let mut corrector = Self::new(config.typo)?;
 
         // Load dictionaries from configured paths
         if let Some(ref path) = config.paths.english_dict {
@@ -604,7 +606,7 @@ fn parse_compound_corrections(original: &str, corrected: &str) -> Vec<Correction
 
 impl Default for TypoCorrector {
     fn default() -> Self {
-        Self::with_defaults()
+        Self::with_defaults().expect("default TypoConfig should always build")
     }
 }
 
@@ -657,7 +659,7 @@ mod tests {
 
     #[test]
     fn test_protected_words() {
-        let mut corrector = TypoCorrector::with_defaults();
+        let mut corrector = TypoCorrector::with_defaults().unwrap();
         corrector.add_protected_words(["API", "HTTP", "JSON"]);
 
         assert!(corrector.is_protected("API"));
@@ -670,7 +672,7 @@ mod tests {
     fn test_disabled_on_words() {
         let config = TypoConfig::default()
             .with_disabled_words(["Meilisearch", "Rust"]);
-        let corrector = TypoCorrector::new(config);
+        let corrector = TypoCorrector::new(config).unwrap();
 
         assert!(corrector.is_protected("Meilisearch"));
         assert!(corrector.is_protected("meilisearch"));
@@ -679,7 +681,7 @@ mod tests {
 
     #[test]
     fn test_correction_with_dictionary() {
-        let mut corrector = TypoCorrector::with_defaults();
+        let mut corrector = TypoCorrector::with_defaults().unwrap();
 
         // Load a simple dictionary
         corrector.load_dictionary([
@@ -701,7 +703,7 @@ mod tests {
     #[test]
     fn test_disabled_corrector() {
         let config = TypoConfig::default().disabled();
-        let corrector = TypoCorrector::new(config);
+        let corrector = TypoCorrector::new(config).unwrap();
 
         let (corrected, corrections) = corrector.correct_query("helo wrold");
         assert_eq!(corrected, "helo wrold");
@@ -710,7 +712,7 @@ mod tests {
 
     #[test]
     fn test_dictionary_path_tracking() {
-        let mut corrector = TypoCorrector::with_defaults();
+        let mut corrector = TypoCorrector::with_defaults().unwrap();
 
         // Initially, no paths are set
         assert!(corrector.dictionary_path().is_none());
@@ -733,7 +735,7 @@ mod tests {
 
     #[test]
     fn test_reload_preserves_protected_words() {
-        let mut corrector = TypoCorrector::with_defaults();
+        let mut corrector = TypoCorrector::with_defaults().unwrap();
 
         // Add some protected words
         corrector.add_protected_words(["API", "HTTP"]);
@@ -758,7 +760,7 @@ mod tests {
 
     #[test]
     fn test_reload_clears_dictionary_state() {
-        let mut corrector = TypoCorrector::with_defaults();
+        let mut corrector = TypoCorrector::with_defaults().unwrap();
 
         // Load dictionary programmatically
         corrector.load_dictionary([("hello", 100)]);

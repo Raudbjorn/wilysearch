@@ -38,7 +38,7 @@
 //! use wilysearch::core::preprocessing::{QueryPipeline, TypoCorrector, SynonymMap};
 //!
 //! // Build the pipeline
-//! let mut typo_corrector = TypoCorrector::with_defaults();
+//! let mut typo_corrector = TypoCorrector::with_defaults()?;
 //! typo_corrector.load_dictionary_from_file("dictionary.txt")?;
 //!
 //! let mut synonym_map = SynonymMap::new();
@@ -344,21 +344,44 @@ pub struct PipelineConfig {
     #[serde(default)]
     pub synonyms: SynonymConfig,
 
-    /// Whether to normalize Unicode characters (NFKC normalization).
+    /// Text normalization settings (lowercase, trim, unicode, whitespace collapse).
     #[serde(default)]
-    pub normalize_unicode: bool,
+    pub normalization: NormalizationConfig,
 
-    /// Whether to convert to lowercase before processing.
+    // --- Backwards-compatible accessors for the flattened fields ---
+    // These are kept as serde aliases so existing configs still parse.
+
+    /// Deprecated: use `normalization.unicode_normalize` instead.
+    #[serde(default, alias = "normalizeUnicode")]
+    #[doc(hidden)]
+    normalize_unicode: Option<bool>,
+
+    /// Deprecated: use `normalization.lowercase` instead.
     #[serde(default)]
-    pub lowercase: bool,
+    #[doc(hidden)]
+    lowercase: Option<bool>,
 
-    /// Whether to trim whitespace.
-    #[serde(default = "default_trim")]
-    pub trim: bool,
+    /// Deprecated: use `normalization.trim` instead.
+    #[serde(default)]
+    #[doc(hidden)]
+    trim: Option<bool>,
 }
 
-fn default_trim() -> bool {
-    true
+impl PipelineConfig {
+    /// Resolve the effective normalization config, applying any legacy field overrides.
+    pub fn effective_normalization(&self) -> NormalizationConfig {
+        let mut norm = self.normalization.clone();
+        if let Some(v) = self.normalize_unicode {
+            norm.unicode_normalize = v;
+        }
+        if let Some(v) = self.lowercase {
+            norm.lowercase = v;
+        }
+        if let Some(v) = self.trim {
+            norm.trim = v;
+        }
+        norm
+    }
 }
 
 /// The query preprocessing pipeline.
@@ -403,9 +426,15 @@ impl QueryPipeline {
     /// Create a minimal pipeline without typo correction or synonyms.
     ///
     /// Useful for testing or when preprocessing is not needed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the SymSpell engine fails to initialize with default disabled config.
+    /// This should never happen in practice.
     pub fn passthrough() -> Self {
         Self {
-            typo_corrector: TypoCorrector::new(TypoConfig::default().disabled()),
+            typo_corrector: TypoCorrector::new(TypoConfig::default().disabled())
+                .expect("default disabled TypoConfig should always build"),
             synonym_map: SynonymMap::with_config(SynonymConfig {
                 enabled: false,
                 ..Default::default()
@@ -512,24 +541,24 @@ impl QueryPipeline {
 
     /// Normalize a query string according to pipeline configuration.
     fn normalize(&self, query: &str) -> String {
+        let norm = self.config.effective_normalization();
         let mut result = query.to_string();
 
-        if self.config.trim {
+        if norm.trim {
             result = result.trim().to_string();
         }
 
-        if self.config.lowercase {
+        if norm.lowercase {
             result = result.to_lowercase();
         }
 
-        if self.config.normalize_unicode {
-            // NFKC normalization: compatibility decomposition followed by canonical composition
-            // This normalizes things like full-width characters, ligatures, etc.
+        if norm.unicode_normalize {
             result = unicode_normalization_nfkc(&result);
         }
 
-        // Collapse multiple spaces into single space
-        result = collapse_whitespace(&result);
+        if norm.collapse_whitespace {
+            result = collapse_whitespace(&result);
+        }
 
         result
     }
@@ -537,12 +566,12 @@ impl QueryPipeline {
 
 /// Perform NFKC normalization on a string.
 ///
-/// This is a simplified implementation. For production use,
-/// consider using the `unicode-normalization` crate.
+/// NFKC (Normalization Form Compatibility Composition) normalizes compatibility
+/// characters to their canonical equivalents (e.g., full-width characters,
+/// ligatures, superscripts).
 fn unicode_normalization_nfkc(s: &str) -> String {
-    // Basic implementation: just return as-is
-    // In production, use: unicode_normalization::UnicodeNormalization::nfkc(s).collect()
-    s.to_string()
+    use unicode_normalization::UnicodeNormalization;
+    s.nfkc().collect()
 }
 
 /// Collapse multiple whitespace characters into single spaces.
@@ -677,19 +706,19 @@ impl QueryPipelineBuilder {
 
     /// Enable Unicode normalization.
     pub fn normalize_unicode(mut self) -> Self {
-        self.pipeline_config.normalize_unicode = true;
+        self.pipeline_config.normalization.unicode_normalize = true;
         self
     }
 
     /// Enable lowercase conversion.
     pub fn lowercase(mut self) -> Self {
-        self.pipeline_config.lowercase = true;
+        self.pipeline_config.normalization.lowercase = true;
         self
     }
 
     /// Build the query pipeline.
-    pub fn build(self) -> QueryPipeline {
-        let mut typo_corrector = TypoCorrector::new(self.typo_config);
+    pub fn build(self) -> Result<QueryPipeline> {
+        let mut typo_corrector = TypoCorrector::new(self.typo_config)?;
 
         // Load dictionary entries
         if !self.dictionary_entries.is_empty() {
@@ -708,7 +737,7 @@ impl QueryPipelineBuilder {
             typo_corrector.add_protected_words(self.protected_words.iter().map(|s| s.as_str()));
         }
 
-        QueryPipeline::with_config(typo_corrector, self.synonym_map, self.pipeline_config)
+        Ok(QueryPipeline::with_config(typo_corrector, self.synonym_map, self.pipeline_config))
     }
 }
 
@@ -733,7 +762,7 @@ mod tests {
         synonym_map.add_multi_way(&["hp", "hit points", "health"]);
 
         let pipeline = QueryPipeline::new(
-            TypoCorrector::new(TypoConfig::default().disabled()),
+            TypoCorrector::new(TypoConfig::default().disabled()).unwrap(),
             synonym_map,
         );
 
@@ -755,7 +784,8 @@ mod tests {
             .multi_way_synonyms(&["hp", "health"])
             .one_way_synonyms("dragon", &["wyrm"])
             .max_expansions(5)
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(pipeline.typo_corrector().config().min_word_size_one_typo, 4);
         assert!(pipeline.synonym_map().has_synonyms("hp"));
@@ -805,11 +835,15 @@ mod tests {
     #[test]
     fn test_pipeline_normalization() {
         let pipeline = QueryPipeline::with_config(
-            TypoCorrector::new(TypoConfig::default().disabled()),
+            TypoCorrector::new(TypoConfig::default().disabled()).unwrap(),
             SynonymMap::new(),
             PipelineConfig {
-                trim: true,
-                lowercase: true,
+                normalization: NormalizationConfig {
+                    trim: true,
+                    lowercase: true,
+                    collapse_whitespace: true,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         );

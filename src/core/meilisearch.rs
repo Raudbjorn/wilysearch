@@ -196,7 +196,7 @@ impl Meilisearch {
             return Err(Error::InvalidIndexUid(uid.to_string()));
         }
 
-        let mut indexes = self.indexes.write().unwrap();
+        let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
 
         if indexes.contains_key(uid) {
             return Err(Error::IndexAlreadyExists(uid.to_string()));
@@ -251,7 +251,7 @@ impl Meilisearch {
     ///
     /// Returns [`Error::IndexNotFound`] if no index with the given UID exists.
     pub fn get_index(&self, uid: &str) -> Result<Arc<Index>> {
-        let indexes = self.indexes.read().unwrap();
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
         if let Some(index) = indexes.get(uid) {
             return Ok(index.clone());
         }
@@ -260,7 +260,7 @@ impl Meilisearch {
         let index_path = self.options.db_path.join("indexes").join(uid);
         if index_path.exists() {
             drop(indexes); // Drop read lock before acquiring write lock
-            let mut indexes = self.indexes.write().unwrap();
+            let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
 
             // Check again in case someone else loaded it
             if let Some(index) = indexes.get(uid) {
@@ -300,7 +300,7 @@ impl Meilisearch {
 
         // Remove from memory cache if present
         {
-            let mut indexes = self.indexes.write().unwrap();
+            let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
             if let Some(index) = indexes.remove(uid) {
                 // Check if there are other references to this index
                 // Arc::strong_count of 1 means we hold the only reference
@@ -433,10 +433,31 @@ impl Meilisearch {
             let settings_json = serde_json::to_string_pretty(&settings)?;
             std::fs::write(index_dump_dir.join("settings.json"), settings_json)?;
 
-            // Export documents
-            let doc_result = index.get_documents(0, u32::MAX as usize)?;
-            let docs_json = serde_json::to_string_pretty(&doc_result.documents)?;
-            std::fs::write(index_dump_dir.join("documents.json"), docs_json)?;
+            // Export documents in batches to avoid OOM on large indexes
+            let docs_file = std::fs::File::create(index_dump_dir.join("documents.json"))?;
+            let mut writer = std::io::BufWriter::new(docs_file);
+            use std::io::Write;
+            write!(writer, "[")?;
+
+            const BATCH_SIZE: usize = 1000;
+            let mut offset = 0;
+            let mut first = true;
+            loop {
+                let batch = index.get_documents(offset, BATCH_SIZE)?;
+                for doc in &batch.documents {
+                    if !first {
+                        write!(writer, ",")?;
+                    }
+                    first = false;
+                    serde_json::to_writer_pretty(&mut writer, doc)?;
+                }
+                if batch.documents.len() < BATCH_SIZE {
+                    break;
+                }
+                offset += BATCH_SIZE;
+            }
+            write!(writer, "]")?;
+            writer.flush()?;
         }
 
         Ok(DumpInfo {
@@ -446,6 +467,9 @@ impl Meilisearch {
     }
 
     /// Create a snapshot of the database at the specified directory.
+    ///
+    /// Uses LMDB's built-in copy API to produce a consistent snapshot
+    /// without risking corruption from copying live data files.
     pub fn create_snapshot(&self, snapshot_dir: &std::path::Path) -> Result<()> {
         std::fs::create_dir_all(snapshot_dir)?;
 
@@ -461,13 +485,17 @@ impl Meilisearch {
                     let dest = snapshot_indexes.join(&name);
                     std::fs::create_dir_all(&dest)?;
 
-                    // Copy LMDB data files
-                    for file_entry in std::fs::read_dir(entry.path())? {
-                        let file_entry = file_entry?;
-                        if file_entry.file_type()?.is_file() {
-                            std::fs::copy(file_entry.path(), dest.join(file_entry.file_name()))?;
-                        }
-                    }
+                    // Use LMDB's copy_to_file for a consistent snapshot of live data
+                    let mut options = milli::heed::EnvOpenOptions::new().read_txn_without_tls();
+                    options.map_size(self.options.max_index_size);
+
+                    let env = unsafe {
+                        options.open(entry.path()).map_err(Error::Heed)?
+                    };
+                    let snapshot_file = dest.join("data.mdb");
+                    let mut file = std::fs::File::create(&snapshot_file)?;
+                    env.copy_to_file(&mut file, milli::heed::CompactionOption::Disabled)
+                        .map_err(Error::Heed)?;
                 }
             }
         }
@@ -477,12 +505,12 @@ impl Meilisearch {
 
     /// Get the current experimental feature flags.
     pub fn get_experimental_features(&self) -> ExperimentalFeatures {
-        self.experimental_features.read().unwrap().clone()
+        self.experimental_features.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Update experimental feature flags.
     pub fn update_experimental_features(&self, features: ExperimentalFeatures) -> ExperimentalFeatures {
-        let mut current = self.experimental_features.write().unwrap();
+        let mut current = self.experimental_features.write().unwrap_or_else(|e| e.into_inner());
         *current = features;
         current.clone()
     }
@@ -503,7 +531,7 @@ impl Meilisearch {
             }
         }
 
-        let mut indexes = self.indexes.write().unwrap();
+        let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
 
         for (a, b) in swaps {
             let index_path_a = self.options.db_path.join("indexes").join(a);
@@ -543,7 +571,7 @@ impl Meilisearch {
 
         // Remove from cache so we can close the LMDB environment
         {
-            let mut indexes = self.indexes.write().unwrap();
+            let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
             let removed = indexes.remove(uid);
             // Drop the Arc to close the LMDB environment
             drop(removed);

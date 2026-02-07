@@ -874,8 +874,9 @@ pub(crate) fn read_settings_from_index(
                 .map(|rule| LocalizedAttributeRule {
                     attribute_patterns: rule.attribute_patterns.patterns,
                     locales: rule.locales.into_iter().filter_map(|l| {
-                        // Language derives Serialize; use serde_json to get the string form
-                        serde_json::to_value(&l).ok().and_then(|v| v.as_str().map(|s| s.to_string()))
+                        // Language derives Serialize with a string representation.
+                        // Serialize directly to a JSON string and strip the quotes.
+                        serde_json::to_string(&l).ok().map(|s| s.trim_matches('"').to_string())
                     }).collect(),
                 })
                 .collect()

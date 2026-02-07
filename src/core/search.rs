@@ -367,6 +367,13 @@ pub struct SearchResult {
     /// The matching documents.
     pub hits: Vec<SearchHit>,
 
+    /// Internal milli document IDs corresponding 1:1 to `hits`.
+    ///
+    /// Used by hybrid search to merge keyword and vector results by actual
+    /// document identity rather than hit index. Not serialized to JSON.
+    #[serde(skip)]
+    pub document_ids: Vec<u32>,
+
     /// The original query string.
     pub query: String,
 
@@ -402,6 +409,33 @@ impl SearchResult {
     ) -> Self {
         Self {
             hits,
+            document_ids: Vec::new(),
+            query,
+            processing_time_ms,
+            hits_info: HitsInfo::OffsetLimit {
+                limit,
+                offset,
+                estimated_total_hits,
+            },
+            facet_distribution: None,
+            facet_stats: None,
+            semantic_hit_count: None,
+        }
+    }
+
+    /// Create a new search result with offset/limit pagination and milli document IDs.
+    pub fn with_document_ids(
+        hits: Vec<SearchHit>,
+        document_ids: Vec<u32>,
+        query: String,
+        processing_time_ms: u128,
+        estimated_total_hits: usize,
+        limit: usize,
+        offset: usize,
+    ) -> Self {
+        Self {
+            hits,
+            document_ids,
             query,
             processing_time_ms,
             hits_info: HitsInfo::OffsetLimit {
@@ -431,6 +465,7 @@ impl SearchResult {
         };
         Self {
             hits,
+            document_ids: Vec::new(),
             query,
             processing_time_ms,
             hits_info: HitsInfo::Pagination {
