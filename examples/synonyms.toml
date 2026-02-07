@@ -1,0 +1,96 @@
+# TTRPG Synonym Configuration
+# ===========================
+#
+# This file defines synonyms for query expansion in TTRPG (tabletop RPG) search.
+# There are two types of synonyms:
+#
+# 1. Multi-way (bidirectional): All terms are interchangeable
+#    - Searching for any term finds results for all terms
+#    - Example: "hp" <-> "hit points" <-> "health"
+#
+# 2. One-way (directional): Source maps to targets, not vice versa
+#    - Searching "dragon" finds "wyrm" and "drake"
+#    - But searching "wyrm" does NOT find "dragon"
+
+[synonyms]
+
+# Multi-way synonyms - all terms are interchangeable
+multi_way = [
+    # Character stats
+    ["hp", "hit points", "health", "life"],
+    ["ac", "armor class", "armour class"],
+    ["str", "strength"],
+    ["dex", "dexterity"],
+    ["con", "constitution"],
+    ["int", "intelligence"],
+    ["wis", "wisdom"],
+    ["cha", "charisma"],
+
+    # Combat mechanics
+    ["aoo", "attack of opportunity", "opportunity attack"],
+    ["crit", "critical hit", "nat 20", "natural 20"],
+    ["init", "initiative"],
+    ["dc", "difficulty class"],
+
+    # Roles and positions
+    ["dm", "dungeon master", "game master", "gm"],
+    ["pc", "player character"],
+    ["npc", "non-player character"],
+
+    # Book abbreviations
+    ["phb", "player's handbook", "players handbook"],
+    ["dmg", "dungeon master's guide", "dm guide"],
+    ["mm", "monster manual"],
+    ["xge", "xanathar's guide to everything"],
+    ["tce", "tasha's cauldron of everything"],
+    ["ftod", "fizban's treasury of dragons"],
+
+    # Common terms
+    ["lvl", "level"],
+    ["xp", "experience", "experience points"],
+    ["sp", "spell points", "sorcery points"],
+
+    # Dice notation
+    ["d20", "twenty-sided die", "twenty sided die"],
+    ["d6", "six-sided die", "six sided die"],
+]
+
+# One-way synonyms - source expands to include targets
+[synonyms.one_way]
+# Creature categories (specific types don't map back to general)
+dragon = ["wyrm", "drake", "wyvern"]
+undead = ["zombie", "skeleton", "vampire", "lich", "ghost", "wraith"]
+fiend = ["demon", "devil", "yugoloth"]
+celestial = ["angel", "archon"]
+fey = ["fairy", "sprite", "pixie", "dryad", "satyr"]
+elemental = ["fire elemental", "water elemental", "earth elemental", "air elemental"]
+
+# Damage types (general -> specific)
+"fire damage" = ["flame damage", "burning", "fire"]
+"cold damage" = ["frost damage", "ice damage", "freezing"]
+"lightning damage" = ["electric damage", "thunder damage"]
+"necrotic damage" = ["death damage", "life drain"]
+"radiant damage" = ["holy damage", "divine damage"]
+"psychic damage" = ["mental damage", "mind damage"]
+
+# Weapon categories
+sword = ["longsword", "shortsword", "greatsword", "rapier", "scimitar"]
+axe = ["battleaxe", "handaxe", "greataxe"]
+bow = ["longbow", "shortbow", "crossbow"]
+polearm = ["halberd", "glaive", "pike", "lance"]
+
+# Spell schools
+evocation = ["blast", "damage spell", "attack spell"]
+abjuration = ["protection", "ward", "barrier"]
+conjuration = ["summon", "teleport", "create"]
+divination = ["scry", "detect", "see", "foresight"]
+enchantment = ["charm", "mind control", "compel"]
+illusion = ["disguise", "invisibility", "phantasm"]
+necromancy = ["raise dead", "death magic", "life drain"]
+transmutation = ["polymorph", "alter", "change"]
+
+# Class features
+"sneak attack" = ["backstab", "surprise attack"]
+"wild shape" = ["animal form", "beast form", "shapeshift"]
+"rage" = ["barbarian rage", "fury"]
+"smite" = ["divine smite", "holy strike"]

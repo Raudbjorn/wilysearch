@@ -1,0 +1,1415 @@
+//! HTTP-less Meilisearch engine implementation.
+//!
+//! Wraps `crate::core::Meilisearch` and implements all traits from
+//! `crate::traits` by delegating directly to the milli search engine.
+//! Operations execute synchronously -- no task queue. Mutation methods
+//! return a synthetic `TaskInfo` with status `Succeeded`.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use serde_json::Value;
+
+use crate::traits::{self, Result};
+use crate::types::*;
+
+/// Embedded Meilisearch engine backed by milli/LMDB.
+///
+/// All operations execute immediately. Mutations return a synthetic
+/// [`TaskInfo`] with `status: Succeeded` since there is no task queue.
+pub struct Engine {
+    inner: crate::core::Meilisearch,
+    task_counter: AtomicU64,
+    dump_dir: std::path::PathBuf,
+    snapshot_dir: std::path::PathBuf,
+}
+
+impl Engine {
+    /// Create a new embedded engine with the given options.
+    pub fn new(options: crate::core::MeilisearchOptions) -> Result<Self> {
+        let dump_dir = options.db_path.join("dumps");
+        let snapshot_dir = options.db_path.join("snapshots");
+        let inner = crate::core::Meilisearch::new(options)?;
+        Ok(Self {
+            inner,
+            task_counter: AtomicU64::new(0),
+            dump_dir,
+            snapshot_dir,
+        })
+    }
+
+    /// Create a new engine with default options.
+    pub fn default_engine() -> Result<Self> {
+        Self::new(crate::core::MeilisearchOptions::default())
+    }
+
+    fn next_task(&self, task_type: &str, index_uid: Option<&str>) -> TaskInfo {
+        let uid = self.task_counter.fetch_add(1, Ordering::Relaxed);
+        TaskInfo {
+            task_uid: uid,
+            index_uid: index_uid.map(String::from),
+            status: TaskStatus::Succeeded,
+            r#type: task_type.to_string(),
+            enqueued_at: now_iso8601(),
+        }
+    }
+
+    fn resolve_index(&self, uid: &str) -> Result<std::sync::Arc<crate::core::Index>> {
+        Ok(self.inner.get_index(uid)?)
+    }
+}
+
+fn now_iso8601() -> String {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("1970-01-01T00:00:00.000Z+{}s", d.as_secs())
+}
+
+// ─── Type conversion helpers ─────────────────────────────────────────────────
+
+fn convert_search_request(req: &SearchRequest) -> crate::core::SearchQuery {
+    let mut q = match &req.q {
+        Some(s) => crate::core::SearchQuery::new(s.as_str()),
+        None => crate::core::SearchQuery::match_all(),
+    };
+    if let Some(offset) = req.offset {
+        q = q.with_offset(offset as usize);
+    }
+    if let Some(limit) = req.limit {
+        q = q.with_limit(limit as usize);
+    }
+    if let Some(page) = req.page {
+        q = q.with_page(page as usize);
+    }
+    if let Some(hpp) = req.hits_per_page {
+        q = q.with_hits_per_page(hpp as usize);
+    }
+    if let Some(ref attrs) = req.attributes_to_retrieve {
+        q = q.with_attributes_to_retrieve(attrs.iter().cloned());
+    }
+    if let Some(ref attrs) = req.attributes_to_highlight {
+        q = q.with_attributes_to_highlight(attrs.iter().cloned());
+    }
+    if let Some(ref attrs) = req.attributes_to_crop {
+        q = q.with_attributes_to_crop(attrs.clone());
+    }
+    if let Some(len) = req.crop_length {
+        q = q.with_crop_length(len as usize);
+    }
+    if let Some(ref marker) = req.crop_marker {
+        q = q.with_crop_marker(marker.as_str());
+    }
+    if let Some(ref filter) = req.filter {
+        q = q.with_filter(filter.clone());
+    }
+    if let Some(show) = req.show_matches_position {
+        q = q.with_matches_position(show);
+    }
+    if let Some(ref facets) = req.facets {
+        q = q.with_facets(facets.clone());
+    }
+    if let Some(ref sort) = req.sort {
+        q = q.with_sort(sort.clone());
+    }
+    if let Some(ref pre) = req.highlight_pre_tag {
+        q = q.with_highlight_pre_tag(pre.as_str());
+    }
+    if let Some(ref post) = req.highlight_post_tag {
+        q = q.with_highlight_post_tag(post.as_str());
+    }
+    if let Some(ref ms) = req.matching_strategy {
+        let strategy = match ms {
+            MatchingStrategy::Last => crate::core::search::MatchingStrategy::Last,
+            MatchingStrategy::All => crate::core::search::MatchingStrategy::All,
+            MatchingStrategy::Frequency => crate::core::search::MatchingStrategy::Frequency,
+        };
+        q = q.with_matching_strategy(strategy);
+    }
+    if let Some(show) = req.show_ranking_score {
+        q = q.with_ranking_score(show);
+    }
+    if let Some(show) = req.show_ranking_score_details {
+        q = q.with_ranking_score_details(show);
+    }
+    if let Some(ref attrs) = req.attributes_to_search_on {
+        q = q.with_attributes_to_search_on(attrs.clone());
+    }
+    if let Some(retrieve) = req.retrieve_vectors {
+        q = q.with_retrieve_vectors(retrieve);
+    }
+    if let Some(threshold) = req.ranking_score_threshold {
+        q = q.with_ranking_score_threshold(threshold);
+    }
+    if let Some(ref distinct) = req.distinct {
+        q = q.with_distinct(distinct.as_str());
+    }
+    if let Some(ref locales) = req.locales {
+        q = q.with_locales(locales.clone());
+    }
+    q
+}
+
+fn convert_search_result(r: &crate::core::SearchResult) -> SearchResponse {
+    let (offset, limit, estimated_total_hits, total_hits, total_pages, page, hits_per_page) =
+        match &r.hits_info {
+            crate::core::search::HitsInfo::OffsetLimit {
+                limit,
+                offset,
+                estimated_total_hits,
+            } => (
+                Some(*offset as u32),
+                Some(*limit as u32),
+                Some(*estimated_total_hits as u64),
+                None,
+                None,
+                None,
+                None,
+            ),
+            crate::core::search::HitsInfo::Pagination {
+                hits_per_page,
+                page,
+                total_pages,
+                total_hits,
+            } => (
+                None,
+                None,
+                None,
+                Some(*total_hits as u64),
+                Some(*total_pages as u32),
+                Some(*page as u32),
+                Some(*hits_per_page as u32),
+            ),
+        };
+
+    let facet_distribution = r.facet_distribution.as_ref().map(|fd| {
+        fd.iter()
+            .map(|(k, v)| (k.clone(), v.iter().map(|(k2, v2)| (k2.clone(), *v2)).collect()))
+            .collect()
+    });
+    let facet_stats = r
+        .facet_stats
+        .as_ref()
+        .map(|fs| serde_json::to_value(fs).unwrap_or(Value::Null));
+
+    SearchResponse {
+        hits: r.hits.iter().map(|h| convert_hit(h)).collect(),
+        offset,
+        limit,
+        estimated_total_hits,
+        total_hits,
+        total_pages,
+        page,
+        hits_per_page,
+        facet_distribution,
+        facet_stats,
+        processing_time_ms: r.processing_time_ms as u64,
+        query: r.query.clone(),
+    }
+}
+
+fn convert_hit(h: &crate::core::SearchHit) -> Value {
+    // The SearchHit has `document` flattened, plus optional metadata fields.
+    // We serialize the whole hit to produce the correct shape.
+    serde_json::to_value(h).unwrap_or(Value::Null)
+}
+
+fn convert_settings_to_lib(s: &Settings) -> crate::core::Settings {
+    let mut ms = crate::core::Settings::new();
+    if let Some(ref rules) = s.ranking_rules {
+        ms = ms.with_ranking_rules(rules.clone());
+    }
+    if let Some(ref attr) = s.distinct_attribute {
+        ms = ms.with_distinct_attribute(attr.clone());
+    }
+    if let Some(ref attrs) = s.searchable_attributes {
+        ms = ms.with_searchable_attributes(attrs.clone());
+    }
+    if let Some(ref attrs) = s.displayed_attributes {
+        ms = ms.with_displayed_attributes(attrs.clone());
+    }
+    if let Some(ref words) = s.stop_words {
+        ms = ms.with_stop_words(words.iter().cloned().collect());
+    }
+    if let Some(ref syns) = s.synonyms {
+        ms = ms.with_synonyms(syns.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+    }
+    if let Some(ref attrs) = s.filterable_attributes {
+        ms = ms.with_filterable_attributes(attrs.clone());
+    }
+    if let Some(ref attrs) = s.sortable_attributes {
+        ms = ms.with_sortable_attributes(attrs.iter().cloned().collect());
+    }
+    if let Some(ref typo) = s.typo_tolerance {
+        let lib_typo = crate::core::settings::TypoToleranceSettings {
+            enabled: typo.enabled,
+            min_word_size_for_typos: typo.min_word_size_for_typos.as_ref().map(|m| {
+                crate::core::settings::MinWordSizeForTypos {
+                    one_typo: m.one_typo.map(|v| v as u8),
+                    two_typos: m.two_typos.map(|v| v as u8),
+                }
+            }),
+            disable_on_words: typo.disable_on_words.as_ref().map(|w| w.iter().cloned().collect()),
+            disable_on_attributes: typo.disable_on_attributes.as_ref().map(|a| a.iter().cloned().collect()),
+            disable_on_numbers: typo.disable_on_numbers,
+        };
+        ms = ms.with_typo_tolerance(lib_typo);
+    }
+    if let Some(ref pag) = s.pagination {
+        let lib_pag = crate::core::settings::PaginationSettings {
+            max_total_hits: pag.max_total_hits.map(|v| v as usize),
+        };
+        ms = ms.with_pagination(lib_pag);
+    }
+    if let Some(ref fac) = s.faceting {
+        let lib_fac = crate::core::settings::FacetingSettings {
+            max_values_per_facet: fac.max_values_per_facet.map(|v| v as usize),
+            sort_facet_values_by: fac.sort_facet_values_by.as_ref().map(|m| {
+                m.iter()
+                    .map(|(k, v)| {
+                        let sort = match v.as_str() {
+                            "count" => crate::core::settings::FacetValuesSort::Count,
+                            _ => crate::core::settings::FacetValuesSort::Alpha,
+                        };
+                        (k.clone(), sort)
+                    })
+                    .collect()
+            }),
+        };
+        ms = ms.with_faceting(lib_fac);
+    }
+    if let Some(ref dict) = s.dictionary {
+        ms = ms.with_dictionary(dict.iter().cloned().collect());
+    }
+    if let Some(ref tokens) = s.separator_tokens {
+        ms = ms.with_separator_tokens(tokens.iter().cloned().collect());
+    }
+    if let Some(ref tokens) = s.non_separator_tokens {
+        ms = ms.with_non_separator_tokens(tokens.iter().cloned().collect());
+    }
+    if let Some(ref prec) = s.proximity_precision {
+        let lib_prec = match prec.as_str() {
+            "byAttribute" => crate::core::settings::ProximityPrecision::ByAttribute,
+            _ => crate::core::settings::ProximityPrecision::ByWord,
+        };
+        ms = ms.with_proximity_precision(lib_prec);
+    }
+    if let Some(enabled) = s.facet_search {
+        ms = ms.with_facet_search(enabled);
+    }
+    if let Some(ref mode) = s.prefix_search {
+        ms = ms.with_prefix_search(mode.clone());
+    }
+    if let Some(ms_val) = s.search_cutoff_ms {
+        ms = ms.with_search_cutoff_ms(ms_val);
+    }
+    if let Some(ref rules) = s.localized_attributes {
+        let lib_rules: Vec<crate::core::settings::LocalizedAttributeRule> = rules
+            .iter()
+            .map(|r| crate::core::settings::LocalizedAttributeRule {
+                attribute_patterns: r.attribute_patterns.clone(),
+                locales: r.locales.clone(),
+            })
+            .collect();
+        ms = ms.with_localized_attributes(lib_rules);
+    }
+    if let Some(ref embs) = s.embedders {
+        let lib_embs: HashMap<String, crate::core::EmbedderSettings> = embs
+            .iter()
+            .map(|(k, v)| {
+                let mut es = crate::core::EmbedderSettings::default();
+                let source = match v.source.as_str() {
+                    "openAi" => crate::core::EmbedderSource::OpenAi,
+                    "huggingFace" => crate::core::EmbedderSource::HuggingFace,
+                    "ollama" => crate::core::EmbedderSource::Ollama,
+                    "userProvided" => crate::core::EmbedderSource::UserProvided,
+                    "rest" => crate::core::EmbedderSource::Rest,
+                    _ => crate::core::EmbedderSource::default(),
+                };
+                es.source = Some(source);
+                es.api_key = v.api_key.clone();
+                es.model = v.model.clone();
+                es.dimensions = v.dimensions.map(|d| d as usize);
+                es.url = v.url.clone();
+                (k.clone(), es)
+            })
+            .collect();
+        ms = ms.with_embedders(lib_embs);
+    }
+    ms
+}
+
+fn convert_settings_from_lib(s: &crate::core::Settings) -> Settings {
+    Settings {
+        ranking_rules: s.ranking_rules.clone(),
+        distinct_attribute: s.distinct_attribute.clone(),
+        searchable_attributes: s.searchable_attributes.clone(),
+        displayed_attributes: s.displayed_attributes.clone(),
+        stop_words: s.stop_words.as_ref().map(|w| w.iter().cloned().collect()),
+        synonyms: s.synonyms.as_ref().map(|m| {
+            m.iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        }),
+        filterable_attributes: s.filterable_attributes.clone(),
+        sortable_attributes: s.sortable_attributes.as_ref().map(|a| a.iter().cloned().collect()),
+        typo_tolerance: s.typo_tolerance.as_ref().map(|t| TypoTolerance {
+            enabled: t.enabled,
+            min_word_size_for_typos: t.min_word_size_for_typos.as_ref().map(|m| {
+                MinWordSizeForTypos {
+                    one_typo: m.one_typo.map(|v| v as u32),
+                    two_typos: m.two_typos.map(|v| v as u32),
+                }
+            }),
+            disable_on_words: t.disable_on_words.as_ref().map(|w| w.iter().cloned().collect()),
+            disable_on_attributes: t.disable_on_attributes.as_ref().map(|a| a.iter().cloned().collect()),
+            disable_on_numbers: t.disable_on_numbers,
+        }),
+        pagination: s.pagination.as_ref().map(|p| Pagination {
+            max_total_hits: p.max_total_hits.map(|v| v as u64),
+        }),
+        faceting: s.faceting.as_ref().map(|f| Faceting {
+            max_values_per_facet: f.max_values_per_facet.map(|v| v as u64),
+            sort_facet_values_by: f.sort_facet_values_by.as_ref().map(|m| {
+                m.iter()
+                    .map(|(k, v)| {
+                        let s = match v {
+                            crate::core::settings::FacetValuesSort::Count => "count",
+                            crate::core::settings::FacetValuesSort::Alpha => "alpha",
+                        };
+                        (k.clone(), s.to_string())
+                    })
+                    .collect()
+            }),
+        }),
+        dictionary: s.dictionary.as_ref().map(|d| d.iter().cloned().collect()),
+        separator_tokens: s.separator_tokens.as_ref().map(|t| t.iter().cloned().collect()),
+        non_separator_tokens: s.non_separator_tokens.as_ref().map(|t| t.iter().cloned().collect()),
+        proximity_precision: s.proximity_precision.as_ref().map(|p| {
+            match p {
+                crate::core::settings::ProximityPrecision::ByWord => "byWord".to_string(),
+                crate::core::settings::ProximityPrecision::ByAttribute => "byAttribute".to_string(),
+            }
+        }),
+        facet_search: s.facet_search,
+        prefix_search: s.prefix_search.clone(),
+        search_cutoff_ms: s.search_cutoff_ms,
+        localized_attributes: s.localized_attributes.as_ref().map(|rules| {
+            rules
+                .iter()
+                .map(|r| LocalizedAttribute {
+                    attribute_patterns: r.attribute_patterns.clone(),
+                    locales: r.locales.clone(),
+                })
+                .collect()
+        }),
+        embedders: s.embedders.as_ref().map(|embs| {
+            embs.iter()
+                .map(|(k, v)| {
+                    let source = v
+                        .source
+                        .as_ref()
+                        .map(|s| format!("{s:?}"))
+                        .unwrap_or_default()
+                        .to_lowercase();
+                    (
+                        k.clone(),
+                        EmbedderConfig {
+                            source,
+                            api_key: v.api_key.clone(),
+                            model: v.model.clone(),
+                            dimensions: v.dimensions.map(|d| d as u32),
+                            url: v.url.clone(),
+                            extra: HashMap::new(),
+                        },
+                    )
+                })
+                .collect()
+        }),
+    }
+}
+
+// ─── Documents ───────────────────────────────────────────────────────────────
+
+impl traits::Documents for Engine {
+    fn get_document(
+        &self,
+        index_uid: &str,
+        document_id: &str,
+        query: &DocumentQuery,
+    ) -> Result<Value> {
+        let idx = self.resolve_index(index_uid)?;
+        let fields: Option<Vec<String>> = query
+            .fields
+            .as_ref()
+            .map(|f| f.split(',').map(|s| s.trim().to_string()).collect());
+        let doc = idx.get_document_with_fields(document_id, fields.as_deref())?;
+        doc.ok_or_else(|| format!("Document not found: {document_id}").into())
+    }
+
+    fn get_documents(
+        &self,
+        index_uid: &str,
+        query: &DocumentsQuery,
+    ) -> Result<DocumentsResponse> {
+        let idx = self.resolve_index(index_uid)?;
+        let offset = query.offset.unwrap_or(0) as usize;
+        let limit = query.limit.unwrap_or(20) as usize;
+
+        if query.filter.is_some() || query.ids.is_some() || query.sort.is_some() {
+            let options = crate::core::search::GetDocumentsOptions {
+                offset,
+                limit,
+                fields: query.fields.as_ref().map(|f| {
+                    f.split(',').map(|s| s.trim().to_string()).collect()
+                }),
+                filter: query.filter.as_ref().map(|f| Value::String(f.clone())),
+                ids: query.ids.as_ref().map(|ids_str| {
+                    ids_str.split(',').map(|s| s.trim().to_string()).collect()
+                }),
+                sort: query.sort.as_ref().map(|s| {
+                    s.split(',').map(|s| s.trim().to_string()).collect()
+                }),
+                ..Default::default()
+            };
+            let result = idx.get_documents_with_options(&options)?;
+            return Ok(DocumentsResponse {
+                results: result.documents,
+                offset: result.offset as u32,
+                limit: result.limit as u32,
+                total: result.total,
+            });
+        }
+
+        let result = idx.get_documents(offset, limit)?;
+        Ok(DocumentsResponse {
+            results: result.documents,
+            offset: result.offset as u32,
+            limit: result.limit as u32,
+            total: result.total,
+        })
+    }
+
+    fn fetch_documents(
+        &self,
+        index_uid: &str,
+        request: &FetchDocumentsRequest,
+    ) -> Result<DocumentsResponse> {
+        let idx = self.resolve_index(index_uid)?;
+        let options = crate::core::search::GetDocumentsOptions {
+            offset: request.offset.unwrap_or(0) as usize,
+            limit: request.limit.unwrap_or(20) as usize,
+            fields: request.fields.clone(),
+            filter: request.filter.as_ref().map(|f| Value::String(f.clone())),
+            ..Default::default()
+        };
+        let result = idx.get_documents_with_options(&options)?;
+        Ok(DocumentsResponse {
+            results: result.documents,
+            offset: result.offset as u32,
+            limit: result.limit as u32,
+            total: result.total,
+        })
+    }
+
+    fn add_or_replace_documents(
+        &self,
+        index_uid: &str,
+        documents: &[Value],
+        query: &AddDocumentsQuery,
+    ) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.add_documents(documents.to_vec(), query.primary_key.as_deref())?;
+        Ok(self.next_task("documentAdditionOrUpdate", Some(index_uid)))
+    }
+
+    fn add_or_update_documents(
+        &self,
+        index_uid: &str,
+        documents: &[Value],
+        query: &AddDocumentsQuery,
+    ) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.update_documents(documents.to_vec(), query.primary_key.as_deref())?;
+        Ok(self.next_task("documentAdditionOrUpdate", Some(index_uid)))
+    }
+
+    fn delete_document(&self, index_uid: &str, document_id: &str) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.delete_document(document_id)?;
+        Ok(self.next_task("documentDeletion", Some(index_uid)))
+    }
+
+    fn delete_documents_by_filter(
+        &self,
+        index_uid: &str,
+        request: &DeleteDocumentsByFilterRequest,
+    ) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.delete_by_filter(&request.filter)?;
+        Ok(self.next_task("documentDeletion", Some(index_uid)))
+    }
+
+    fn delete_documents_by_batch(
+        &self,
+        index_uid: &str,
+        document_ids: &[Value],
+    ) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        let ids: Vec<String> = document_ids
+            .iter()
+            .map(|v| match v {
+                Value::String(s) => s.clone(),
+                Value::Number(n) => n.to_string(),
+                other => other.to_string(),
+            })
+            .collect();
+        idx.delete_documents(ids)?;
+        Ok(self.next_task("documentDeletion", Some(index_uid)))
+    }
+
+    fn delete_all_documents(&self, index_uid: &str) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.clear()?;
+        Ok(self.next_task("documentDeletion", Some(index_uid)))
+    }
+}
+
+// ─── Search ──────────────────────────────────────────────────────────────────
+
+impl traits::Search for Engine {
+    fn search(
+        &self,
+        index_uid: &str,
+        request: &SearchRequest,
+    ) -> Result<SearchResponse> {
+        let idx = self.resolve_index(index_uid)?;
+        let query = convert_search_request(request);
+        let result = idx.search(&query)?;
+        Ok(convert_search_result(&result))
+    }
+
+    fn similar(
+        &self,
+        index_uid: &str,
+        request: &SimilarRequest,
+    ) -> Result<SimilarResponse> {
+        let idx = self.resolve_index(index_uid)?;
+
+        let embedder = request.embedder.clone().unwrap_or("default".to_string());
+        let lib_query = crate::core::search::SimilarQuery {
+            id: request.id.clone(),
+            offset: request.offset.unwrap_or(0) as usize,
+            limit: request.limit.unwrap_or(20) as usize,
+            filter: request.filter.clone(),
+            embedder,
+            attributes_to_retrieve: request
+                .attributes_to_retrieve
+                .as_ref()
+                .map(|a| a.iter().cloned().collect()),
+            retrieve_vectors: false,
+            show_ranking_score: request.show_ranking_score.unwrap_or(false),
+            show_ranking_score_details: request.show_ranking_score_details.unwrap_or(false),
+            ranking_score_threshold: request.ranking_score_threshold,
+        };
+        let result = idx.get_similar_documents(&lib_query)?;
+
+        let (offset, limit, estimated) = match &result.hits_info {
+            crate::core::search::HitsInfo::OffsetLimit {
+                offset,
+                limit,
+                estimated_total_hits,
+            } => (*offset as u32, *limit as u32, *estimated_total_hits as u64),
+            crate::core::search::HitsInfo::Pagination { total_hits, .. } => {
+                (0, 20, *total_hits as u64)
+            }
+        };
+
+        Ok(SimilarResponse {
+            hits: result.hits.iter().map(|h| convert_hit(h)).collect(),
+            offset,
+            limit,
+            estimated_total_hits: estimated,
+            processing_time_ms: result.processing_time_ms as u64,
+            id: Value::String(result.id),
+        })
+    }
+
+    fn multi_search(&self, request: &MultiSearchRequest) -> Result<MultiSearchResponse> {
+        // If federation is set, use federated multi-search (returns merged hits).
+        // For simplicity we handle the non-federated case only here.
+        let mut results = Vec::with_capacity(request.queries.len());
+        for mq in &request.queries {
+            let idx = self.resolve_index(&mq.index_uid)?;
+            let query = convert_search_request(&mq.search);
+            let result = idx.search(&query)?;
+            let resp = convert_search_result(&result);
+            results.push(resp);
+        }
+        Ok(MultiSearchResponse { results })
+    }
+
+    fn facet_search(
+        &self,
+        index_uid: &str,
+        request: &FacetSearchRequest,
+    ) -> Result<FacetSearchResponse> {
+        let idx = self.resolve_index(index_uid)?;
+        let matching = request.matching_strategy.as_ref().map(|ms| match ms {
+            MatchingStrategy::Last => crate::core::search::MatchingStrategy::Last,
+            MatchingStrategy::All => crate::core::search::MatchingStrategy::All,
+            MatchingStrategy::Frequency => crate::core::search::MatchingStrategy::Frequency,
+        });
+        let lib_query = crate::core::search::FacetSearchQuery {
+            facet_name: request.facet_name.clone(),
+            facet_query: request.facet_query.clone(),
+            q: request.q.clone(),
+            filter: request.filter.clone(),
+            matching_strategy: matching.unwrap_or(crate::core::search::MatchingStrategy::Last),
+            attributes_to_search_on: request.attributes_to_search_on.clone(),
+            ranking_score_threshold: None,
+            locales: None,
+        };
+        let result = idx.facet_search(&lib_query)?;
+        Ok(FacetSearchResponse {
+            facet_hits: result
+                .facet_hits
+                .into_iter()
+                .map(|h| FacetHit {
+                    value: h.value,
+                    count: h.count,
+                })
+                .collect(),
+            facet_query: result.facet_query,
+            processing_time_ms: result.processing_time_ms as u64,
+        })
+    }
+}
+
+// ─── Indexes ─────────────────────────────────────────────────────────────────
+
+impl traits::Indexes for Engine {
+    fn list_indexes(&self, query: &PaginationQuery) -> Result<IndexList> {
+        let offset = query.offset.unwrap_or(0) as usize;
+        let limit = query.limit.unwrap_or(20) as usize;
+        let (infos, total) = self.inner.list_indexes_with_pagination(offset, limit)?;
+        let results = infos
+            .into_iter()
+            .map(|info| Index {
+                uid: info.uid,
+                primary_key: info.primary_key,
+                created_at: info.created_at.unwrap_or_default(),
+                updated_at: info.updated_at.unwrap_or_default(),
+            })
+            .collect();
+        Ok(IndexList {
+            results,
+            offset: offset as u32,
+            limit: limit as u32,
+            total: total as u64,
+        })
+    }
+
+    fn get_index(&self, index_uid: &str) -> Result<Index> {
+        let idx = self.resolve_index(index_uid)?;
+        let pk = idx.primary_key()?;
+        Ok(Index {
+            uid: index_uid.to_string(),
+            primary_key: pk,
+            created_at: String::new(),
+            updated_at: String::new(),
+        })
+    }
+
+    fn create_index(&self, request: &CreateIndexRequest) -> Result<TaskInfo> {
+        self.inner
+            .create_index(&request.uid, request.primary_key.as_deref())?;
+        Ok(self.next_task("indexCreation", Some(&request.uid)))
+    }
+
+    fn update_index(
+        &self,
+        index_uid: &str,
+        request: &UpdateIndexRequest,
+    ) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.update_primary_key(&request.primary_key)?;
+        Ok(self.next_task("indexUpdate", Some(index_uid)))
+    }
+
+    fn swap_indexes(&self, swaps: &[SwapIndexesRequest]) -> Result<TaskInfo> {
+        let pairs: Vec<(&str, &str)> = swaps
+            .iter()
+            .map(|s| (s.indexes[0].as_str(), s.indexes[1].as_str()))
+            .collect();
+        self.inner.swap_indexes(&pairs)?;
+        Ok(self.next_task("indexSwap", None))
+    }
+
+    fn delete_index(&self, index_uid: &str) -> Result<TaskInfo> {
+        self.inner.delete_index(index_uid)?;
+        Ok(self.next_task("indexDeletion", Some(index_uid)))
+    }
+}
+
+// ─── Tasks (stub -- no task queue in embedded mode) ──────────────────────────
+
+impl traits::Tasks for Engine {
+    fn get_task(&self, _task_uid: u64) -> Result<Task> {
+        Err("Tasks are not supported in embedded mode".into())
+    }
+
+    fn list_tasks(&self, _filter: &TaskFilter) -> Result<TaskList> {
+        Ok(TaskList {
+            results: vec![],
+            total: 0,
+            limit: 20,
+            from: None,
+            next: None,
+        })
+    }
+
+    fn cancel_tasks(&self, _filter: &TaskFilter) -> Result<TaskInfo> {
+        Err("Tasks are not supported in embedded mode".into())
+    }
+
+    fn delete_tasks(&self, _filter: &TaskFilter) -> Result<TaskInfo> {
+        Err("Tasks are not supported in embedded mode".into())
+    }
+}
+
+// ─── Batches (stub) ──────────────────────────────────────────────────────────
+
+impl traits::Batches for Engine {
+    fn get_batch(&self, _batch_uid: u64) -> Result<Batch> {
+        Err("Batches are not supported in embedded mode".into())
+    }
+
+    fn list_batches(&self, _filter: &TaskFilter) -> Result<BatchList> {
+        Ok(BatchList {
+            results: vec![],
+            total: 0,
+            limit: 20,
+            from: None,
+            next: None,
+        })
+    }
+}
+
+// ─── Settings ────────────────────────────────────────────────────────────────
+
+impl traits::SettingsApi for Engine {
+    fn get_settings(&self, index_uid: &str) -> Result<Settings> {
+        let idx = self.resolve_index(index_uid)?;
+        let lib_settings = idx.get_settings()?;
+        Ok(convert_settings_from_lib(&lib_settings))
+    }
+
+    fn update_settings(&self, index_uid: &str, settings: &Settings) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        let lib_settings = convert_settings_to_lib(settings);
+        idx.update_settings(&lib_settings)?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+
+    fn reset_settings(&self, index_uid: &str) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.reset_settings()?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+
+    // ── Sub-settings ─────────────────────────────────────────────────────
+
+    fn get_ranking_rules(&self, index_uid: &str) -> Result<Vec<String>> {
+        let idx = self.resolve_index(index_uid)?;
+        Ok(idx.get_ranking_rules()?.unwrap_or_default())
+    }
+    fn update_ranking_rules(&self, index_uid: &str, rules: &[String]) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.update_ranking_rules(rules.to_vec())?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+    fn reset_ranking_rules(&self, index_uid: &str) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.reset_ranking_rules()?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+
+    fn get_distinct_attribute(&self, index_uid: &str) -> Result<Option<String>> {
+        let idx = self.resolve_index(index_uid)?;
+        Ok(idx.get_distinct_attribute()?)
+    }
+    fn update_distinct_attribute(&self, index_uid: &str, attr: &str) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.update_distinct_attribute(attr.to_string())?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+    fn reset_distinct_attribute(&self, index_uid: &str) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.reset_distinct_attribute()?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+
+    fn get_searchable_attributes(&self, index_uid: &str) -> Result<Vec<String>> {
+        let idx = self.resolve_index(index_uid)?;
+        Ok(idx.get_searchable_attributes()?.unwrap_or_default())
+    }
+    fn update_searchable_attributes(&self, index_uid: &str, attrs: &[String]) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.update_searchable_attributes(attrs.to_vec())?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+    fn reset_searchable_attributes(&self, index_uid: &str) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.reset_searchable_attributes()?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+
+    fn get_displayed_attributes(&self, index_uid: &str) -> Result<Vec<String>> {
+        let idx = self.resolve_index(index_uid)?;
+        Ok(idx.get_displayed_attributes()?.unwrap_or_default())
+    }
+    fn update_displayed_attributes(&self, index_uid: &str, attrs: &[String]) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.update_displayed_attributes(attrs.to_vec())?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+    fn reset_displayed_attributes(&self, index_uid: &str) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.reset_displayed_attributes()?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+
+    fn get_synonyms(&self, index_uid: &str) -> Result<HashMap<String, Vec<String>>> {
+        let idx = self.resolve_index(index_uid)?;
+        Ok(idx
+            .get_synonyms()?
+            .map(|m| m.into_iter().collect())
+            .unwrap_or_default())
+    }
+    fn update_synonyms(
+        &self,
+        index_uid: &str,
+        synonyms: &HashMap<String, Vec<String>>,
+    ) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        let btree: BTreeMap<String, Vec<String>> = synonyms.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        idx.update_synonyms(btree)?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+    fn reset_synonyms(&self, index_uid: &str) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.reset_synonyms()?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+
+    fn get_stop_words(&self, index_uid: &str) -> Result<Vec<String>> {
+        let idx = self.resolve_index(index_uid)?;
+        Ok(idx
+            .get_stop_words()?
+            .map(|s| s.into_iter().collect())
+            .unwrap_or_default())
+    }
+    fn update_stop_words(&self, index_uid: &str, words: &[String]) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.update_stop_words(words.iter().cloned().collect())?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+    fn reset_stop_words(&self, index_uid: &str) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.reset_stop_words()?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+
+    fn get_filterable_attributes(&self, index_uid: &str) -> Result<Vec<String>> {
+        let idx = self.resolve_index(index_uid)?;
+        Ok(idx.get_filterable_attributes()?.unwrap_or_default())
+    }
+    fn update_filterable_attributes(&self, index_uid: &str, attrs: &[String]) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.update_filterable_attributes(attrs.to_vec())?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+    fn reset_filterable_attributes(&self, index_uid: &str) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.reset_filterable_attributes()?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+
+    fn get_sortable_attributes(&self, index_uid: &str) -> Result<Vec<String>> {
+        let idx = self.resolve_index(index_uid)?;
+        Ok(idx
+            .get_sortable_attributes()?
+            .map(|s| s.into_iter().collect())
+            .unwrap_or_default())
+    }
+    fn update_sortable_attributes(&self, index_uid: &str, attrs: &[String]) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.update_sortable_attributes(attrs.iter().cloned().collect())?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+    fn reset_sortable_attributes(&self, index_uid: &str) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.reset_sortable_attributes()?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+
+    fn get_typo_tolerance(&self, index_uid: &str) -> Result<TypoTolerance> {
+        let idx = self.resolve_index(index_uid)?;
+        let lib = idx.get_typo_tolerance()?;
+        Ok(lib
+            .map(|t| TypoTolerance {
+                enabled: t.enabled,
+                min_word_size_for_typos: t.min_word_size_for_typos.map(|m| MinWordSizeForTypos {
+                    one_typo: m.one_typo.map(|v| v as u32),
+                    two_typos: m.two_typos.map(|v| v as u32),
+                }),
+                disable_on_words: t.disable_on_words.map(|w| w.into_iter().collect()),
+                disable_on_attributes: t.disable_on_attributes.map(|a| a.into_iter().collect()),
+                disable_on_numbers: t.disable_on_numbers,
+            })
+            .unwrap_or_default())
+    }
+    fn update_typo_tolerance(&self, index_uid: &str, config: &TypoTolerance) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        let lib_typo = crate::core::settings::TypoToleranceSettings {
+            enabled: config.enabled,
+            min_word_size_for_typos: config.min_word_size_for_typos.as_ref().map(|m| {
+                crate::core::settings::MinWordSizeForTypos {
+                    one_typo: m.one_typo.map(|v| v as u8),
+                    two_typos: m.two_typos.map(|v| v as u8),
+                }
+            }),
+            disable_on_words: config.disable_on_words.as_ref().map(|w| w.iter().cloned().collect()),
+            disable_on_attributes: config.disable_on_attributes.as_ref().map(|a| a.iter().cloned().collect()),
+            disable_on_numbers: config.disable_on_numbers,
+        };
+        idx.update_typo_tolerance(lib_typo)?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+    fn reset_typo_tolerance(&self, index_uid: &str) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.reset_typo_tolerance()?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+
+    fn get_pagination(&self, index_uid: &str) -> Result<Pagination> {
+        let idx = self.resolve_index(index_uid)?;
+        Ok(idx
+            .get_pagination()?
+            .map(|p| Pagination {
+                max_total_hits: p.max_total_hits.map(|v| v as u64),
+            })
+            .unwrap_or_default())
+    }
+    fn update_pagination(&self, index_uid: &str, config: &Pagination) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.update_pagination(crate::core::settings::PaginationSettings {
+            max_total_hits: config.max_total_hits.map(|v| v as usize),
+        })?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+    fn reset_pagination(&self, index_uid: &str) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.reset_pagination()?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+
+    fn get_faceting(&self, index_uid: &str) -> Result<Faceting> {
+        let idx = self.resolve_index(index_uid)?;
+        Ok(idx
+            .get_faceting()?
+            .map(|f| Faceting {
+                max_values_per_facet: f.max_values_per_facet.map(|v| v as u64),
+                sort_facet_values_by: f.sort_facet_values_by.map(|m| {
+                    m.into_iter()
+                        .map(|(k, v)| {
+                            let s = match v {
+                                crate::core::settings::FacetValuesSort::Count => "count",
+                                crate::core::settings::FacetValuesSort::Alpha => "alpha",
+                            };
+                            (k, s.to_string())
+                        })
+                        .collect()
+                }),
+            })
+            .unwrap_or_default())
+    }
+    fn update_faceting(&self, index_uid: &str, config: &Faceting) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.update_faceting(crate::core::settings::FacetingSettings {
+            max_values_per_facet: config.max_values_per_facet.map(|v| v as usize),
+            sort_facet_values_by: config.sort_facet_values_by.as_ref().map(|m| {
+                m.iter()
+                    .map(|(k, v)| {
+                        let sort = match v.as_str() {
+                            "count" => crate::core::settings::FacetValuesSort::Count,
+                            _ => crate::core::settings::FacetValuesSort::Alpha,
+                        };
+                        (k.clone(), sort)
+                    })
+                    .collect()
+            }),
+        })?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+    fn reset_faceting(&self, index_uid: &str) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.reset_faceting()?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+
+    fn get_dictionary(&self, index_uid: &str) -> Result<Vec<String>> {
+        let idx = self.resolve_index(index_uid)?;
+        Ok(idx.get_dictionary()?.map(|d| d.into_iter().collect()).unwrap_or_default())
+    }
+    fn update_dictionary(&self, index_uid: &str, words: &[String]) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.update_dictionary(words.iter().cloned().collect())?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+    fn reset_dictionary(&self, index_uid: &str) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.reset_dictionary()?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+
+    fn get_separator_tokens(&self, index_uid: &str) -> Result<Vec<String>> {
+        let idx = self.resolve_index(index_uid)?;
+        Ok(idx.get_separator_tokens()?.map(|t| t.into_iter().collect()).unwrap_or_default())
+    }
+    fn update_separator_tokens(&self, index_uid: &str, tokens: &[String]) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.update_separator_tokens(tokens.iter().cloned().collect())?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+    fn reset_separator_tokens(&self, index_uid: &str) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.reset_separator_tokens()?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+
+    fn get_non_separator_tokens(&self, index_uid: &str) -> Result<Vec<String>> {
+        let idx = self.resolve_index(index_uid)?;
+        Ok(idx.get_non_separator_tokens()?.map(|t| t.into_iter().collect()).unwrap_or_default())
+    }
+    fn update_non_separator_tokens(&self, index_uid: &str, tokens: &[String]) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.update_non_separator_tokens(tokens.iter().cloned().collect())?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+    fn reset_non_separator_tokens(&self, index_uid: &str) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.reset_non_separator_tokens()?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+
+    fn get_proximity_precision(&self, index_uid: &str) -> Result<String> {
+        let idx = self.resolve_index(index_uid)?;
+        Ok(idx
+            .get_proximity_precision()?
+            .map(|p| match p {
+                crate::core::settings::ProximityPrecision::ByWord => "byWord".to_string(),
+                crate::core::settings::ProximityPrecision::ByAttribute => {
+                    "byAttribute".to_string()
+                }
+            })
+            .unwrap_or_else(|| "byWord".to_string()))
+    }
+    fn update_proximity_precision(&self, index_uid: &str, precision: &str) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        let p = match precision {
+            "byAttribute" => crate::core::settings::ProximityPrecision::ByAttribute,
+            _ => crate::core::settings::ProximityPrecision::ByWord,
+        };
+        idx.update_proximity_precision(p)?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+    fn reset_proximity_precision(&self, index_uid: &str) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.reset_proximity_precision()?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+
+    fn get_facet_search(&self, index_uid: &str) -> Result<bool> {
+        let idx = self.resolve_index(index_uid)?;
+        Ok(idx.get_facet_search()?.unwrap_or(true))
+    }
+    fn update_facet_search(&self, index_uid: &str, enabled: bool) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.update_facet_search(enabled)?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+    fn reset_facet_search(&self, index_uid: &str) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.reset_facet_search()?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+
+    fn get_prefix_search(&self, index_uid: &str) -> Result<String> {
+        let idx = self.resolve_index(index_uid)?;
+        Ok(idx.get_prefix_search()?.unwrap_or_else(|| "indexingTime".to_string()))
+    }
+    fn update_prefix_search(&self, index_uid: &str, mode: &str) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.update_prefix_search(mode.to_string())?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+    fn reset_prefix_search(&self, index_uid: &str) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.reset_prefix_search()?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+
+    fn get_search_cutoff_ms(&self, index_uid: &str) -> Result<Option<u64>> {
+        let idx = self.resolve_index(index_uid)?;
+        Ok(idx.get_search_cutoff_ms()?)
+    }
+    fn update_search_cutoff_ms(&self, index_uid: &str, ms: u64) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.update_search_cutoff_ms(ms)?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+    fn reset_search_cutoff_ms(&self, index_uid: &str) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.reset_search_cutoff_ms()?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+
+    fn get_localized_attributes(
+        &self,
+        index_uid: &str,
+    ) -> Result<Option<Vec<LocalizedAttribute>>> {
+        let idx = self.resolve_index(index_uid)?;
+        Ok(idx.get_localized_attributes()?.map(|rules| {
+            rules
+                .into_iter()
+                .map(|r| LocalizedAttribute {
+                    locales: r.locales,
+                    attribute_patterns: r.attribute_patterns,
+                })
+                .collect()
+        }))
+    }
+    fn update_localized_attributes(
+        &self,
+        index_uid: &str,
+        attrs: &[LocalizedAttribute],
+    ) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        let lib_rules: Vec<crate::core::settings::LocalizedAttributeRule> = attrs
+            .iter()
+            .map(|a| crate::core::settings::LocalizedAttributeRule {
+                attribute_patterns: a.attribute_patterns.clone(),
+                locales: a.locales.clone(),
+            })
+            .collect();
+        idx.update_localized_attributes(lib_rules)?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+    fn reset_localized_attributes(&self, index_uid: &str) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.reset_localized_attributes()?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+
+    fn get_embedders(
+        &self,
+        index_uid: &str,
+    ) -> Result<Option<HashMap<String, EmbedderConfig>>> {
+        let idx = self.resolve_index(index_uid)?;
+        Ok(idx.get_embedders()?.map(|embs| {
+            embs.into_iter()
+                .map(|(k, v)| {
+                    let source = v
+                        .source
+                        .map(|s| format!("{s:?}"))
+                        .unwrap_or_default()
+                        .to_lowercase();
+                    (
+                        k,
+                        EmbedderConfig {
+                            source,
+                            api_key: v.api_key,
+                            model: v.model,
+                            dimensions: v.dimensions.map(|d| d as u32),
+                            url: v.url,
+                            extra: HashMap::new(),
+                        },
+                    )
+                })
+                .collect()
+        }))
+    }
+    fn update_embedders(
+        &self,
+        index_uid: &str,
+        embedders: &HashMap<String, EmbedderConfig>,
+    ) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        let lib_embs: HashMap<String, crate::core::EmbedderSettings> = embedders
+            .iter()
+            .map(|(k, v)| {
+                let mut es = crate::core::EmbedderSettings::default();
+                let source = match v.source.as_str() {
+                    "openai" | "openAi" => crate::core::EmbedderSource::OpenAi,
+                    "huggingface" | "huggingFace" => crate::core::EmbedderSource::HuggingFace,
+                    "ollama" => crate::core::EmbedderSource::Ollama,
+                    "userprovided" | "userProvided" => crate::core::EmbedderSource::UserProvided,
+                    "rest" => crate::core::EmbedderSource::Rest,
+                    _ => crate::core::EmbedderSource::default(),
+                };
+                es.source = Some(source);
+                es.api_key = v.api_key.clone();
+                es.model = v.model.clone();
+                es.dimensions = v.dimensions.map(|d| d as usize);
+                es.url = v.url.clone();
+                (k.clone(), es)
+            })
+            .collect();
+        idx.update_embedders(lib_embs)?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+    fn reset_embedders(&self, index_uid: &str) -> Result<TaskInfo> {
+        let idx = self.resolve_index(index_uid)?;
+        idx.reset_embedders()?;
+        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+    }
+}
+
+// ─── Keys (stub -- no auth in embedded mode) ─────────────────────────────────
+
+impl traits::Keys for Engine {
+    fn list_keys(&self, _query: &PaginationQuery) -> Result<ApiKeyList> {
+        Ok(ApiKeyList {
+            results: vec![],
+            offset: 0,
+            limit: 20,
+            total: 0,
+        })
+    }
+    fn get_key(&self, _key_id: &str) -> Result<ApiKey> {
+        Err("API keys are not supported in embedded mode".into())
+    }
+    fn create_key(&self, _request: &CreateApiKeyRequest) -> Result<ApiKey> {
+        Err("API keys are not supported in embedded mode".into())
+    }
+    fn update_key(&self, _key_id: &str, _request: &UpdateApiKeyRequest) -> Result<ApiKey> {
+        Err("API keys are not supported in embedded mode".into())
+    }
+    fn delete_key(&self, _key_id: &str) -> Result<()> {
+        Err("API keys are not supported in embedded mode".into())
+    }
+}
+
+// ─── Webhooks (stub -- no webhooks in embedded mode) ─────────────────────────
+
+impl traits::Webhooks for Engine {
+    fn list_webhooks(&self) -> Result<Vec<Webhook>> {
+        Ok(vec![])
+    }
+    fn get_webhook(&self, _webhook_uid: &str) -> Result<Webhook> {
+        Err("Webhooks are not supported in embedded mode".into())
+    }
+    fn create_webhook(&self, _request: &CreateWebhookRequest) -> Result<Webhook> {
+        Err("Webhooks are not supported in embedded mode".into())
+    }
+    fn update_webhook(&self, _uid: &str, _request: &UpdateWebhookRequest) -> Result<Webhook> {
+        Err("Webhooks are not supported in embedded mode".into())
+    }
+    fn delete_webhook(&self, _webhook_uid: &str) -> Result<()> {
+        Err("Webhooks are not supported in embedded mode".into())
+    }
+}
+
+// ─── System ──────────────────────────────────────────────────────────────────
+
+impl traits::System for Engine {
+    fn global_stats(&self) -> Result<GlobalStats> {
+        let lib_stats = self.inner.stats()?;
+        Ok(GlobalStats {
+            database_size: lib_stats.database_size,
+            used_database_size: None,
+            last_update: lib_stats.last_update,
+            indexes: lib_stats
+                .indexes
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        k,
+                        IndexStats {
+                            number_of_documents: v.number_of_documents,
+                            is_indexing: v.is_indexing,
+                            field_distribution: v.field_distribution.into_iter().collect(),
+                        },
+                    )
+                })
+                .collect(),
+        })
+    }
+
+    fn index_stats(&self, index_uid: &str) -> Result<IndexStats> {
+        let lib_stats = self.inner.index_stats(index_uid)?;
+        Ok(IndexStats {
+            number_of_documents: lib_stats.number_of_documents,
+            is_indexing: lib_stats.is_indexing,
+            field_distribution: lib_stats.field_distribution.into_iter().collect(),
+        })
+    }
+
+    fn version(&self) -> Result<Version> {
+        let v = self.inner.version();
+        Ok(Version {
+            commit_sha: v.commit_sha,
+            commit_date: v.commit_date,
+            pkg_version: v.pkg_version,
+        })
+    }
+
+    fn health(&self) -> Result<Health> {
+        let h = self.inner.health();
+        Ok(Health { status: h.status })
+    }
+
+    fn create_dump(&self) -> Result<TaskInfo> {
+        std::fs::create_dir_all(&self.dump_dir)?;
+        let info = self.inner.create_dump(&self.dump_dir)?;
+        let _ = info; // dump completed successfully
+        Ok(self.next_task("dumpCreation", None))
+    }
+
+    fn create_snapshot(&self) -> Result<TaskInfo> {
+        std::fs::create_dir_all(&self.snapshot_dir)?;
+        self.inner.create_snapshot(&self.snapshot_dir)?;
+        Ok(self.next_task("snapshotCreation", None))
+    }
+
+    fn export(&self, _request: &ExportRequest) -> Result<TaskInfo> {
+        Err("Export requires an HTTP target and is not supported in embedded mode".into())
+    }
+}
+
+// ─── Experimental features ───────────────────────────────────────────────────
+
+impl traits::ExperimentalFeaturesApi for Engine {
+    fn get_experimental_features(&self) -> Result<ExperimentalFeatures> {
+        let lib_features = self.inner.get_experimental_features();
+        Ok(ExperimentalFeatures {
+            features: serde_json::from_value(serde_json::to_value(&lib_features)?)
+                .unwrap_or_default(),
+        })
+    }
+
+    fn update_experimental_features(
+        &self,
+        features: &ExperimentalFeatures,
+    ) -> Result<ExperimentalFeatures> {
+        let lib_features: crate::core::meilisearch::ExperimentalFeatures =
+            serde_json::from_value(serde_json::to_value(&features.features)?)?;
+        let updated = self.inner.update_experimental_features(lib_features);
+        Ok(ExperimentalFeatures {
+            features: serde_json::from_value(serde_json::to_value(&updated)?)
+                .unwrap_or_default(),
+        })
+    }
+}
