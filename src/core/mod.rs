@@ -16,8 +16,8 @@ pub mod vector;
 pub use error::{Error, Result};
 pub use index::{DocumentsResult, Index};
 pub use meilisearch::{
-    DumpInfo, ExperimentalFeatures, GlobalStats, HealthStatus, IndexInfo, IndexStats, Meilisearch,
-    VersionInfo,
+    DumpInfo, ExperimentalFeatures, GlobalStats, HealthStatus, IndexInfo, IndexMetadata,
+    IndexStats, Meilisearch, VersionInfo,
 };
 pub use options::MeilisearchOptions;
 pub use preprocessing::{
@@ -36,7 +36,7 @@ pub use settings::{
     EmbedderSettings, EmbedderSource, FacetValuesSort, FacetingSettings, LocalizedAttributeRule,
     MinWordSizeForTypos, PaginationSettings, ProximityPrecision, Settings, TypoToleranceSettings,
 };
-pub use vector::{NoOpVectorStore, VectorStore};
+pub use vector::{InMemoryVectorStore, NoOpVectorStore, VectorStore};
 
 #[cfg(feature = "surrealdb")]
 pub use vector::{SurrealDbVectorStore, SurrealDbVectorStoreConfig};

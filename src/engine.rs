@@ -57,6 +57,11 @@ impl Engine {
     fn resolve_index(&self, uid: &str) -> Result<std::sync::Arc<crate::core::Index>> {
         Ok(self.inner.get_index(uid)?)
     }
+
+    fn mutation_task(&self, index_uid: &str, task_type: &str) -> Result<TaskInfo> {
+        self.inner.touch_index_updated(index_uid)?;
+        Ok(self.next_task(task_type, Some(index_uid)))
+    }
 }
 
 fn now_iso8601() -> String {
@@ -532,7 +537,7 @@ impl traits::Documents for Engine {
     ) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.add_documents(documents.to_vec(), query.primary_key.as_deref())?;
-        Ok(self.next_task("documentAdditionOrUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "documentAdditionOrUpdate")
     }
 
     fn add_or_update_documents(
@@ -543,13 +548,13 @@ impl traits::Documents for Engine {
     ) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.update_documents(documents.to_vec(), query.primary_key.as_deref())?;
-        Ok(self.next_task("documentAdditionOrUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "documentAdditionOrUpdate")
     }
 
     fn delete_document(&self, index_uid: &str, document_id: &str) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.delete_document(document_id)?;
-        Ok(self.next_task("documentDeletion", Some(index_uid)))
+        self.mutation_task(index_uid, "documentDeletion")
     }
 
     fn delete_documents_by_filter(
@@ -559,7 +564,7 @@ impl traits::Documents for Engine {
     ) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.delete_by_filter(&request.filter)?;
-        Ok(self.next_task("documentDeletion", Some(index_uid)))
+        self.mutation_task(index_uid, "documentDeletion")
     }
 
     fn delete_documents_by_batch(
@@ -577,13 +582,13 @@ impl traits::Documents for Engine {
             })
             .collect();
         idx.delete_documents(ids)?;
-        Ok(self.next_task("documentDeletion", Some(index_uid)))
+        self.mutation_task(index_uid, "documentDeletion")
     }
 
     fn delete_all_documents(&self, index_uid: &str) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.clear()?;
-        Ok(self.next_task("documentDeletion", Some(index_uid)))
+        self.mutation_task(index_uid, "documentDeletion")
     }
 }
 
@@ -725,11 +730,16 @@ impl traits::Indexes for Engine {
     fn get_index(&self, index_uid: &str) -> Result<Index> {
         let idx = self.resolve_index(index_uid)?;
         let pk = idx.primary_key()?;
+        let (created_at, updated_at) = self
+            .inner
+            .get_index_metadata(index_uid)
+            .map(|m| (m.created_at, m.updated_at))
+            .unwrap_or_default();
         Ok(Index {
             uid: index_uid.to_string(),
             primary_key: pk,
-            created_at: String::new(),
-            updated_at: String::new(),
+            created_at,
+            updated_at,
         })
     }
 
@@ -746,7 +756,7 @@ impl traits::Indexes for Engine {
     ) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.update_primary_key(&request.primary_key)?;
-        Ok(self.next_task("indexUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "indexUpdate")
     }
 
     fn swap_indexes(&self, swaps: &[SwapIndexesRequest]) -> Result<TaskInfo> {
@@ -821,13 +831,13 @@ impl traits::SettingsApi for Engine {
         let idx = self.resolve_index(index_uid)?;
         let lib_settings = convert_settings_to_lib(settings);
         idx.update_settings(&lib_settings)?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
 
     fn reset_settings(&self, index_uid: &str) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.reset_settings()?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
 
     // ── Sub-settings ─────────────────────────────────────────────────────
@@ -839,12 +849,12 @@ impl traits::SettingsApi for Engine {
     fn update_ranking_rules(&self, index_uid: &str, rules: &[String]) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.update_ranking_rules(rules.to_vec())?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
     fn reset_ranking_rules(&self, index_uid: &str) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.reset_ranking_rules()?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
 
     fn get_distinct_attribute(&self, index_uid: &str) -> Result<Option<String>> {
@@ -854,12 +864,12 @@ impl traits::SettingsApi for Engine {
     fn update_distinct_attribute(&self, index_uid: &str, attr: &str) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.update_distinct_attribute(attr.to_string())?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
     fn reset_distinct_attribute(&self, index_uid: &str) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.reset_distinct_attribute()?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
 
     fn get_searchable_attributes(&self, index_uid: &str) -> Result<Vec<String>> {
@@ -869,12 +879,12 @@ impl traits::SettingsApi for Engine {
     fn update_searchable_attributes(&self, index_uid: &str, attrs: &[String]) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.update_searchable_attributes(attrs.to_vec())?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
     fn reset_searchable_attributes(&self, index_uid: &str) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.reset_searchable_attributes()?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
 
     fn get_displayed_attributes(&self, index_uid: &str) -> Result<Vec<String>> {
@@ -884,12 +894,12 @@ impl traits::SettingsApi for Engine {
     fn update_displayed_attributes(&self, index_uid: &str, attrs: &[String]) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.update_displayed_attributes(attrs.to_vec())?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
     fn reset_displayed_attributes(&self, index_uid: &str) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.reset_displayed_attributes()?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
 
     fn get_synonyms(&self, index_uid: &str) -> Result<HashMap<String, Vec<String>>> {
@@ -907,12 +917,12 @@ impl traits::SettingsApi for Engine {
         let idx = self.resolve_index(index_uid)?;
         let btree: BTreeMap<String, Vec<String>> = synonyms.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         idx.update_synonyms(btree)?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
     fn reset_synonyms(&self, index_uid: &str) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.reset_synonyms()?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
 
     fn get_stop_words(&self, index_uid: &str) -> Result<Vec<String>> {
@@ -925,12 +935,12 @@ impl traits::SettingsApi for Engine {
     fn update_stop_words(&self, index_uid: &str, words: &[String]) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.update_stop_words(words.iter().cloned().collect())?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
     fn reset_stop_words(&self, index_uid: &str) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.reset_stop_words()?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
 
     fn get_filterable_attributes(&self, index_uid: &str) -> Result<Vec<String>> {
@@ -940,12 +950,12 @@ impl traits::SettingsApi for Engine {
     fn update_filterable_attributes(&self, index_uid: &str, attrs: &[String]) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.update_filterable_attributes(attrs.to_vec())?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
     fn reset_filterable_attributes(&self, index_uid: &str) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.reset_filterable_attributes()?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
 
     fn get_sortable_attributes(&self, index_uid: &str) -> Result<Vec<String>> {
@@ -958,12 +968,12 @@ impl traits::SettingsApi for Engine {
     fn update_sortable_attributes(&self, index_uid: &str, attrs: &[String]) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.update_sortable_attributes(attrs.iter().cloned().collect())?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
     fn reset_sortable_attributes(&self, index_uid: &str) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.reset_sortable_attributes()?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
 
     fn get_typo_tolerance(&self, index_uid: &str) -> Result<TypoTolerance> {
@@ -997,12 +1007,12 @@ impl traits::SettingsApi for Engine {
             disable_on_numbers: config.disable_on_numbers,
         };
         idx.update_typo_tolerance(lib_typo)?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
     fn reset_typo_tolerance(&self, index_uid: &str) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.reset_typo_tolerance()?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
 
     fn get_pagination(&self, index_uid: &str) -> Result<Pagination> {
@@ -1019,12 +1029,12 @@ impl traits::SettingsApi for Engine {
         idx.update_pagination(crate::core::settings::PaginationSettings {
             max_total_hits: config.max_total_hits.map(|v| v as usize),
         })?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
     fn reset_pagination(&self, index_uid: &str) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.reset_pagination()?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
 
     fn get_faceting(&self, index_uid: &str) -> Result<Faceting> {
@@ -1067,12 +1077,12 @@ impl traits::SettingsApi for Engine {
             max_values_per_facet: config.max_values_per_facet.map(|v| v as usize),
             sort_facet_values_by: sort_map,
         })?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
     fn reset_faceting(&self, index_uid: &str) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.reset_faceting()?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
 
     fn get_dictionary(&self, index_uid: &str) -> Result<Vec<String>> {
@@ -1082,12 +1092,12 @@ impl traits::SettingsApi for Engine {
     fn update_dictionary(&self, index_uid: &str, words: &[String]) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.update_dictionary(words.iter().cloned().collect())?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
     fn reset_dictionary(&self, index_uid: &str) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.reset_dictionary()?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
 
     fn get_separator_tokens(&self, index_uid: &str) -> Result<Vec<String>> {
@@ -1097,12 +1107,12 @@ impl traits::SettingsApi for Engine {
     fn update_separator_tokens(&self, index_uid: &str, tokens: &[String]) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.update_separator_tokens(tokens.iter().cloned().collect())?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
     fn reset_separator_tokens(&self, index_uid: &str) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.reset_separator_tokens()?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
 
     fn get_non_separator_tokens(&self, index_uid: &str) -> Result<Vec<String>> {
@@ -1112,12 +1122,12 @@ impl traits::SettingsApi for Engine {
     fn update_non_separator_tokens(&self, index_uid: &str, tokens: &[String]) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.update_non_separator_tokens(tokens.iter().cloned().collect())?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
     fn reset_non_separator_tokens(&self, index_uid: &str) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.reset_non_separator_tokens()?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
 
     fn get_proximity_precision(&self, index_uid: &str) -> Result<String> {
@@ -1140,12 +1150,12 @@ impl traits::SettingsApi for Engine {
             other => return Err(format!("invalid proximity_precision: '{other}', expected 'byWord' or 'byAttribute'").into()),
         };
         idx.update_proximity_precision(p)?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
     fn reset_proximity_precision(&self, index_uid: &str) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.reset_proximity_precision()?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
 
     fn get_facet_search(&self, index_uid: &str) -> Result<bool> {
@@ -1155,12 +1165,12 @@ impl traits::SettingsApi for Engine {
     fn update_facet_search(&self, index_uid: &str, enabled: bool) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.update_facet_search(enabled)?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
     fn reset_facet_search(&self, index_uid: &str) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.reset_facet_search()?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
 
     fn get_prefix_search(&self, index_uid: &str) -> Result<String> {
@@ -1170,12 +1180,12 @@ impl traits::SettingsApi for Engine {
     fn update_prefix_search(&self, index_uid: &str, mode: &str) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.update_prefix_search(mode.to_string())?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
     fn reset_prefix_search(&self, index_uid: &str) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.reset_prefix_search()?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
 
     fn get_search_cutoff_ms(&self, index_uid: &str) -> Result<Option<u64>> {
@@ -1185,12 +1195,12 @@ impl traits::SettingsApi for Engine {
     fn update_search_cutoff_ms(&self, index_uid: &str, ms: u64) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.update_search_cutoff_ms(ms)?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
     fn reset_search_cutoff_ms(&self, index_uid: &str) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.reset_search_cutoff_ms()?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
 
     fn get_localized_attributes(
@@ -1222,12 +1232,12 @@ impl traits::SettingsApi for Engine {
             })
             .collect();
         idx.update_localized_attributes(lib_rules)?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
     fn reset_localized_attributes(&self, index_uid: &str) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.reset_localized_attributes()?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
 
     fn get_embedders(
@@ -1278,12 +1288,12 @@ impl traits::SettingsApi for Engine {
             })
             .collect();
         idx.update_embedders(lib_embs)?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
     fn reset_embedders(&self, index_uid: &str) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         idx.reset_embedders()?;
-        Ok(self.next_task("settingsUpdate", Some(index_uid)))
+        self.mutation_task(index_uid, "settingsUpdate")
     }
 }
 

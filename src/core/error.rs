@@ -70,6 +70,10 @@ pub enum Error {
     #[error("Experimental feature not enabled: {0}")]
     ExperimentalFeatureNotEnabled(String),
 
+    /// An error from the external vector store.
+    #[error("Vector store error: {0}")]
+    VectorStore(String),
+
     /// Invalid pagination parameters (both offset/limit and page/hitsPerPage set).
     #[error("Invalid pagination: {0}")]
     InvalidPagination(String),

@@ -1,6 +1,8 @@
 mod common;
 
 use common::TestContext;
+use wilysearch::core::MeilisearchOptions;
+use wilysearch::engine::Engine;
 use wilysearch::traits::*;
 use wilysearch::types::*;
 
@@ -166,4 +168,126 @@ fn test_version() {
     let ctx = TestContext::new();
     let version = ctx.engine.version().expect("version check failed");
     assert!(!version.pkg_version.is_empty());
+}
+
+#[test]
+fn test_index_has_created_at() {
+    let ctx = TestContext::new();
+    ctx.engine
+        .create_index(&CreateIndexRequest {
+            uid: "movies".to_string(),
+            primary_key: None,
+        })
+        .expect("failed to create index");
+
+    let index = ctx.engine.get_index("movies").expect("failed to get index");
+    assert!(!index.created_at.is_empty(), "created_at should be set");
+    assert!(!index.updated_at.is_empty(), "updated_at should be set");
+    // Verify ISO-8601 format (starts with a year)
+    assert!(index.created_at.starts_with("20"), "created_at should be ISO-8601");
+    assert!(index.updated_at.starts_with("20"), "updated_at should be ISO-8601");
+}
+
+#[test]
+fn test_updated_at_changes_on_document_add() {
+    let ctx = TestContext::new();
+    ctx.engine
+        .create_index(&CreateIndexRequest {
+            uid: "movies".to_string(),
+            primary_key: Some("id".to_string()),
+        })
+        .expect("failed to create index");
+
+    let before = ctx.engine.get_index("movies").unwrap();
+    let created_at_before = before.created_at.clone();
+    let updated_at_before = before.updated_at.clone();
+
+    // Small sleep to ensure timestamp advances
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
+    ctx.engine
+        .add_or_replace_documents(
+            "movies",
+            &common::sample_movies(),
+            &AddDocumentsQuery::default(),
+        )
+        .expect("failed to add documents");
+
+    let after = ctx.engine.get_index("movies").unwrap();
+    assert_eq!(after.created_at, created_at_before, "created_at should not change");
+    assert!(after.updated_at > updated_at_before, "updated_at should advance");
+}
+
+#[test]
+fn test_global_stats_last_update() {
+    let ctx = TestContext::new();
+    common::create_test_index(&ctx, "movies");
+
+    let stats = ctx.engine.global_stats().expect("failed to get global stats");
+    assert!(stats.last_update.is_some(), "last_update should be Some after mutations");
+    let ts = stats.last_update.unwrap();
+    assert!(ts.starts_with("20"), "last_update should be ISO-8601");
+}
+
+#[test]
+fn test_list_indexes_has_timestamps() {
+    let ctx = TestContext::new();
+    ctx.engine
+        .create_index(&CreateIndexRequest {
+            uid: "movies".to_string(),
+            primary_key: None,
+        })
+        .expect("failed to create index");
+
+    let list = ctx
+        .engine
+        .list_indexes(&PaginationQuery {
+            offset: None,
+            limit: Some(20),
+        })
+        .expect("failed to list indexes");
+
+    assert_eq!(list.results.len(), 1);
+    let idx = &list.results[0];
+    assert!(!idx.created_at.is_empty(), "created_at should be set in list");
+    assert!(!idx.updated_at.is_empty(), "updated_at should be set in list");
+}
+
+#[test]
+fn test_timestamps_persist_across_restart() {
+    let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+    let db_path = temp_dir.path().to_path_buf();
+
+    let created_at;
+    {
+        let engine = Engine::new(MeilisearchOptions {
+            db_path: db_path.clone(),
+            max_index_size: 100 * 1024 * 1024,
+            max_task_db_size: 10 * 1024 * 1024,
+        })
+        .expect("failed to create engine");
+
+        engine
+            .create_index(&CreateIndexRequest {
+                uid: "movies".to_string(),
+                primary_key: None,
+            })
+            .expect("failed to create index");
+
+        let index = engine.get_index("movies").unwrap();
+        created_at = index.created_at.clone();
+        assert!(!created_at.is_empty());
+    }
+
+    // Reopen with a fresh Engine pointing at the same db_path
+    let engine2 = Engine::new(MeilisearchOptions {
+        db_path,
+        max_index_size: 100 * 1024 * 1024,
+        max_task_db_size: 10 * 1024 * 1024,
+    })
+    .expect("failed to reopen engine");
+
+    let index = engine2.get_index("movies").unwrap();
+    assert_eq!(index.created_at, created_at, "created_at should survive restart");
+    assert!(!index.updated_at.is_empty(), "updated_at should survive restart");
 }

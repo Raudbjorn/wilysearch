@@ -24,6 +24,23 @@ use crate::core::settings::{
 };
 use crate::core::vector::VectorStore;
 
+/// Convert a primary key JSON value to the string form milli uses for external ID mapping.
+fn pk_value_to_string(val: &Value) -> String {
+    match val {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                i.to_string()
+            } else if let Some(u) = n.as_u64() {
+                u.to_string()
+            } else {
+                n.to_string()
+            }
+        }
+        other => other.to_string(),
+    }
+}
+
 /// Result of a document retrieval operation with pagination info.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DocumentsResult {
@@ -54,6 +71,165 @@ impl Index {
     /// Wrap a raw milli index with an optional external vector store.
     pub fn new(inner: milli::Index, vector_store: Option<Arc<dyn VectorStore>>) -> Self {
         Self { inner, vector_store }
+    }
+
+    /// Parse all vectors from a `_vectors` JSON value.
+    ///
+    /// Supports three formats per embedder:
+    /// - `{"embedder": [f32, ...]}` -- single vector
+    /// - `{"embedder": [[f32, ...], ...]}` -- multi-vector
+    /// - `{"embedder": {"embeddings": [...], "regenerate": bool}}` -- structured
+    ///
+    /// Returns all vectors from all embedders flattened into one list.
+    fn parse_vectors_value(vectors_val: &Value) -> Result<Vec<Vec<f32>>> {
+        let obj = match vectors_val.as_object() {
+            Some(o) => o,
+            None => return Ok(Vec::new()),
+        };
+
+        let mut all_vectors = Vec::new();
+
+        for (_embedder_name, val) in obj {
+            match val {
+                // Single vector: [f32, ...]
+                Value::Array(arr) if arr.first().map_or(false, |v| v.is_number()) => {
+                    let vec: Vec<f32> = arr
+                        .iter()
+                        .filter_map(|v| v.as_f64().map(|f| f as f32))
+                        .collect();
+                    if !vec.is_empty() {
+                        all_vectors.push(vec);
+                    }
+                }
+                // Multi-vector: [[f32, ...], ...]
+                Value::Array(arr) if arr.first().map_or(false, |v| v.is_array()) => {
+                    for inner in arr {
+                        if let Value::Array(nums) = inner {
+                            let vec: Vec<f32> = nums
+                                .iter()
+                                .filter_map(|v| v.as_f64().map(|f| f as f32))
+                                .collect();
+                            if !vec.is_empty() {
+                                all_vectors.push(vec);
+                            }
+                        }
+                    }
+                }
+                // Structured: {"embeddings": [...], "regenerate": bool}
+                Value::Object(inner) => {
+                    if let Some(embeddings) = inner.get("embeddings") {
+                        if let Value::Array(emb_arr) = embeddings {
+                            for item in emb_arr {
+                                match item {
+                                    // [[f32, ...], ...]
+                                    Value::Array(nums) if nums.first().map_or(false, |v| v.is_number()) => {
+                                        let vec: Vec<f32> = nums
+                                            .iter()
+                                            .filter_map(|v| v.as_f64().map(|f| f as f32))
+                                            .collect();
+                                        if !vec.is_empty() {
+                                            all_vectors.push(vec);
+                                        }
+                                    }
+                                    // [[[f32, ...], ...]]
+                                    Value::Array(inner_arr) if inner_arr.first().map_or(false, |v| v.is_array()) => {
+                                        for nested in inner_arr {
+                                            if let Value::Array(nums) = nested {
+                                                let vec: Vec<f32> = nums
+                                                    .iter()
+                                                    .filter_map(|v| v.as_f64().map(|f| f as f32))
+                                                    .collect();
+                                                if !vec.is_empty() {
+                                                    all_vectors.push(vec);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(all_vectors)
+    }
+
+    /// Scan input documents for `_vectors` fields and pair each with its external ID string.
+    ///
+    /// Returns an empty vec if no primary key is known or no vectors are found.
+    fn extract_pending_vectors(
+        documents: &[Value],
+        pk_name: Option<&str>,
+    ) -> Result<Vec<(String, Vec<Vec<f32>>)>> {
+        let pk_name = match pk_name {
+            Some(name) => name,
+            None => return Ok(Vec::new()),
+        };
+
+        let mut pending = Vec::new();
+
+        for doc in documents {
+            let obj = match doc.as_object() {
+                Some(o) => o,
+                None => continue,
+            };
+
+            let vectors_val = match obj.get("_vectors") {
+                Some(v) => v,
+                None => continue,
+            };
+
+            let pk_val = match obj.get(pk_name) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            let vectors = Self::parse_vectors_value(vectors_val)?;
+            if !vectors.is_empty() {
+                pending.push((pk_value_to_string(pk_val), vectors));
+            }
+        }
+
+        Ok(pending)
+    }
+
+    /// Resolve pending external IDs to internal IDs via the uncommitted write txn,
+    /// then call `store.add_documents()`.
+    ///
+    /// No-op if no vector store is configured or the pending list is empty.
+    fn sync_pending_vectors(
+        &self,
+        wtxn: &milli::heed::RwTxn<'_>,
+        pending: Vec<(String, Vec<Vec<f32>>)>,
+    ) -> Result<()> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let store = match &self.vector_store {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        let external_ids = self.inner.external_documents_ids();
+        let mut pairs: Vec<(u32, Vec<Vec<f32>>)> = Vec::with_capacity(pending.len());
+
+        for (ext_id, vectors) in pending {
+            if let Some(internal_id) = external_ids.get(wtxn, &ext_id).map_err(Error::Heed)? {
+                pairs.push((internal_id, vectors));
+            }
+        }
+
+        if !pairs.is_empty() {
+            store
+                .add_documents(&pairs)
+                .map_err(|e| Error::VectorStore(e.to_string()))?;
+        }
+
+        Ok(())
     }
 
     /// Add or replace documents in the index.
@@ -97,6 +273,14 @@ impl Index {
             }
         }
 
+        // Extract pending vectors before the batch loop consumes documents.
+        // Use the provided PK or read the one already set on the index.
+        let pk_name = match primary_key {
+            Some(pk) => Some(pk.to_string()),
+            None => self.inner.primary_key(&wtxn).map_err(Error::Heed)?.map(|s| s.to_string()),
+        };
+        let pending_vectors = Self::extract_pending_vectors(&documents, pk_name.as_deref())?;
+
         let config = milli::update::IndexDocumentsConfig::default();
         let indexer_config = IndexerConfig::default();
 
@@ -136,10 +320,8 @@ impl Index {
         // Execute
         builder.execute().map_err(Error::Milli)?;
 
-        // Manual vector extraction if vector_store is present
-        if let Some(_store) = &self.vector_store {
-            // TODO: Implement vector extraction
-        }
+        // Sync extracted vectors to the external VectorStore
+        self.sync_pending_vectors(&wtxn, pending_vectors)?;
 
         wtxn.commit().map_err(|e| Error::Heed(e))?;
 
@@ -171,6 +353,13 @@ impl Index {
                     .map_err(Error::Milli)?;
             }
         }
+
+        // Extract pending vectors before the batch loop consumes documents.
+        let pk_name = match primary_key {
+            Some(pk) => Some(pk.to_string()),
+            None => self.inner.primary_key(&wtxn).map_err(Error::Heed)?.map(|s| s.to_string()),
+        };
+        let pending_vectors = Self::extract_pending_vectors(&documents, pk_name.as_deref())?;
 
         let config = milli::update::IndexDocumentsConfig {
             update_method: IndexDocumentsMethod::UpdateDocuments,
@@ -213,6 +402,9 @@ impl Index {
 
         // Execute
         builder.execute().map_err(Error::Milli)?;
+
+        // Sync extracted vectors to the external VectorStore
+        self.sync_pending_vectors(&wtxn, pending_vectors)?;
 
         wtxn.commit().map_err(|e| Error::Heed(e))?;
 
@@ -1047,12 +1239,20 @@ impl Index {
         let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
         let rtxn = self.inner.read_txn().map_err(Error::Heed)?;
 
-        // Count how many documents actually exist before deletion
+        // Count how many documents actually exist before deletion and
+        // collect their internal IDs for VectorStore cleanup.
         let external_ids = self.inner.external_documents_ids();
-        let existing_count = ids
-            .iter()
-            .filter(|id| external_ids.get(&rtxn, id).ok().flatten().is_some())
-            .count() as u64;
+        let mut existing_count = 0u64;
+        let mut vector_ids_to_remove: Vec<u32> = Vec::new();
+
+        for id in &ids {
+            if let Some(internal_id) = external_ids.get(&rtxn, id).ok().flatten() {
+                existing_count += 1;
+                if self.vector_store.is_some() {
+                    vector_ids_to_remove.push(internal_id);
+                }
+            }
+        }
 
         if existing_count == 0 {
             return Ok(0);
@@ -1114,6 +1314,15 @@ impl Index {
         .map_err(|e| Error::Internal(e.to_string()))?
         .map_err(Error::Milli)?;
 
+        // Remove vectors from the external VectorStore
+        if let Some(store) = &self.vector_store {
+            if !vector_ids_to_remove.is_empty() {
+                store
+                    .remove_documents(&vector_ids_to_remove)
+                    .map_err(|e| Error::VectorStore(e.to_string()))?;
+            }
+        }
+
         wtxn.commit().map_err(Error::Heed)?;
 
         Ok(existing_count)
@@ -1144,6 +1353,13 @@ impl Index {
         if count == 0 {
             return Ok(0);
         }
+
+        // Collect internal IDs for VectorStore cleanup before the delete
+        let vector_ids_to_remove: Vec<u32> = if self.vector_store.is_some() {
+            candidates.iter().collect()
+        } else {
+            Vec::new()
+        };
 
         let indexer_config = IndexerConfig::default();
         let pool = &indexer_config.thread_pool;
@@ -1194,6 +1410,15 @@ impl Index {
         })
         .map_err(|e| Error::Internal(e.to_string()))?
         .map_err(Error::Milli)?;
+
+        // Remove vectors from the external VectorStore
+        if let Some(store) = &self.vector_store {
+            if !vector_ids_to_remove.is_empty() {
+                store
+                    .remove_documents(&vector_ids_to_remove)
+                    .map_err(|e| Error::VectorStore(e.to_string()))?;
+            }
+        }
 
         wtxn.commit().map_err(Error::Heed)?;
 
@@ -1645,6 +1870,13 @@ impl Index {
 
         let clear_op = milli::update::ClearDocuments::new(&mut wtxn, &self.inner);
         let deleted_count = clear_op.execute().map_err(Error::Milli)?;
+
+        // Clear the external VectorStore
+        if let Some(store) = &self.vector_store {
+            store
+                .clear()
+                .map_err(|e| Error::VectorStore(e.to_string()))?;
+        }
 
         wtxn.commit().map_err(Error::Heed)?;
 

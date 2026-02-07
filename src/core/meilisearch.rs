@@ -1,6 +1,7 @@
 use milli::progress::EmbedderStats;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
@@ -110,6 +111,34 @@ pub struct IndexInfo {
     pub updated_at: Option<String>,
 }
 
+/// Per-index creation and update timestamps, persisted as `metadata.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexMetadata {
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+const METADATA_FILE: &str = "metadata.json";
+
+fn now_iso8601() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+fn load_index_metadata(index_dir: &Path) -> Option<IndexMetadata> {
+    let path = index_dir.join(METADATA_FILE);
+    let data = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+fn save_index_metadata(index_dir: &Path, meta: &IndexMetadata) -> Result<()> {
+    let path = index_dir.join(METADATA_FILE);
+    let data = serde_json::to_string(meta)?;
+    std::fs::write(&path, data)?;
+    Ok(())
+}
+
 /// Top-level handle for an embedded Meilisearch instance.
 ///
 /// `Meilisearch` owns the LMDB environment and an in-memory cache of loaded
@@ -119,6 +148,7 @@ pub struct IndexInfo {
 pub struct Meilisearch {
     options: MeilisearchOptions,
     indexes: RwLock<HashMap<String, Arc<Index>>>,
+    index_metadata: RwLock<HashMap<String, IndexMetadata>>,
     #[allow(dead_code)] // Held to keep the LMDB environment open (RAII).
     db_env: Arc<milli::heed::Env>,
     vector_store: Option<Arc<dyn VectorStore>>,
@@ -156,9 +186,35 @@ impl Meilisearch {
         // unsafe { env_builder.open(...) } is required by heed
         let db_env = Arc::new(unsafe { env_builder.open(&options.db_path).map_err(Error::Heed)? });
 
+        // Load persisted metadata for all existing indexes, backfilling any that lack it
+        let mut metadata_cache = HashMap::new();
+        let indexes_dir = options.db_path.join("indexes");
+        if indexes_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&indexes_dir) {
+                for entry in entries.flatten() {
+                    if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        if let Some(uid) = entry.file_name().to_str() {
+                            let uid = uid.to_string();
+                            let meta = load_index_metadata(&entry.path()).unwrap_or_else(|| {
+                                let now = now_iso8601();
+                                let backfill = IndexMetadata {
+                                    created_at: now.clone(),
+                                    updated_at: now,
+                                };
+                                let _ = save_index_metadata(&entry.path(), &backfill);
+                                backfill
+                            });
+                            metadata_cache.insert(uid, meta);
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(Self {
             options,
             indexes: RwLock::new(HashMap::new()),
+            index_metadata: RwLock::new(metadata_cache),
             db_env,
             vector_store: None,
             experimental_features: RwLock::new(ExperimentalFeatures::default()),
@@ -242,6 +298,18 @@ impl Meilisearch {
         let index = Arc::new(Index::new(milli_index, self.vector_store.clone()));
         indexes.insert(uid.to_string(), index.clone());
 
+        // Persist creation metadata
+        let now = now_iso8601();
+        let meta = IndexMetadata {
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        let _ = save_index_metadata(&index_path, &meta);
+        self.index_metadata
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(uid.to_string(), meta);
+
         Ok(index)
     }
 
@@ -314,8 +382,14 @@ impl Meilisearch {
             }
         }
 
-        // Delete index directory from disk
+        // Delete index directory from disk (metadata.json goes with it)
         std::fs::remove_dir_all(&index_path)?;
+
+        // Remove from metadata cache
+        self.index_metadata
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(uid);
 
         Ok(())
     }
@@ -373,6 +447,27 @@ impl Meilisearch {
         })
     }
 
+    /// Update the `updated_at` timestamp for an index and persist to disk.
+    pub fn touch_index_updated(&self, uid: &str) -> Result<()> {
+        let now = now_iso8601();
+        let index_path = self.options.db_path.join("indexes").join(uid);
+        let mut cache = self.index_metadata.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(meta) = cache.get_mut(uid) {
+            meta.updated_at = now;
+            save_index_metadata(&index_path, meta)?;
+        }
+        Ok(())
+    }
+
+    /// Get a clone of the metadata for an index, if it exists.
+    pub fn get_index_metadata(&self, uid: &str) -> Option<IndexMetadata> {
+        self.index_metadata
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(uid)
+            .cloned()
+    }
+
     // ========================================================================
     // Instance Operations (Tasks 5.1 - 5.4)
     // ========================================================================
@@ -409,9 +504,17 @@ impl Meilisearch {
             total_size = dir_size(db_path).unwrap_or(0);
         }
 
+        let last_update = self
+            .index_metadata
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(|m| m.updated_at.clone())
+            .max();
+
         Ok(GlobalStats {
             database_size: total_size,
-            last_update: None, // TODO: track last update time
+            last_update,
             indexes,
         })
     }
@@ -544,10 +647,26 @@ impl Meilisearch {
             drop(idx_a);
             drop(idx_b);
 
-            // Rename directories atomically
+            // Rename directories atomically (metadata.json moves with them)
             std::fs::rename(&index_path_a, &tmp_path)?;
             std::fs::rename(&index_path_b, &index_path_a)?;
             std::fs::rename(&tmp_path, &index_path_b)?;
+
+            // Swap metadata entries and bump updated_at
+            let now = now_iso8601();
+            let mut meta_cache = self.index_metadata.write().unwrap_or_else(|e| e.into_inner());
+            let meta_a = meta_cache.remove(*a);
+            let meta_b = meta_cache.remove(*b);
+            if let Some(mut m) = meta_b {
+                m.updated_at = now.clone();
+                let _ = save_index_metadata(&index_path_a, &m);
+                meta_cache.insert(a.to_string(), m);
+            }
+            if let Some(mut m) = meta_a {
+                m.updated_at = now;
+                let _ = save_index_metadata(&index_path_b, &m);
+                meta_cache.insert(b.to_string(), m);
+            }
         }
 
         // Indexes will be re-loaded on next access via get_index()
@@ -612,6 +731,7 @@ impl Meilisearch {
 
         let paginated: Vec<String> = all_uids.into_iter().skip(offset).take(limit).collect();
 
+        let meta_cache = self.index_metadata.read().unwrap_or_else(|e| e.into_inner());
         let mut infos = Vec::with_capacity(paginated.len());
         for uid in paginated {
             let primary_key = if let Ok(index) = self.get_index(&uid) {
@@ -620,11 +740,16 @@ impl Meilisearch {
                 None
             };
 
+            let (created_at, updated_at) = meta_cache
+                .get(&uid)
+                .map(|m| (Some(m.created_at.clone()), Some(m.updated_at.clone())))
+                .unwrap_or((None, None));
+
             infos.push(IndexInfo {
                 uid,
                 primary_key,
-                created_at: None, // TODO: track creation time
-                updated_at: None, // TODO: track update time
+                created_at,
+                updated_at,
             });
         }
 

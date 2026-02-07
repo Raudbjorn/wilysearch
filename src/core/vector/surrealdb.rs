@@ -559,6 +559,17 @@ impl SurrealDbVectorStore {
         Ok(())
     }
 
+    /// Remove all vectors from the store.
+    pub async fn clear_async(&self) -> Result<()> {
+        let table = &self.config.table;
+        let query = format!("DELETE FROM {table};");
+        self.db
+            .query(&query)
+            .await
+            .context("Failed to clear vector store")?;
+        Ok(())
+    }
+
     /// Get statistics about the vector store.
     pub async fn stats(&self) -> Result<VectorStoreStats> {
         let table = &self.config.table;
@@ -745,6 +756,19 @@ impl VectorStore for SurrealDbVectorStore {
 
     fn dimensions(&self) -> Result<Option<usize>> {
         Ok(Some(self.config.dimensions))
+    }
+
+    fn clear(&self) -> Result<()> {
+        let db = Arc::clone(&self.db);
+        let table = self.config.table.clone();
+
+        self.runtime.block_on(async move {
+            let query = format!("DELETE FROM {table};");
+            db.query(&query)
+                .await
+                .context("Failed to clear vector store")?;
+            Ok(())
+        })
     }
 }
 
