@@ -387,24 +387,42 @@ impl SynonymMap {
             return; // Need at least 2 terms for a synonym group
         }
 
-        // Check if any term is already in a group
-        let existing_group_id = terms.iter().find_map(|t| self.multi_way_index.get(t).copied());
+        let mut affected_group_ids: Vec<usize> = terms
+            .iter()
+            .filter_map(|t| self.multi_way_index.get(t).copied())
+            .collect();
+        affected_group_ids.sort_unstable();
+        affected_group_ids.dedup();
 
-        match existing_group_id {
-            Some(group_id) => {
-                // Merge with existing group
-                for term in &terms {
-                    self.multi_way_index.insert(term.clone(), group_id);
-                }
-                self.multi_way_groups[group_id].extend(terms);
-            }
-            None => {
-                // Create new group
+        match affected_group_ids.len() {
+            0 => {
                 let group_id = self.multi_way_groups.len();
                 for term in &terms {
                     self.multi_way_index.insert(term.clone(), group_id);
                 }
                 self.multi_way_groups.push(terms);
+            }
+            1 => {
+                let group_id = affected_group_ids[0];
+                for term in &terms {
+                    self.multi_way_index.insert(term.clone(), group_id);
+                }
+                self.multi_way_groups[group_id].extend(terms);
+            }
+            _ => {
+                let target_id = affected_group_ids[0];
+                let mut merged = std::mem::take(&mut self.multi_way_groups[target_id]);
+                merged.extend(terms);
+
+                for &other_id in affected_group_ids[1..].iter().rev() {
+                    let other = std::mem::take(&mut self.multi_way_groups[other_id]);
+                    merged.extend(other);
+                }
+
+                for term in &merged {
+                    self.multi_way_index.insert(term.clone(), target_id);
+                }
+                self.multi_way_groups[target_id] = merged;
             }
         }
     }
@@ -475,7 +493,9 @@ impl SynonymMap {
             }
         }
 
-        expansions.into_iter().collect()
+        let mut result: Vec<String> = expansions.into_iter().collect();
+        result.sort();
+        result
     }
 
     /// Expand a full query, returning an `ExpandedQuery` with alternatives at each position.

@@ -178,17 +178,24 @@ where
             return Ok(keyword_results);
         }
 
-        // Fuse results using RRF
+        let keyword_weight = 1.0 - semantic_ratio;
+        let semantic_weight = semantic_ratio;
+
+        let weighted_keyword: Vec<RetrievalResult<D>> = keyword_results
+            .into_iter()
+            .map(|mut r| { r.score *= keyword_weight; r })
+            .collect();
+        let weighted_semantic: Vec<RetrievalResult<D>> = semantic_results
+            .into_iter()
+            .map(|mut r| { r.score *= semantic_weight; r })
+            .collect();
+
         let fused = fuse_retrieval_results(
-            vec![keyword_results, semantic_results],
+            vec![weighted_keyword, weighted_semantic],
             self.k_constant,
             query.limit,
             |doc| doc.id(),
         );
-
-        // Optionally adjust scores based on semantic_ratio
-        // (RRF already handles this implicitly, but we could weight differently)
-        let _ = semantic_ratio; // Acknowledge the variable
 
         Ok(fused)
     }
@@ -212,8 +219,11 @@ impl HasId for serde_json::Value {
     fn id(&self) -> String {
         self.get("id")
             .or_else(|| self.get("_id"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+            .and_then(|v| match v {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            })
             .unwrap_or_else(|| self.to_string())
     }
 }

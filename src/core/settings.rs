@@ -571,10 +571,13 @@ impl<'a, 't, 'i> SettingsApplier<'a, 't, 'i> {
         }
 
         if let Some(ref rules) = settings.ranking_rules {
-            let criteria: Vec<milli::Criterion> = rules
-                .iter()
-                .filter_map(|r| r.parse().ok())
-                .collect();
+            let mut criteria: Vec<milli::Criterion> = Vec::with_capacity(rules.len());
+            for r in rules {
+                match r.parse() {
+                    Ok(c) => criteria.push(c),
+                    Err(e) => log::warn!("Skipping invalid ranking rule '{r}': {e}"),
+                }
+            }
             self.builder.set_criteria(criteria);
         }
 

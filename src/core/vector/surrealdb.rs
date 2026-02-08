@@ -282,9 +282,13 @@ impl SurrealDbVectorStore {
             .await
             .context("Failed to define schema")?;
 
-        // Check for errors in schema definition
-        for (index, error) in response.take_errors() {
-            log::warn!("Schema definition warning at statement {}: {}", index, error);
+        let errors: Vec<_> = response.take_errors().collect();
+        if !errors.is_empty() {
+            let messages: Vec<String> = errors
+                .into_iter()
+                .map(|(idx, err)| format!("statement {idx}: {err}"))
+                .collect();
+            anyhow::bail!("Schema definition failed: {}", messages.join("; "));
         }
 
         Ok(())
@@ -299,41 +303,32 @@ impl SurrealDbVectorStore {
         let table = &self.config.table;
 
         for (doc_id, vectors) in documents {
-            // Delete existing vectors for this doc_id to prevent stale records
-            // when a document is updated with fewer vectors than before.
-            let delete_query = format!(
-                r#"DELETE FROM {table} WHERE doc_id = $doc_id;"#
-            );
-            self.db
-                .query(&delete_query)
-                .bind(("doc_id", *doc_id))
-                .await
-                .with_context(|| format!("Failed to delete old vectors for document {}", doc_id))?;
+            let mut transaction_query = String::from("BEGIN TRANSACTION;\n");
 
-            // Insert new vectors
-            for (vec_idx, vector) in vectors.iter().enumerate() {
+            transaction_query.push_str(&format!(
+                "DELETE FROM {table} WHERE doc_id = $doc_id;\n"
+            ));
+
+            for (vec_idx, _vector) in vectors.iter().enumerate() {
                 let record_id = if vectors.len() == 1 {
                     format!("{}", doc_id)
                 } else {
                     format!("{}_{}", doc_id, vec_idx)
                 };
 
-                let query = format!(
-                    r#"
-                    CREATE {table}:`{record_id}` CONTENT {{
-                        doc_id: $doc_id,
-                        embedding: $embedding
-                    }};
-                    "#
-                );
-
-                self.db
-                    .query(&query)
-                    .bind(("doc_id", *doc_id))
-                    .bind(("embedding", vector.clone()))
-                    .await
-                    .with_context(|| format!("Failed to insert vector for document {}", doc_id))?;
+                transaction_query.push_str(&format!(
+                    "CREATE {table}:`{record_id}` CONTENT {{ doc_id: $doc_id, embedding: $embedding_{vec_idx} }};\n"
+                ));
             }
+
+            transaction_query.push_str("COMMIT TRANSACTION;\n");
+
+            let mut query = self.db.query(&transaction_query).bind(("doc_id", *doc_id));
+            for (vec_idx, vector) in vectors.iter().enumerate() {
+                query = query.bind((format!("embedding_{vec_idx}"), vector.clone()));
+            }
+            query.await
+                .with_context(|| format!("Failed to upsert vectors for document {}", doc_id))?;
         }
 
         Ok(())
@@ -640,37 +635,32 @@ impl VectorStore for SurrealDbVectorStore {
 
         self.block_on(async move {
             for (doc_id, vectors) in &documents {
-                // Delete existing vectors for this doc_id to prevent stale records
-                let delete_query = format!(
-                    r#"DELETE FROM {table} WHERE doc_id = $doc_id;"#
-                );
-                db.query(&delete_query)
-                    .bind(("doc_id", *doc_id))
-                    .await
-                    .with_context(|| format!("Failed to delete old vectors for document {}", doc_id))?;
+                let mut transaction_query = String::from("BEGIN TRANSACTION;\n");
 
-                for (vec_idx, vector) in vectors.iter().enumerate() {
+                transaction_query.push_str(&format!(
+                    "DELETE FROM {table} WHERE doc_id = $doc_id;\n"
+                ));
+
+                for (vec_idx, _vector) in vectors.iter().enumerate() {
                     let record_id = if vectors.len() == 1 {
                         format!("{}", doc_id)
                     } else {
                         format!("{}_{}", doc_id, vec_idx)
                     };
 
-                    let query = format!(
-                        r#"
-                        CREATE {table}:`{record_id}` CONTENT {{
-                            doc_id: $doc_id,
-                            embedding: $embedding
-                        }};
-                        "#
-                    );
-
-                    db.query(&query)
-                        .bind(("doc_id", *doc_id))
-                        .bind(("embedding", vector.clone()))
-                        .await
-                        .with_context(|| format!("Failed to insert vector for document {}", doc_id))?;
+                    transaction_query.push_str(&format!(
+                        "CREATE {table}:`{record_id}` CONTENT {{ doc_id: $doc_id, embedding: $embedding_{vec_idx} }};\n"
+                    ));
                 }
+
+                transaction_query.push_str("COMMIT TRANSACTION;\n");
+
+                let mut query = db.query(&transaction_query).bind(("doc_id", *doc_id));
+                for (vec_idx, vector) in vectors.iter().enumerate() {
+                    query = query.bind((format!("embedding_{vec_idx}"), vector.clone()));
+                }
+                query.await
+                    .with_context(|| format!("Failed to upsert vectors for document {}", doc_id))?;
             }
             Ok(())
         })

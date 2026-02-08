@@ -484,8 +484,9 @@ impl Meilisearch {
         let mut total_size = 0u64;
 
         for uid in &index_uids {
-            if let Ok(stats) = self.index_stats(uid) {
-                indexes.insert(uid.clone(), stats);
+            match self.index_stats(uid) {
+                Ok(stats) => { indexes.insert(uid.clone(), stats); }
+                Err(e) => { log::warn!("Failed to collect stats for index '{uid}': {e}"); }
             }
         }
 
@@ -702,10 +703,16 @@ impl Meilisearch {
             drop(idx_a);
             drop(idx_b);
 
-            // Rename directories atomically (metadata.json moves with them)
             std::fs::rename(&index_path_a, &tmp_path)?;
-            std::fs::rename(&index_path_b, &index_path_a)?;
-            std::fs::rename(&tmp_path, &index_path_b)?;
+            if let Err(e) = std::fs::rename(&index_path_b, &index_path_a) {
+                let _ = std::fs::rename(&tmp_path, &index_path_a);
+                return Err(e.into());
+            }
+            if let Err(e) = std::fs::rename(&tmp_path, &index_path_b) {
+                let _ = std::fs::rename(&index_path_a, &index_path_b);
+                let _ = std::fs::rename(&tmp_path, &index_path_a);
+                return Err(e.into());
+            }
 
             // Swap metadata entries and bump updated_at
             let now = now_iso8601();

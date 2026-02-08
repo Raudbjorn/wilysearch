@@ -23,6 +23,8 @@ pub struct Engine {
     dump_dir: std::path::PathBuf,
     snapshot_dir: std::path::PathBuf,
     #[allow(dead_code)]
+    dump_lock: std::sync::Mutex<()>,
+    #[allow(dead_code)]
     search_defaults: crate::config::SearchDefaultsConfig,
     #[allow(dead_code)]
     preprocessing_config: crate::core::preprocessing::config::PreprocessingConfig,
@@ -41,6 +43,7 @@ impl Engine {
             task_counter: AtomicU64::new(0),
             dump_dir,
             snapshot_dir,
+            dump_lock: std::sync::Mutex::new(()),
             search_defaults: crate::config::SearchDefaultsConfig::default(),
             preprocessing_config: crate::core::preprocessing::config::PreprocessingConfig::default(),
             rag_config: crate::config::RagConfig::default(),
@@ -96,6 +99,7 @@ impl Engine {
             task_counter: AtomicU64::new(0),
             dump_dir,
             snapshot_dir,
+            dump_lock: std::sync::Mutex::new(()),
             search_defaults: config.search_defaults,
             preprocessing_config: config.preprocessing,
             rag_config: config.rag,
@@ -397,8 +401,8 @@ fn convert_settings_to_lib(s: &Settings) -> Result<crate::core::Settings> {
             enabled: typo.enabled,
             min_word_size_for_typos: typo.min_word_size_for_typos.as_ref().map(|m| {
                 crate::core::settings::MinWordSizeForTypos {
-                    one_typo: m.one_typo.map(|v| v as u8),
-                    two_typos: m.two_typos.map(|v| v as u8),
+                    one_typo: m.one_typo.map(|v| u8::try_from(v).unwrap_or(u8::MAX)),
+                    two_typos: m.two_typos.map(|v| u8::try_from(v).unwrap_or(u8::MAX)),
                 }
             }),
             disable_on_words: typo.disable_on_words.as_ref().map(|w| w.iter().cloned().collect()),
@@ -650,8 +654,8 @@ impl traits::Documents for Engine {
             let result = idx.get_documents_with_options(&options)?;
             return Ok(DocumentsResponse {
                 results: result.documents,
-                offset: result.offset as u32,
-                limit: result.limit as u32,
+                offset: u32::try_from(result.offset).unwrap_or(u32::MAX),
+                limit: u32::try_from(result.limit).unwrap_or(u32::MAX),
                 total: result.total,
             });
         }
@@ -659,8 +663,8 @@ impl traits::Documents for Engine {
         let result = idx.get_documents(offset, limit)?;
         Ok(DocumentsResponse {
             results: result.documents,
-            offset: result.offset as u32,
-            limit: result.limit as u32,
+            offset: u32::try_from(result.offset).unwrap_or(u32::MAX),
+            limit: u32::try_from(result.limit).unwrap_or(u32::MAX),
             total: result.total,
         })
     }
@@ -681,8 +685,8 @@ impl traits::Documents for Engine {
         let result = idx.get_documents_with_options(&options)?;
         Ok(DocumentsResponse {
             results: result.documents,
-            offset: result.offset as u32,
-            limit: result.limit as u32,
+            offset: u32::try_from(result.offset).unwrap_or(u32::MAX),
+            limit: u32::try_from(result.limit).unwrap_or(u32::MAX),
             total: result.total,
         })
     }
@@ -1179,8 +1183,8 @@ impl traits::SettingsApi for Engine {
             enabled: config.enabled,
             min_word_size_for_typos: config.min_word_size_for_typos.as_ref().map(|m| {
                 crate::core::settings::MinWordSizeForTypos {
-                    one_typo: m.one_typo.map(|v| v as u8),
-                    two_typos: m.two_typos.map(|v| v as u8),
+                    one_typo: m.one_typo.map(|v| u8::try_from(v).unwrap_or(u8::MAX)),
+                    two_typos: m.two_typos.map(|v| u8::try_from(v).unwrap_or(u8::MAX)),
                 }
             }),
             disable_on_words: config.disable_on_words.as_ref().map(|w| w.iter().cloned().collect()),
@@ -1573,6 +1577,7 @@ impl traits::System for Engine {
     }
 
     fn create_dump(&self) -> Result<TaskInfo> {
+        let _guard = self.dump_lock.lock().unwrap_or_else(|e| e.into_inner());
         std::fs::create_dir_all(&self.dump_dir)?;
         let info = self.inner.create_dump(&self.dump_dir)?;
         let _ = info; // dump completed successfully
@@ -1580,6 +1585,7 @@ impl traits::System for Engine {
     }
 
     fn create_snapshot(&self) -> Result<TaskInfo> {
+        let _guard = self.dump_lock.lock().unwrap_or_else(|e| e.into_inner());
         std::fs::create_dir_all(&self.snapshot_dir)?;
         self.inner.create_snapshot(&self.snapshot_dir)?;
         Ok(self.next_task("snapshotCreation", None))
@@ -1605,8 +1611,7 @@ impl traits::ExperimentalFeaturesApi for Engine {
     fn get_experimental_features(&self) -> Result<ExperimentalFeatures> {
         let lib_features = self.inner.get_experimental_features();
         Ok(ExperimentalFeatures {
-            features: serde_json::from_value(serde_json::to_value(&lib_features)?)
-                .unwrap_or_default(),
+            features: serde_json::from_value(serde_json::to_value(&lib_features)?)?,
         })
     }
 
@@ -1618,8 +1623,7 @@ impl traits::ExperimentalFeaturesApi for Engine {
             serde_json::from_value(serde_json::to_value(&features.features)?)?;
         let updated = self.inner.update_experimental_features(lib_features);
         Ok(ExperimentalFeatures {
-            features: serde_json::from_value(serde_json::to_value(&updated)?)
-                .unwrap_or_default(),
+            features: serde_json::from_value(serde_json::to_value(&updated)?)?,
         })
     }
 }

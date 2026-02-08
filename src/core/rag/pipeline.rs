@@ -330,10 +330,21 @@ where
         // 4. Generate answer if generator is configured
         let gen_start = Instant::now();
         let answer = if let Some(generator) = &self.generator {
-            let context: Vec<String> = results
-                .iter()
-                .map(|r| r.document.to_context_string())
-                .collect();
+            let mut context: Vec<String> = Vec::new();
+            let mut total_chars = 0;
+            for r in &results {
+                let s = r.document.to_context_string();
+                total_chars += s.len();
+                if total_chars > self.config.max_context_chars {
+                    let overflow = total_chars - self.config.max_context_chars;
+                    if s.len() > overflow {
+                        let end = s.floor_char_boundary(s.len() - overflow);
+                        context.push(s[..end].to_string());
+                    }
+                    break;
+                }
+                context.push(s);
+            }
             let context_refs: Vec<&str> = context.iter().map(|s| s.as_str()).collect();
 
             generator.generate(question, &context_refs).await?
