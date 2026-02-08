@@ -100,10 +100,13 @@ impl ExpandedQuery {
                     let or_terms: Vec<String> = terms
                         .iter()
                         .map(|t| {
-                            if t.contains(' ') {
-                                format!("\"{}\"", escape_fts5_term(t))
+                            let escaped = escape_fts5_term(t);
+                            if t.contains(' ')
+                                && !(escaped.starts_with('"') && escaped.ends_with('"'))
+                            {
+                                format!("\"{}\"", escaped)
                             } else {
-                                escape_fts5_term(t)
+                                escaped
                             }
                         })
                         .collect();

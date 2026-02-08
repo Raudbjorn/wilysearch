@@ -5,10 +5,21 @@ use std::time::Instant;
 
 use crate::core::error::{Error, Result};
 use crate::core::search::{
-    HybridSearchQuery, HybridSearchResult, SearchHit, SearchResult,
+    HybridSearchQuery, HybridSearchResult, SearchHit, SearchQuery, SearchResult,
 };
 
 use super::{Index, parse_filter_to_string};
+
+/// Options for merging keyword and vector search results in hybrid search.
+struct MergeHybridOptions<'a> {
+    keyword_result: &'a SearchResult,
+    vector_results: &'a [(u32, f32)],
+    semantic_ratio: f32,
+    limit: usize,
+    offset: usize,
+    show_ranking_score: bool,
+    attributes_to_retrieve: Option<&'a BTreeSet<String>>,
+}
 
 impl Index {
     /// Perform a hybrid search combining keyword and vector search.
@@ -51,8 +62,16 @@ impl Index {
                 }
             };
 
-            // Perform keyword search
-            let keyword_result = self.search(&query.search)?;
+            // Force ranking score computation for hybrid merging regardless of
+            // the caller's show_ranking_score flag. Without scores, all keyword
+            // hits collapse to the same default (1.0), producing incorrect hybrid
+            // ranking. We strip scores from the response later if the caller
+            // didn't request them.
+            let scoring_query = SearchQuery {
+                show_ranking_score: true,
+                ..query.search.clone()
+            };
+            let keyword_result = self.search(&scoring_query)?;
 
             // Perform vector search
             let rtxn = self.inner.read_txn().map_err(|e| Error::Heed(e))?;
@@ -78,16 +97,20 @@ impl Index {
                 .search(&vector, query.search.limit + query.search.offset, filter_bitmap.as_ref())
                 .map_err(|e| Error::Internal(e.to_string()))?;
 
-            // Merge results based on semantic_ratio
+            // Merge results based on semantic_ratio. Pass the caller's original
+            // show_ranking_score flag so scores are only included in the final
+            // response when explicitly requested.
             let merged = self.merge_hybrid_results(
                 &rtxn,
-                keyword_result.clone(),
-                vector_results.clone(),
-                query.semantic_ratio,
-                query.search.limit,
-                query.search.offset,
-                query.search.show_ranking_score,
-                query.search.attributes_to_retrieve.as_ref(),
+                &MergeHybridOptions {
+                    keyword_result: &keyword_result,
+                    vector_results: &vector_results,
+                    semantic_ratio: query.semantic_ratio,
+                    limit: query.search.limit,
+                    offset: query.search.offset,
+                    show_ranking_score: query.search.show_ranking_score,
+                    attributes_to_retrieve: query.search.attributes_to_retrieve.as_ref(),
+                },
             )?;
 
             let processing_time_ms = start_time.elapsed().as_millis();
@@ -137,20 +160,22 @@ impl Index {
     }
 
     /// Merge keyword and vector search results based on semantic ratio.
-    #[allow(clippy::too_many_arguments)]
     fn merge_hybrid_results(
         &self,
         rtxn: &milli::heed::RoTxn<'_>,
-        keyword_result: SearchResult,
-        vector_results: Vec<(u32, f32)>,
-        semantic_ratio: f32,
-        limit: usize,
-        offset: usize,
-        show_ranking_score: bool,
-        attributes_to_retrieve: Option<&BTreeSet<String>>,
+        opts: &MergeHybridOptions<'_>,
     ) -> Result<(Vec<SearchHit>, u32)> {
+        let MergeHybridOptions {
+            keyword_result,
+            vector_results,
+            semantic_ratio,
+            limit,
+            offset,
+            show_ranking_score,
+            attributes_to_retrieve,
+        } = opts;
         let fields_ids_map = self.inner.fields_ids_map(rtxn).map_err(Error::Heed)?;
-        let displayed_fields = self.get_displayed_fields(rtxn, &fields_ids_map, attributes_to_retrieve)?;
+        let displayed_fields = self.get_displayed_fields(rtxn, &fields_ids_map, *attributes_to_retrieve)?;
 
         // Create scored entries for both result sets
         #[derive(Debug)]
@@ -170,27 +195,40 @@ impl Index {
             Both,
         }
 
-        let keyword_weight = 1.0 - semantic_ratio as f64;
-        let semantic_weight = semantic_ratio as f64;
+        let keyword_weight = 1.0 - *semantic_ratio as f64;
+        let semantic_weight = *semantic_ratio as f64;
 
         // Build a map of doc_id -> scores
         let mut score_map: std::collections::HashMap<u32, ScoredEntry> =
             std::collections::HashMap::new();
 
-        // Add keyword results using the actual milli document IDs
+        // Add keyword results using the actual milli document IDs.
+        // The document_ids vec must have the same length as hits -- this is
+        // an invariant maintained by Index::search. Debug-assert to catch
+        // violations early; in release builds a missing entry is a bug but
+        // we fall back to the array index with a warning rather than panicking.
+        debug_assert_eq!(
+            keyword_result.hits.len(),
+            keyword_result.document_ids.len(),
+            "keyword_result.hits and keyword_result.document_ids must have the same length"
+        );
         for (idx, hit) in keyword_result.hits.iter().enumerate() {
             let doc_id = keyword_result
                 .document_ids
                 .get(idx)
                 .copied()
                 .unwrap_or_else(|| {
-                    tracing::warn!(
+                    tracing::error!(
                         idx,
-                        "keyword_result.document_ids missing entry; falling back to array index as doc_id"
+                        hits_len = keyword_result.hits.len(),
+                        doc_ids_len = keyword_result.document_ids.len(),
+                        "BUG: keyword_result.document_ids shorter than hits; falling back to array index"
                     );
                     idx as u32
                 });
 
+            // ranking_score is always populated here because hybrid_search
+            // forces show_ranking_score=true on the keyword query.
             let keyword_score = hit.ranking_score.unwrap_or(1.0);
             let combined = keyword_score * keyword_weight;
 
@@ -208,7 +246,7 @@ impl Index {
 
         // Add vector results
         let mut semantic_hit_count = 0u32;
-        for (doc_id, similarity) in &vector_results {
+        for (doc_id, similarity) in *vector_results {
             let vector_score = *similarity as f64;
 
             if let Some(entry) = score_map.get_mut(doc_id) {
@@ -237,7 +275,7 @@ impl Index {
         entries.sort_by(|a, b| b.combined_score.partial_cmp(&a.combined_score).unwrap_or(std::cmp::Ordering::Equal));
 
         // Apply offset and limit
-        let entries: Vec<_> = entries.into_iter().skip(offset).take(limit).collect();
+        let entries: Vec<_> = entries.into_iter().skip(*offset).take(*limit).collect();
 
         // Fetch documents and build hits
         let doc_ids: Vec<u32> = entries.iter().map(|e| e.doc_id).collect();
@@ -251,7 +289,7 @@ impl Index {
                 let json = milli::obkv_to_json(&displayed_fields, &fields_ids_map, obkv)
                     .map_err(Error::Milli)?;
 
-                let ranking_score = if show_ranking_score {
+                let ranking_score = if *show_ranking_score {
                     Some(entry.combined_score)
                 } else {
                     None

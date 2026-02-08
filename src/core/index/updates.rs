@@ -166,7 +166,7 @@ impl Index {
             let mut count = 0u64;
             let mut to_remove: Vec<u32> = Vec::new();
             for id in &ids {
-                if let Some(internal_id) = external_ids.get(&rtxn, id).ok().flatten() {
+                if let Some(internal_id) = external_ids.get(&rtxn, id).map_err(Error::Heed)? {
                     count += 1;
                     if self.vector_store.is_some() {
                         to_remove.push(internal_id);

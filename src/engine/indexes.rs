@@ -63,8 +63,16 @@ impl traits::Indexes for Engine {
     fn swap_indexes(&self, swaps: &[SwapIndexesRequest]) -> Result<TaskInfo> {
         let pairs: Vec<(&str, &str)> = swaps
             .iter()
-            .map(|s| (s.indexes[0].as_str(), s.indexes[1].as_str()))
-            .collect();
+            .map(|s| {
+                if s.indexes.len() != 2 {
+                    return Err(crate::error::Error::Internal(format!(
+                        "swap_indexes: each SwapIndexesRequest must contain exactly 2 index UIDs, got {}",
+                        s.indexes.len()
+                    )));
+                }
+                Ok((s.indexes[0].as_str(), s.indexes[1].as_str()))
+            })
+            .collect::<Result<Vec<_>>>()?;
         self.inner.swap_indexes(&pairs)?;
         Ok(self.next_task("indexSwap", None))
     }

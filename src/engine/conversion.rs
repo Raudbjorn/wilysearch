@@ -274,8 +274,14 @@ pub(super) fn convert_settings_to_lib(s: &Settings) -> Result<crate::core::Setti
             enabled: typo.enabled,
             min_word_size_for_typos: typo.min_word_size_for_typos.as_ref().map(|m| {
                 crate::core::settings::MinWordSizeForTypos {
-                    one_typo: m.one_typo.map(|v| u8::try_from(v).unwrap_or(u8::MAX)),
-                    two_typos: m.two_typos.map(|v| u8::try_from(v).unwrap_or(u8::MAX)),
+                    one_typo: m.one_typo.map(|v| u8::try_from(v).unwrap_or_else(|_| {
+                        tracing::warn!(value = v, "one_typo value {} exceeds u8::MAX, clamping to 255", v);
+                        u8::MAX
+                    })),
+                    two_typos: m.two_typos.map(|v| u8::try_from(v).unwrap_or_else(|_| {
+                        tracing::warn!(value = v, "two_typos value {} exceeds u8::MAX, clamping to 255", v);
+                        u8::MAX
+                    })),
                 }
             }),
             disable_on_words: typo.disable_on_words.as_ref().map(|w| w.iter().cloned().collect()),

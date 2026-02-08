@@ -51,7 +51,9 @@ impl traits::Search for Engine {
                 estimated_total_hits,
             } => (saturating_u32(*offset), saturating_u32(*limit), usize_to_u64(*estimated_total_hits)),
             crate::core::search::HitsInfo::Pagination { total_hits, .. } => {
-                (0, 20, usize_to_u64(*total_hits))
+                let req_offset = request.offset.unwrap_or(0) as usize;
+                let req_limit = request.limit.unwrap_or(20) as usize;
+                (saturating_u32(req_offset), saturating_u32(req_limit), usize_to_u64(*total_hits))
             }
         };
 
