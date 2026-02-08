@@ -18,21 +18,21 @@ use super::Index;
 /// - `update_{name}(&self, val: T) -> Result<()>`
 /// - `reset_{name}(&self) -> Result<()>`
 macro_rules! settings_accessor {
-    ($name:ident, $ty:ty, $reset:expr) => {
+    ($name:ident, $doc_name:literal, $ty:ty, $reset:expr) => {
         paste::paste! {
-            #[doc = "Get the " $name " setting."]
+            #[doc = "Get the " $doc_name " setting."]
             pub fn [<get_ $name>](&self) -> Result<Option<$ty>> {
                 let settings = self.get_settings()?;
                 Ok(settings.$name)
             }
 
-            #[doc = "Update the " $name " setting."]
+            #[doc = "Update the " $doc_name " setting."]
             pub fn [<update_ $name>](&self, val: $ty) -> Result<()> {
                 let settings = Settings::new().[<with_ $name>](val);
                 self.update_settings(&settings)
             }
 
-            #[doc = "Reset the " $name " to its default value."]
+            #[doc = "Reset the " $doc_name " to its default value."]
             pub fn [<reset_ $name>](&self) -> Result<()> {
                 self.execute_settings_reset($reset)
             }
@@ -190,32 +190,32 @@ impl Index {
     // Individual Settings Accessors
     // ========================================================================
 
-    settings_accessor!(displayed_attributes,   Vec<String>,                        |s| s.reset_displayed_fields());
-    settings_accessor!(searchable_attributes,  Vec<String>,                        |s| s.reset_searchable_fields());
-    settings_accessor!(filterable_attributes,  Vec<String>,                        |s| s.reset_filterable_fields());
-    settings_accessor!(sortable_attributes,    BTreeSet<String>,                   |s| s.reset_sortable_fields());
-    settings_accessor!(ranking_rules,          Vec<String>,                        |s| s.reset_criteria());
-    settings_accessor!(stop_words,             BTreeSet<String>,                   |s| s.reset_stop_words());
-    settings_accessor!(non_separator_tokens,   BTreeSet<String>,                   |s| s.reset_non_separator_tokens());
-    settings_accessor!(separator_tokens,       BTreeSet<String>,                   |s| s.reset_separator_tokens());
-    settings_accessor!(dictionary,             BTreeSet<String>,                   |s| s.reset_dictionary());
-    settings_accessor!(synonyms,              BTreeMap<String, Vec<String>>,       |s| s.reset_synonyms());
-    settings_accessor!(distinct_attribute,     String,                             |s| s.reset_distinct_field());
-    settings_accessor!(proximity_precision,    ProximityPrecision,                 |s| s.reset_proximity_precision());
-    settings_accessor!(typo_tolerance,         TypoToleranceSettings,              |s| {
+    settings_accessor!(displayed_attributes,  "displayed attributes",  Vec<String>,                       |s| s.reset_displayed_fields());
+    settings_accessor!(searchable_attributes, "searchable attributes", Vec<String>,                       |s| s.reset_searchable_fields());
+    settings_accessor!(filterable_attributes, "filterable attributes", Vec<String>,                       |s| s.reset_filterable_fields());
+    settings_accessor!(sortable_attributes,   "sortable attributes",  BTreeSet<String>,                  |s| s.reset_sortable_fields());
+    settings_accessor!(ranking_rules,         "ranking rules",        Vec<String>,                       |s| s.reset_criteria());
+    settings_accessor!(stop_words,            "stop words",           BTreeSet<String>,                  |s| s.reset_stop_words());
+    settings_accessor!(non_separator_tokens,  "non-separator tokens", BTreeSet<String>,                  |s| s.reset_non_separator_tokens());
+    settings_accessor!(separator_tokens,      "separator tokens",     BTreeSet<String>,                  |s| s.reset_separator_tokens());
+    settings_accessor!(dictionary,            "dictionary",           BTreeSet<String>,                  |s| s.reset_dictionary());
+    settings_accessor!(synonyms,             "synonyms",             BTreeMap<String, Vec<String>>,      |s| s.reset_synonyms());
+    settings_accessor!(distinct_attribute,    "distinct attribute",   String,                            |s| s.reset_distinct_field());
+    settings_accessor!(proximity_precision,   "proximity precision",  ProximityPrecision,                |s| s.reset_proximity_precision());
+    settings_accessor!(typo_tolerance,        "typo tolerance",       TypoToleranceSettings,             |s| {
         s.reset_authorize_typos();
         s.reset_min_word_len_one_typo();
         s.reset_min_word_len_two_typos();
         s.reset_exact_words();
         s.reset_exact_attributes();
     });
-    settings_accessor!(faceting,               FacetingSettings,                   |s| s.reset_max_values_per_facet());
-    settings_accessor!(pagination,             PaginationSettings,                 |s| s.reset_pagination_max_total_hits());
-    settings_accessor!(embedders,              HashMap<String, EmbedderSettings>,  |s| s.reset_embedder_settings());
-    settings_accessor!(search_cutoff_ms,       u64,                                |s| s.reset_search_cutoff());
-    settings_accessor!(localized_attributes,   Vec<LocalizedAttributeRule>,        |s| s.reset_localized_attributes_rules());
-    settings_accessor!(facet_search,           bool,                               |s| s.reset_facet_search());
-    settings_accessor!(prefix_search,          String,                             |s| s.reset_prefix_search());
+    settings_accessor!(faceting,              "faceting",             FacetingSettings,                  |s| s.reset_max_values_per_facet());
+    settings_accessor!(pagination,            "pagination",           PaginationSettings,                |s| s.reset_pagination_max_total_hits());
+    settings_accessor!(embedders,             "embedders",            HashMap<String, EmbedderSettings>, |s| s.reset_embedder_settings());
+    settings_accessor!(search_cutoff_ms,      "search cutoff ms",    u64,                               |s| s.reset_search_cutoff());
+    settings_accessor!(localized_attributes,  "localized attributes", Vec<LocalizedAttributeRule>,       |s| s.reset_localized_attributes_rules());
+    settings_accessor!(facet_search,          "facet search",         bool,                              |s| s.reset_facet_search());
+    settings_accessor!(prefix_search,         "prefix search",        String,                            |s| s.reset_prefix_search());
 
     /// Get the primary key field name for this index.
     ///
