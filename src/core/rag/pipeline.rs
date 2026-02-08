@@ -44,6 +44,10 @@ pub struct PipelineConfig {
     pub max_context_chars: usize,
 
     /// System prompt template for generation.
+    ///
+    /// TODO: Pass to `Generator::generate()` once the trait supports a system prompt
+    /// parameter. Currently defined for configuration completeness but not threaded
+    /// through to the generator.
     pub system_prompt: Option<String>,
 
     /// Whether to include source snippets in the response.

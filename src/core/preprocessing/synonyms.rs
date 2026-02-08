@@ -523,7 +523,12 @@ impl SynonymMap {
             // Check multi-way synonyms
             if let Some(&group_id) = self.multi_way_index.get(&term_lower) {
                 let mut count = 1; // Original already counted
-                for synonym in &self.multi_way_groups[group_id] {
+                // Sort to ensure deterministic expansion order regardless of
+                // HashSet iteration order (addresses non-reproducibility concern).
+                let mut sorted_synonyms: Vec<&String> =
+                    self.multi_way_groups[group_id].iter().collect();
+                sorted_synonyms.sort();
+                for synonym in sorted_synonyms {
                     if count >= self.config.max_expansions {
                         break;
                     }

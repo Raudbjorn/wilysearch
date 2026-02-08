@@ -178,6 +178,13 @@ use crate::core::now_iso8601;
 
 // ─── Type conversion helpers ─────────────────────────────────────────────────
 
+/// Saturating cast from `usize` to `u32`.
+/// Returns `u32::MAX` when the value exceeds `u32::MAX` instead of silently
+/// truncating via `as u32`.
+fn saturating_u32(v: usize) -> u32 {
+    u32::try_from(v).unwrap_or(u32::MAX)
+}
+
 fn convert_search_request(req: &SearchRequest) -> crate::core::SearchQuery {
     let mut q = match &req.q {
         Some(s) => crate::core::SearchQuery::new(s.as_str()),
@@ -260,7 +267,7 @@ fn convert_search_request(req: &SearchRequest) -> crate::core::SearchQuery {
     q
 }
 
-fn convert_search_result(r: &crate::core::SearchResult) -> SearchResponse {
+fn convert_search_result(r: &crate::core::SearchResult) -> Result<SearchResponse> {
     let (offset, limit, estimated_total_hits, total_hits, total_pages, page, hits_per_page) =
         match &r.hits_info {
             crate::core::search::HitsInfo::OffsetLimit {
@@ -268,8 +275,8 @@ fn convert_search_result(r: &crate::core::SearchResult) -> SearchResponse {
                 offset,
                 estimated_total_hits,
             } => (
-                Some(*offset as u32),
-                Some(*limit as u32),
+                Some(saturating_u32(*offset)),
+                Some(saturating_u32(*limit)),
                 Some(*estimated_total_hits as u64),
                 None,
                 None,
@@ -286,9 +293,9 @@ fn convert_search_result(r: &crate::core::SearchResult) -> SearchResponse {
                 None,
                 None,
                 Some(*total_hits as u64),
-                Some(*total_pages as u32),
-                Some(*page as u32),
-                Some(*hits_per_page as u32),
+                Some(saturating_u32(*total_pages)),
+                Some(saturating_u32(*page)),
+                Some(saturating_u32(*hits_per_page)),
             ),
         };
 
@@ -300,10 +307,11 @@ fn convert_search_result(r: &crate::core::SearchResult) -> SearchResponse {
     let facet_stats = r
         .facet_stats
         .as_ref()
-        .map(|fs| serde_json::to_value(fs).unwrap_or(Value::Null));
+        .map(|fs| serde_json::to_value(fs))
+        .transpose()?;
 
-    SearchResponse {
-        hits: r.hits.iter().map(|h| convert_hit(h)).collect(),
+    Ok(SearchResponse {
+        hits: r.hits.iter().map(convert_hit).collect::<Result<Vec<_>>>()?,
         offset,
         limit,
         estimated_total_hits,
@@ -315,13 +323,13 @@ fn convert_search_result(r: &crate::core::SearchResult) -> SearchResponse {
         facet_stats,
         processing_time_ms: r.processing_time_ms as u64,
         query: r.query.clone(),
-    }
+    })
 }
 
-fn convert_hit(h: &crate::core::SearchHit) -> Value {
+fn convert_hit(h: &crate::core::SearchHit) -> Result<Value> {
     // The SearchHit has `document` flattened, plus optional metadata fields.
     // We serialize the whole hit to produce the correct shape.
-    serde_json::to_value(h).unwrap_or(Value::Null)
+    Ok(serde_json::to_value(h)?)
 }
 
 fn convert_federation_settings(s: &FederationSettings) -> crate::core::search::Federation {
@@ -337,7 +345,7 @@ fn convert_federation_settings(s: &FederationSettings) -> crate::core::search::F
     }
 }
 
-fn convert_federated_result(r: &crate::core::search::FederatedSearchResult) -> FederatedSearchResponse {
+fn convert_federated_result(r: &crate::core::search::FederatedSearchResult) -> Result<FederatedSearchResponse> {
     let (offset, limit, estimated_total_hits, total_hits, total_pages, page, hits_per_page) =
         match &r.hits_info {
             crate::core::search::HitsInfo::OffsetLimit {
@@ -345,8 +353,8 @@ fn convert_federated_result(r: &crate::core::search::FederatedSearchResult) -> F
                 offset,
                 estimated_total_hits,
             } => (
-                Some(*offset as u32),
-                Some(*limit as u32),
+                Some(saturating_u32(*offset)),
+                Some(saturating_u32(*limit)),
                 Some(*estimated_total_hits as u64),
                 None,
                 None,
@@ -363,9 +371,9 @@ fn convert_federated_result(r: &crate::core::search::FederatedSearchResult) -> F
                 None,
                 None,
                 Some(*total_hits as u64),
-                Some(*total_pages as u32),
-                Some(*page as u32),
-                Some(*hits_per_page as u32),
+                Some(saturating_u32(*total_pages)),
+                Some(saturating_u32(*page)),
+                Some(saturating_u32(*hits_per_page)),
             ),
         };
 
@@ -377,16 +385,17 @@ fn convert_federated_result(r: &crate::core::search::FederatedSearchResult) -> F
     let facet_stats = r
         .facet_stats
         .as_ref()
-        .map(|fs| serde_json::to_value(fs).unwrap_or(Value::Null));
+        .map(|fs| serde_json::to_value(fs))
+        .transpose()?;
 
     let facets_by_index: HashMap<String, Value> = r
         .facets_by_index
         .iter()
-        .map(|(k, v)| (k.clone(), serde_json::to_value(v).unwrap_or(Value::Null)))
-        .collect();
+        .map(|(k, v)| Ok((k.clone(), serde_json::to_value(v)?)))
+        .collect::<Result<HashMap<_, _>>>()?;
 
-    FederatedSearchResponse {
-        hits: r.hits.iter().map(convert_hit).collect(),
+    Ok(FederatedSearchResponse {
+        hits: r.hits.iter().map(convert_hit).collect::<Result<Vec<_>>>()?,
         processing_time_ms: r.processing_time_ms as u64,
         offset,
         limit,
@@ -399,7 +408,7 @@ fn convert_federated_result(r: &crate::core::search::FederatedSearchResult) -> F
         facet_stats,
         facets_by_index,
         semantic_hit_count: r.semantic_hit_count,
-    }
+    })
 }
 
 fn convert_settings_to_lib(s: &Settings) -> Result<crate::core::Settings> {
@@ -631,7 +640,7 @@ fn convert_settings_from_lib(s: &crate::core::Settings) -> Settings {
                             source,
                             api_key: v.api_key.clone(),
                             model: v.model.clone(),
-                            dimensions: v.dimensions.map(|d| d as u32),
+                            dimensions: v.dimensions.map(saturating_u32),
                             url: v.url.clone(),
                             extra: HashMap::new(),
                         },
@@ -799,7 +808,7 @@ impl traits::Search for Engine {
         let idx = self.resolve_index(index_uid)?;
         let query = convert_search_request(request);
         let result = idx.search(&query)?;
-        Ok(convert_search_result(&result))
+        convert_search_result(&result)
     }
 
     fn similar(
@@ -832,14 +841,14 @@ impl traits::Search for Engine {
                 offset,
                 limit,
                 estimated_total_hits,
-            } => (*offset as u32, *limit as u32, *estimated_total_hits as u64),
+            } => (saturating_u32(*offset), saturating_u32(*limit), *estimated_total_hits as u64),
             crate::core::search::HitsInfo::Pagination { total_hits, .. } => {
                 (0, 20, *total_hits as u64)
             }
         };
 
         Ok(SimilarResponse {
-            hits: result.hits.iter().map(|h| convert_hit(h)).collect(),
+            hits: result.hits.iter().map(convert_hit).collect::<Result<Vec<_>>>()?,
             offset,
             limit,
             estimated_total_hits: estimated,
@@ -871,14 +880,14 @@ impl traits::Search for Engine {
                 .collect();
 
             let result = self.inner.multi_search_federated(core_queries, core_federation)?;
-            Ok(MultiSearchResult::Federated(convert_federated_result(&result)))
+            Ok(MultiSearchResult::Federated(convert_federated_result(&result)?))
         } else {
             let mut results = Vec::with_capacity(request.queries.len());
             for mq in &request.queries {
                 let idx = self.resolve_index(&mq.index_uid)?;
                 let query = convert_search_request(&mq.search);
                 let result = idx.search(&query)?;
-                let resp = convert_search_result(&result);
+                let resp = convert_search_result(&result)?;
                 results.push(resp);
             }
             Ok(MultiSearchResult::PerIndex(MultiSearchResponse { results }))
@@ -940,8 +949,8 @@ impl traits::Indexes for Engine {
             .collect();
         Ok(IndexList {
             results,
-            offset: offset as u32,
-            limit: limit as u32,
+            offset: saturating_u32(offset),
+            limit: saturating_u32(limit),
             total: total as u64,
         })
     }
@@ -1478,7 +1487,7 @@ impl traits::SettingsApi for Engine {
                             source,
                             api_key: v.api_key,
                             model: v.model,
-                            dimensions: v.dimensions.map(|d| d as u32),
+                            dimensions: v.dimensions.map(saturating_u32),
                             url: v.url,
                             extra: HashMap::new(),
                         },
