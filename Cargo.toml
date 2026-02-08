@@ -56,6 +56,11 @@ unicode-normalization = "0.1"
 # │ library crate are viral -- any downstream crate that needs a different   │
 # │ candle version will get a dependency conflict. If upgrading milli,       │
 # │ verify candle compatibility first.                                       │
+# │                                                                          │
+# │ These pins constrain milli's transitive candle resolution and            │
+# │ cannot be made optional: milli (a required dep) pulls candle             │
+# │ transitively, so removing these pins would allow the resolver to         │
+# │ pick an incompatible version.                                            │
 # └──────────────────────────────────────────────────────────────────────────┘
 candle-core = "=0.9.1"
 candle-nn = "=0.9.1"
@@ -73,7 +78,7 @@ figment = { version = "0.10", features = ["toml", "env", "test"] }
 
 [lints.rust]
 # unsafe blocks have SAFETY comments; warn to keep them visible in diffs.
-unsafe_code = "allow"
+unsafe_code = "warn"
 
 [lints.clippy]
 pedantic = { level = "allow", priority = -1 }

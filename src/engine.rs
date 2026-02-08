@@ -42,11 +42,19 @@ pub struct Engine {
     task_counter_path: std::path::PathBuf,
     dump_dir: std::path::PathBuf,
     snapshot_dir: std::path::PathBuf,
-    /// TODO: Used to serialize dump/snapshot operations. Wire into create_dump/create_snapshot.
+    /// Serializes dump/snapshot operations so concurrent callers do not
+    /// corrupt the output archive. Wire into `create_dump`/`create_snapshot`
+    /// once those methods perform real I/O.
     dump_lock: std::sync::Mutex<()>,
-    // TODO: Apply search defaults (limit, matching strategy) in convert_search_request.
-    // TODO: Initialize preprocessing pipeline from this config.
-    // TODO: Build RAG pipeline from this config when retrieval is requested.
+    /// Holds the RAG/preprocessing configuration loaded at startup.
+    ///
+    /// Currently unused because three pieces of wiring are still missing:
+    ///   1. Apply search defaults (limit, matching strategy) in `convert_search_request`.
+    ///   2. Initialize the preprocessing pipeline (SymSpell / synonyms) from this config.
+    ///   3. Build the RAG pipeline (embedder + retriever + reranker) on demand
+    ///      when a search request includes retrieval parameters.
+    ///
+    /// Once those are in place, remove the `dead_code` allow.
     #[allow(dead_code)]
     rag_config: crate::config::RagConfig,
 }

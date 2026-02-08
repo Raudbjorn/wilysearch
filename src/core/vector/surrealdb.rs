@@ -7,7 +7,6 @@
 //!
 //! - HNSW index with configurable parameters (M, EF)
 //! - Cosine distance metric
-//! - Optional binary quantization
 //! - Hybrid search with BM25 full-text search and RRF fusion
 //!
 //! # Example
@@ -76,11 +75,6 @@ pub struct SurrealDbVectorStoreConfig {
     /// Default: 500
     pub hnsw_ef: usize,
 
-    /// Whether to use binary quantization.
-    /// Reduces memory usage at the cost of some accuracy.
-    /// Default: false
-    pub quantized: bool,
-
     /// Optional authentication credentials.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth: Option<SurrealDbAuth>,
@@ -103,7 +97,6 @@ impl Default for SurrealDbVectorStoreConfig {
             dimensions: 384,
             hnsw_m: 16,
             hnsw_ef: 500,
-            quantized: false,
             auth: None,
         }
     }
@@ -276,12 +269,7 @@ impl SurrealDbVectorStore {
         let hnsw_ef = self.config.hnsw_ef;
 
         // Define the table and fields
-        // Quantized uses int (0/1) for binary quantization; standard uses float.
-        let type_spec = if self.config.quantized {
-            "array<int>"
-        } else {
-            "array<float>"
-        };
+        let type_spec = "array<float>";
 
         let schema_query = format!(
             r#"
@@ -315,42 +303,60 @@ impl SurrealDbVectorStore {
 
     /// Shared async implementation for upserting document vectors.
     ///
-    /// Uses one SurrealDB transaction per document for fault isolation: if one
-    /// document fails, others already committed are preserved. For bulk inserts
-    /// this has higher overhead than a single transaction, but avoids all-or-nothing
-    /// rollback semantics which would be surprising for partial batch failures.
+    /// Groups documents into batches of [`BATCH_SIZE`] and issues a single
+    /// SurrealDB transaction per batch for better throughput on bulk inserts.
+    /// Each batch is atomic: if any document in a batch fails, the entire batch
+    /// is rolled back while previously committed batches are preserved.
+    const BATCH_SIZE: usize = 100;
+
     async fn upsert_documents_inner(
         db: &Surreal<Any>,
         table: &str,
         documents: &[(u32, Vec<Vec<f32>>)],
     ) -> anyhow::Result<()> {
-        for (doc_id, vectors) in documents {
+        for batch in documents.chunks(Self::BATCH_SIZE) {
             let mut transaction_query = String::from("BEGIN TRANSACTION;\n");
+            let mut bindings: Vec<(String, serde_json::Value)> = Vec::new();
 
-            transaction_query.push_str(&format!(
-                "DELETE FROM {table} WHERE doc_id = $doc_id;\n"
-            ));
-
-            for (vec_idx, _vector) in vectors.iter().enumerate() {
-                let record_id = if vectors.len() == 1 {
-                    format!("{}", doc_id)
-                } else {
-                    format!("{}_{}", doc_id, vec_idx)
-                };
+            for (batch_doc_idx, (doc_id, vectors)) in batch.iter().enumerate() {
+                let doc_id_param = format!("doc_id_{batch_doc_idx}");
 
                 transaction_query.push_str(&format!(
-                    "CREATE {table}:`{record_id}` CONTENT {{ doc_id: $doc_id, embedding: $embedding_{vec_idx} }};\n"
+                    "DELETE FROM {table} WHERE doc_id = ${doc_id_param};\n"
                 ));
+
+                for (vec_idx, _vector) in vectors.iter().enumerate() {
+                    let record_id = if vectors.len() == 1 {
+                        format!("{}", doc_id)
+                    } else {
+                        format!("{}_{}", doc_id, vec_idx)
+                    };
+
+                    let embedding_param = format!("embedding_{batch_doc_idx}_{vec_idx}");
+
+                    transaction_query.push_str(&format!(
+                        "CREATE {table}:`{record_id}` CONTENT {{ doc_id: ${doc_id_param}, embedding: ${embedding_param} }};\n"
+                    ));
+                }
+
+                bindings.push((doc_id_param, serde_json::json!(*doc_id)));
+                for (vec_idx, vector) in vectors.iter().enumerate() {
+                    let embedding_param = format!("embedding_{batch_doc_idx}_{vec_idx}");
+                    bindings.push((embedding_param, serde_json::json!(vector)));
+                }
             }
 
             transaction_query.push_str("COMMIT TRANSACTION;\n");
 
-            let mut query = db.query(&transaction_query).bind(("doc_id", *doc_id));
-            for (vec_idx, vector) in vectors.iter().enumerate() {
-                query = query.bind((format!("embedding_{vec_idx}"), vector.clone()));
+            let mut query = db.query(&transaction_query);
+            for (key, value) in bindings {
+                query = query.bind((key, value));
             }
             query.await
-                .with_context(|| format!("Failed to upsert vectors for document {}", doc_id))?;
+                .with_context(|| {
+                    let doc_ids: Vec<u32> = batch.iter().map(|(id, _)| *id).collect();
+                    format!("Failed to upsert vectors for document batch {:?}", doc_ids)
+                })?;
         }
 
         Ok(())
@@ -932,5 +938,94 @@ mod tests {
         assert_eq!(stats.total_vectors, 3); // 2 vectors for doc 1, 1 for doc 2
         assert_eq!(stats.unique_documents, 2);
         assert_eq!(stats.dimensions, 4);
+    }
+
+    #[tokio::test]
+    async fn test_surrealdb_multi_vector_per_document() {
+        let config = SurrealDbVectorStoreConfig {
+            connection_string: "memory".to_string(),
+            namespace: "test".to_string(),
+            database: "vectors".to_string(),
+            table: "multi_vec_test".to_string(),
+            dimensions: 4,
+            ..Default::default()
+        };
+
+        let store = SurrealDbVectorStore::new(config).await.unwrap();
+
+        // Insert a document with 3 vectors
+        let docs = vec![(1, vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+        ])];
+
+        store.add_documents_async(&docs).await.unwrap();
+
+        let stats = store.stats().await.unwrap();
+        assert_eq!(stats.total_vectors, 3);
+        assert_eq!(stats.unique_documents, 1);
+
+        // A query near the second vector should still find doc 1
+        let results = store
+            .search_async(&[0.0, 0.9, 0.1, 0.0], 5, None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 1);
+    }
+
+    #[tokio::test]
+    async fn test_surrealdb_replace_document_vectors() {
+        let config = SurrealDbVectorStoreConfig {
+            connection_string: "memory".to_string(),
+            namespace: "test".to_string(),
+            database: "vectors".to_string(),
+            table: "replace_vec_test".to_string(),
+            dimensions: 4,
+            ..Default::default()
+        };
+
+        let store = SurrealDbVectorStore::new(config).await.unwrap();
+
+        // Insert doc 1 with 3 vectors
+        store
+            .add_documents_async(&[(1, vec![
+                vec![1.0, 0.0, 0.0, 0.0],
+                vec![0.0, 1.0, 0.0, 0.0],
+                vec![0.0, 0.0, 1.0, 0.0],
+            ])])
+            .await
+            .unwrap();
+
+        let stats = store.stats().await.unwrap();
+        assert_eq!(stats.total_vectors, 3);
+
+        // Replace doc 1 with only 1 vector (stale rows should be removed)
+        store
+            .add_documents_async(&[(1, vec![vec![0.0, 0.0, 0.0, 1.0]])])
+            .await
+            .unwrap();
+
+        let stats = store.stats().await.unwrap();
+        assert_eq!(stats.total_vectors, 1, "stale vector rows should be removed after replacement");
+        assert_eq!(stats.unique_documents, 1);
+
+        // Search should only find the new vector
+        let results = store
+            .search_async(&[0.0, 0.0, 0.0, 1.0], 5, None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 1);
+
+        // The old vectors should NOT match well
+        let results = store
+            .search_async(&[1.0, 0.0, 0.0, 0.0], 5, None)
+            .await
+            .unwrap();
+        // Should still return doc 1 (it's the only doc) but with low similarity
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1 < 0.5, "old vector direction should have low similarity");
     }
 }

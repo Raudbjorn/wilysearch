@@ -166,7 +166,20 @@ pub struct Meilisearch {
     /// is logged so operators can investigate the original panic. The underlying
     /// LMDB data remains consistent regardless of in-memory cache state because
     /// LMDB uses its own transactional isolation.
+    ///
+    /// In-memory cache of opened index handles, keyed by index UID.
+    ///
+    /// # Lock ordering
+    ///
+    /// This lock must be acquired **before** `index_metadata`. See the
+    /// module-level lock ordering comment for rationale.
     indexes: RwLock<Arc<HashMap<String, Arc<Index>>>>,
+    /// Persisted metadata (created_at, updated_at) for each index.
+    ///
+    /// # Lock ordering
+    ///
+    /// This lock must be acquired **after** `indexes`. Never hold this
+    /// lock while trying to acquire `indexes` -- doing so risks deadlock.
     index_metadata: RwLock<HashMap<String, IndexMetadata>>,
     vector_store: Option<Arc<dyn VectorStore>>,
     experimental_features: RwLock<ExperimentalFeatures>,
@@ -870,6 +883,7 @@ impl Meilisearch {
             // solely for copy-compact. The path is constructed from our own `db_path`
             // + validated index UID. The env is scoped to this block and dropped
             // before we replace the data file.
+            #[allow(unsafe_code)]
             let env = unsafe { options.open(&index_path).map_err(Error::Heed)? };
             let compact_path = tmp_path.join("data.mdb");
             let mut file = std::fs::File::create(&compact_path)?;

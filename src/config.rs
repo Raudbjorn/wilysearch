@@ -194,9 +194,6 @@ pub struct VectorStoreConfig {
     /// HNSW EF construction parameter. Default: 500
     pub hnsw_ef: usize,
 
-    /// Whether to use binary quantization. Default: false
-    pub quantized: bool,
-
     /// Optional authentication credentials.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth: Option<VectorStoreAuth>,
@@ -213,7 +210,6 @@ impl Default for VectorStoreConfig {
             dimensions: 384,
             hnsw_m: 16,
             hnsw_ef: 500,
-            quantized: false,
             auth: None,
         }
     }
@@ -254,7 +250,6 @@ impl From<VectorStoreConfig> for crate::core::vector::surrealdb::SurrealDbVector
             dimensions: c.dimensions,
             hnsw_m: c.hnsw_m,
             hnsw_ef: c.hnsw_ef,
-            quantized: c.quantized,
             auth: c.auth.map(|a| {
                 crate::core::vector::surrealdb::SurrealDbAuth {
                     username: a.username,

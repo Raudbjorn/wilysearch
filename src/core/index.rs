@@ -1041,7 +1041,13 @@ impl Index {
                 .document_ids
                 .get(idx)
                 .copied()
-                .unwrap_or(idx as u32);
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        idx,
+                        "keyword_result.document_ids missing entry; falling back to array index as doc_id"
+                    );
+                    idx as u32
+                });
 
             let keyword_score = hit.ranking_score.unwrap_or(1.0);
             let combined = keyword_score * keyword_weight;
