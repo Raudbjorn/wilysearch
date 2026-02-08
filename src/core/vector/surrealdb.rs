@@ -102,15 +102,6 @@ impl Default for SurrealDbVectorStoreConfig {
     }
 }
 
-/// A vector document stored in SurrealDB.
-#[derive(Debug, Serialize, Deserialize)]
-struct VectorDocument {
-    doc_id: u32,
-    embedding: Vec<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    text_content: Option<String>,
-}
-
 /// Result from a vector search query.
 #[derive(Debug, Deserialize)]
 struct SearchResult {
@@ -413,15 +404,21 @@ impl SurrealDbVectorStore {
             }
         }
 
-        // Build and execute the query
+        // Build and execute the query.
+        // When a filter is present, use a subquery to separate KNN retrieval
+        // from post-filtering. SurrealDB's KNN operator doesn't compose
+        // reliably with AND in the same WHERE clause. Oversample 3x to
+        // ensure enough candidates survive the doc_id filter.
         let mut response = if let Some(ref ids) = allowed_ids {
+            let inner_limit = limit.saturating_mul(3).max(limit);
             let query = format!(
                 r#"
-                SELECT doc_id, vector::distance::knn() AS distance
-                FROM {table}
-                WHERE embedding <|{limit},COSINE|> $query_vec
-                  AND doc_id IN $allowed_ids
-                ORDER BY distance
+                SELECT doc_id, distance FROM (
+                    SELECT doc_id, vector::distance::knn() AS distance
+                    FROM {table}
+                    WHERE embedding <|{inner_limit},COSINE|> $query_vec
+                    ORDER BY distance
+                ) WHERE doc_id IN $allowed_ids
                 LIMIT {limit};
                 "#
             );
@@ -637,35 +634,43 @@ impl SurrealDbVectorStore {
     }
 
     /// Get statistics about the vector store.
+    ///
+    /// Runs two queries: one for total vector records and one for unique
+    /// document count (via `GROUP BY doc_id` subquery, since SurrealQL does
+    /// not support `count(DISTINCT ...)`).
     pub async fn stats(&self) -> anyhow::Result<VectorStoreStats> {
         let table = &self.config.table;
 
         let query = format!(
             r#"
-            SELECT
-                count() AS total_records,
-                count(DISTINCT doc_id) AS unique_documents
-            FROM {table}
-            GROUP ALL;
+            SELECT count() AS total_records FROM {table} GROUP ALL;
+            SELECT count() AS unique_documents
+                FROM (SELECT doc_id FROM {table} GROUP BY doc_id) GROUP ALL;
             "#
         );
 
         #[derive(Deserialize)]
-        struct StatsResult {
+        struct TotalResult {
             total_records: u64,
+        }
+
+        #[derive(Deserialize)]
+        struct UniqueResult {
             unique_documents: u64,
         }
 
         let mut response = self.db.query(&query).await.context("Failed to get stats")?;
 
-        let stats: Vec<StatsResult> = response.take(0usize)
-            .context("Failed to parse stats result")?;
-
-        let stats_first = stats.into_iter().next();
+        let total: Vec<TotalResult> = response
+            .take(0usize)
+            .context("Failed to parse total records")?;
+        let unique: Vec<UniqueResult> = response
+            .take(1usize)
+            .context("Failed to parse unique documents")?;
 
         Ok(VectorStoreStats {
-            total_vectors: stats_first.as_ref().map(|s| s.total_records).unwrap_or(0),
-            unique_documents: stats_first.as_ref().map(|s| s.unique_documents).unwrap_or(0),
+            total_vectors: total.first().map(|s| s.total_records).unwrap_or(0),
+            unique_documents: unique.first().map(|s| s.unique_documents).unwrap_or(0),
             dimensions: self.config.dimensions,
         })
     }
@@ -680,6 +685,24 @@ pub struct VectorStoreStats {
     pub unique_documents: u64,
     /// Vector dimensions.
     pub dimensions: usize,
+}
+
+// Dropping a tokio `Runtime` inside an async context panics with "Cannot drop a
+// runtime in a context where blocking is not allowed". This happens when tests
+// (or production code) use `#[tokio::test]` and the `SurrealDbVectorStore` is
+// dropped at the end of the async function.
+//
+// Fix: clone the `Arc<Runtime>` to bump the refcount, then move the clone to a
+// background thread. When the struct's fields drop, the Arc decrements to 1
+// (held by the thread) — the Runtime is NOT freed. The thread then drops its
+// reference outside the async context, freeing the Runtime safely.
+impl Drop for SurrealDbVectorStore {
+    fn drop(&mut self) {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let rt = self.runtime.clone();
+            std::thread::spawn(move || drop(rt));
+        }
+    }
 }
 
 /// Convert an `anyhow::Error` into a [`CoreError::VectorStore`] at the trait boundary.
@@ -741,40 +764,42 @@ impl VectorStore for SurrealDbVectorStore {
         let table = self.config.table.clone();
 
         self.block_on(async move {
-            let query = if let Some(ref allowed_ids) = filter_ids {
-                if allowed_ids.is_empty() {
+            if let Some(ref ids) = filter_ids {
+                if ids.is_empty() {
                     return Ok(Vec::new());
                 }
+            }
 
-                format!(
+            let mut response = if let Some(ref allowed_ids) = filter_ids {
+                let inner_limit = limit.saturating_mul(3).max(limit);
+                let query = format!(
                     r#"
-                    SELECT doc_id, vector::distance::knn() AS distance
-                    FROM {table}
-                    WHERE embedding <|{limit},COSINE|> $query_vec
-                      AND doc_id IN $allowed_ids
-                    ORDER BY distance
+                    SELECT doc_id, distance FROM (
+                        SELECT doc_id, vector::distance::knn() AS distance
+                        FROM {table}
+                        WHERE embedding <|{inner_limit},COSINE|> $query_vec
+                        ORDER BY distance
+                    ) WHERE doc_id IN $allowed_ids
                     LIMIT {limit};
                     "#
-                )
-            } else {
-                format!(
-                    r#"
-                    SELECT doc_id, vector::distance::knn() AS distance
-                    FROM {table}
-                    WHERE embedding <|{limit},COSINE|> $query_vec
-                    ORDER BY distance
-                    LIMIT {limit};
-                    "#
-                )
-            };
+                );
 
-            let mut response = if let Some(allowed_ids) = filter_ids {
                 db.query(&query)
                     .bind(("query_vec", vector))
-                    .bind(("allowed_ids", allowed_ids))
+                    .bind(("allowed_ids", allowed_ids.clone()))
                     .await
                     .context("Failed to execute vector search")?
             } else {
+                let query = format!(
+                    r#"
+                    SELECT doc_id, vector::distance::knn() AS distance
+                    FROM {table}
+                    WHERE embedding <|{limit},COSINE|> $query_vec
+                    ORDER BY distance
+                    LIMIT {limit};
+                    "#
+                );
+
                 db.query(&query)
                     .bind(("query_vec", vector))
                     .await
