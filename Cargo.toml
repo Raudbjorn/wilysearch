@@ -69,6 +69,7 @@ candle-transformers = "=0.9.1"
 # Optional SurrealDB support
 surrealdb = { version = "2.2", features = ["kv-mem", "kv-rocksdb"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"], optional = true }
+paste = "1.0.15"
 
 [dev-dependencies]
 # Used by RAG implementation tests (block_on for async trait methods)
