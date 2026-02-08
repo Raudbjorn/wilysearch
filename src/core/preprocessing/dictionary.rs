@@ -523,8 +523,10 @@ fn strip_punctuation(word: &str) -> &str {
         .find(|c: char| c.is_alphanumeric())
         .unwrap_or(word.len());
     let end = word
-        .rfind(|c: char| c.is_alphanumeric())
-        .map(|i| i + 1)
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_alphanumeric())
+        .map(|(i, c)| i + c.len_utf8())
         .unwrap_or(0);
 
     if start >= end {
@@ -575,6 +577,16 @@ mod tests {
         assert_eq!(strip_punctuation("don't"), "don't");
         assert_eq!(strip_punctuation("well-known"), "well-known");
         assert_eq!(strip_punctuation("..."), "");
+    }
+
+    #[test]
+    fn test_strip_punctuation_multibyte() {
+        assert_eq!(strip_punctuation("café"), "café");
+        assert_eq!(strip_punctuation("¡café!"), "café");
+        assert_eq!(strip_punctuation("über"), "über");
+        assert_eq!(strip_punctuation("日本語"), "日本語");
+        assert_eq!(strip_punctuation("«résumé»"), "résumé");
+        assert_eq!(strip_punctuation("naïve"), "naïve");
     }
 
     #[test]

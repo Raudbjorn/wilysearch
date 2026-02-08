@@ -361,6 +361,8 @@ pub struct MultiSearchQuery {
     pub index_uid: String,
     #[serde(flatten)]
     pub search: SearchRequest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub federation_options: Option<FederationQueryOptions>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,13 +370,89 @@ pub struct MultiSearchQuery {
 pub struct MultiSearchRequest {
     pub queries: Vec<MultiSearchQuery>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub federation: Option<Value>,
+    pub federation: Option<FederationSettings>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MultiSearchResponse {
     pub results: Vec<SearchResponse>,
+}
+
+/// Result of a multi-search -- either per-index or federated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MultiSearchResult {
+    /// Standard per-index results (when no federation).
+    PerIndex(MultiSearchResponse),
+    /// Federated merged results (when federation is set).
+    Federated(FederatedSearchResponse),
+}
+
+/// Federation configuration for merged multi-search.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FederationSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hits_per_page: Option<u32>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub facets_by_index: HashMap<String, Option<Vec<String>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_facets: Option<MergeFacetsSettings>,
+}
+
+/// Merge facets configuration.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeFacetsSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_values_per_facet: Option<u32>,
+}
+
+/// Per-query options for federated ranking.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FederationQueryOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_position: Option<u32>,
+}
+
+/// Response from federated multi-search (flat merged hits).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FederatedSearchResponse {
+    pub hits: Vec<Value>,
+    pub processing_time_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_total_hits: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_hits: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_pages: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hits_per_page: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facet_distribution: Option<HashMap<String, HashMap<String, u64>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facet_stats: Option<Value>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub facets_by_index: HashMap<String, Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_hit_count: Option<u32>,
 }
 
 // ─── Facet search ────────────────────────────────────────────────────────────

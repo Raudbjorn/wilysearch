@@ -300,7 +300,7 @@ impl Default for SynonymConfig {
 ///
 /// Supports both multi-way synonyms (all terms interchangeable) and
 /// one-way synonyms (source maps to targets only).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct SynonymMap {
     /// Multi-way synonym groups. Each group is a set of interchangeable terms.
     /// Stored as: term -> group_id, where all terms in a group share the same id.
@@ -316,6 +316,40 @@ pub struct SynonymMap {
     /// Configuration for expansion behavior.
     #[serde(default)]
     pub config: SynonymConfig,
+}
+
+impl<'de> Deserialize<'de> for SynonymMap {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct SynonymMapHelper {
+            #[serde(default)]
+            multi_way_groups: Vec<HashSet<String>>,
+            #[serde(default)]
+            one_way_mappings: HashMap<String, Vec<String>>,
+            #[serde(default)]
+            config: SynonymConfig,
+        }
+
+        let helper = SynonymMapHelper::deserialize(deserializer)?;
+
+        // Rebuild the multi_way_index from multi_way_groups
+        let mut multi_way_index = HashMap::new();
+        for (group_id, group) in helper.multi_way_groups.iter().enumerate() {
+            for term in group {
+                multi_way_index.insert(term.clone(), group_id);
+            }
+        }
+
+        Ok(SynonymMap {
+            multi_way_index,
+            multi_way_groups: helper.multi_way_groups,
+            one_way_mappings: helper.one_way_mappings,
+            config: helper.config,
+        })
+    }
 }
 
 impl SynonymMap {
@@ -515,7 +549,7 @@ impl SynonymMap {
     pub fn load_from_toml(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         let content = fs::read_to_string(path).map_err(|e| {
-            PreprocessingError::ConfigLoadError(format!("Failed to read {}: {}", path.display(), e))
+            PreprocessingError::ConfigLoad(format!("Failed to read {}: {}", path.display(), e))
         })?;
 
         self.load_from_toml_str(&content)
@@ -524,7 +558,7 @@ impl SynonymMap {
     /// Load synonyms from a TOML string.
     pub fn load_from_toml_str(&mut self, content: &str) -> Result<()> {
         let config: SynonymFileConfig = toml::from_str(content).map_err(|e| {
-            PreprocessingError::ConfigLoadError(format!("Invalid TOML: {}", e))
+            PreprocessingError::ConfigLoad(format!("Invalid TOML: {}", e))
         })?;
 
         // Load multi-way synonyms
@@ -565,7 +599,7 @@ impl SynonymMap {
     pub fn load_from_json(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         let content = fs::read_to_string(path).map_err(|e| {
-            PreprocessingError::ConfigLoadError(format!("Failed to read {}: {}", path.display(), e))
+            PreprocessingError::ConfigLoad(format!("Failed to read {}: {}", path.display(), e))
         })?;
 
         self.load_from_json_str(&content)
@@ -574,7 +608,7 @@ impl SynonymMap {
     /// Load synonyms from a JSON string.
     pub fn load_from_json_str(&mut self, content: &str) -> Result<()> {
         let config: SynonymFileConfig = serde_json::from_str(content).map_err(|e| {
-            PreprocessingError::ConfigLoadError(format!("Invalid JSON: {}", e))
+            PreprocessingError::ConfigLoad(format!("Invalid JSON: {}", e))
         })?;
 
         // Load multi-way synonyms
@@ -1352,5 +1386,26 @@ mod tests {
         // Using nonexistent campaign should just return base synonyms
         let expansions = scoped.expand_term("hp", Some("nonexistent-campaign"));
         assert!(expansions.contains(&"hit points".to_string()));
+    }
+
+    #[test]
+    fn test_synonym_map_roundtrip_preserves_multi_way() {
+        let mut map = SynonymMap::new();
+        map.add_multi_way(&["hp", "hit points", "health"]);
+        map.add_one_way("dragon", &["wyrm", "drake"]);
+
+        // Serialize and deserialize (round-trip)
+        let json = serde_json::to_string(&map).unwrap();
+        let deserialized: SynonymMap = serde_json::from_str(&json).unwrap();
+
+        // Multi-way synonyms should still work after round-trip
+        let expansions = deserialized.expand_term("hp");
+        assert!(expansions.contains(&"hp".to_string()));
+        assert!(expansions.contains(&"hit points".to_string()));
+        assert!(expansions.contains(&"health".to_string()));
+
+        // One-way should also work
+        let dragon_exp = deserialized.expand_term("dragon");
+        assert!(dragon_exp.contains(&"wyrm".to_string()));
     }
 }

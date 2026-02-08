@@ -1,0 +1,195 @@
+# wilysearch.reference.toml
+#
+# Complete reference configuration for wilysearch — an embedded, HTTP-less
+# Meilisearch engine for Rust. Every field is shown with its default value.
+#
+# An empty file (or no file at all) produces a valid, working configuration.
+# Configuration sources are layered:
+#   defaults < wilysearch.toml < WILYSEARCH__* environment variables
+#
+# Environment variable format: WILYSEARCH__SECTION__FIELD (double underscore separator)
+# Example: WILYSEARCH__ENGINE__DB_PATH="/var/lib/wilysearch"
+
+# ─── Engine ──────────────────────────────────────────────────────────────────
+
+[engine]
+
+# type: PathBuf — Directory where the LMDB database files are stored
+db_path = "data.ms"
+
+# type: usize (bytes) — Maximum memory-map size per index (100 GiB)
+max_index_size = 107374182400
+
+# type: usize (bytes) — Maximum memory-map size for the task database (10 GiB)
+max_task_db_size = 10737418240
+
+# ─── Preprocessing: Typo Correction ─────────────────────────────────────────
+# Note: TypoConfig uses camelCase field names (serde rename_all = "camelCase")
+
+[preprocessing.typo]
+
+# type: bool — Whether typo correction is enabled globally
+enabled = true
+
+# type: usize — Minimum word length for single-typo tolerance
+minWordSizeOneTypo = 5
+
+# type: usize — Minimum word length for two-typo tolerance
+minWordSizeTwoTypos = 9
+
+# type: i64 — Maximum edit distance for corrections (0–3)
+maxEditDistance = 2
+
+# type: Vec<String> — Words excluded from typo correction
+disabledOnWords = []
+
+# ─── Preprocessing: Synonym Expansion ────────────────────────────────────────
+# Note: SynonymConfig uses camelCase field names (serde rename_all = "camelCase")
+
+[preprocessing.synonyms]
+
+# type: bool — Whether synonym expansion is enabled
+enabled = true
+
+# type: usize — Maximum number of expansions per term
+maxExpansions = 10
+
+# type: bool — Whether to include the original term in expansions
+includeOriginal = true
+
+# ─── Preprocessing: Dictionary Paths ────────────────────────────────────────
+
+[preprocessing.paths]
+
+# type: Option<PathBuf> — Path to English frequency dictionary
+# english_dict = "data/frequency_dictionary_en.txt"
+
+# type: Option<PathBuf> — Path to corpus frequency dictionary
+# corpus_dict = "data/corpus.txt"
+
+# type: Option<PathBuf> — Path to bigram dictionary for compound word correction
+# bigram_dict = "data/bigrams.txt"
+
+# type: Option<PathBuf> — Path to synonyms TOML file
+# synonyms_file = "data/synonyms.toml"
+
+# ─── Preprocessing: Normalization ────────────────────────────────────────────
+
+[preprocessing.normalization]
+
+# type: bool — Convert text to lowercase before processing
+lowercase = true
+
+# type: bool — Trim leading and trailing whitespace
+trim = true
+
+# type: bool — Collapse multiple whitespace characters into a single space
+collapse_whitespace = true
+
+# type: bool — Apply Unicode normalization (NFKC)
+unicode_normalize = false
+
+# ─── Vector Store (feature-gated: requires `surrealdb` feature) ─────────────
+# Uncomment and configure to enable SurrealDB vector storage.
+
+# [vector_store]
+
+# # type: String — SurrealDB connection string ("memory", "file:///path", "ws://host:port")
+# connection_string = "memory"
+
+# # type: String — SurrealDB namespace
+# namespace = "meilisearch"
+
+# # type: String — SurrealDB database name
+# database = "vectors"
+
+# # type: String — Table name for storing vectors
+# table = "embeddings"
+
+# # type: usize — Vector dimensions
+# dimensions = 384
+
+# # type: usize — HNSW M parameter (max connections per node)
+# hnsw_m = 16
+
+# # type: usize — HNSW EF construction parameter
+# hnsw_ef = 500
+
+# # type: bool — Whether to use binary quantization
+# quantized = false
+
+# [vector_store.auth]
+
+# # type: String — SurrealDB username
+# username = ""
+
+# # type: String — SurrealDB password
+# password = ""
+
+# ─── RAG Pipeline ────────────────────────────────────────────────────────────
+
+[rag]
+
+# type: usize — Number of documents to retrieve before reranking
+retrieval_limit = 20
+
+# type: usize — Number of documents to keep after reranking
+rerank_limit = 5
+
+# type: usize — Maximum context length in characters for the generator
+max_context_chars = 8000
+
+# type: bool — Whether to include source snippets in the response
+include_snippets = true
+
+# type: String — Default search type: "keyword", "semantic", or "hybrid"
+default_search_type = "hybrid"
+
+# type: f32 — Semantic weight for hybrid search [0.0, 1.0]
+semantic_ratio = 0.5
+
+# ─── Experimental Features ───────────────────────────────────────────────────
+# All default to false.
+
+[experimental]
+
+# type: bool — Enable Prometheus metrics endpoint
+metrics = false
+
+# type: bool — Enable the logs route for real-time log streaming
+logs_route = false
+
+# type: bool — Enable editing documents by function (JavaScript runtime)
+edit_documents_by_function = false
+
+# type: bool — Enable the CONTAINS filter operator
+contains_filter = false
+
+# type: bool — Enable composite (multi-source) embedders
+composite_embedders = false
+
+# type: bool — Enable multimodal embeddings
+multimodal = false
+
+# type: bool — Enable vector store settings in index configuration
+vector_store_setting = false
+
+# ─── Search Defaults ─────────────────────────────────────────────────────────
+# Default parameters applied to search queries when not explicitly specified.
+
+[search_defaults]
+
+# type: usize — Default result limit per search query
+limit = 20
+
+# type: String — HTML tag inserted before highlighted terms
+highlight_pre_tag = "<em>"
+
+# type: String — HTML tag inserted after highlighted terms
+highlight_post_tag = "</em>"
+
+# type: usize — Default crop length in words
+crop_length = 10
+
+# type: String — Marker inserted at crop boundaries
+crop_marker = "..."

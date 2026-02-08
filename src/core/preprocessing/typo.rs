@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
-use symspell::{AsciiStringStrategy, SymSpell, SymSpellBuilder, Verbosity};
+use symspell::{SymSpell, SymSpellBuilder, UnicodeStringStrategy, Verbosity};
 
 use crate::core::preprocessing::error::{PreprocessingError, Result};
 
@@ -209,7 +209,7 @@ fn calculate_confidence(original: &str, corrected: &str, edit_distance: i64) -> 
 /// all possible deletion variants of dictionary words.
 pub struct TypoCorrector {
     /// The SymSpell instance for spell checking.
-    symspell: SymSpell<AsciiStringStrategy>,
+    symspell: SymSpell<UnicodeStringStrategy>,
     /// Configuration for typo tolerance.
     config: TypoConfig,
     /// Set of protected words (lowercase) that should never be corrected.
@@ -228,7 +228,7 @@ impl TypoCorrector {
     /// Note: You must load a dictionary before using the corrector.
     /// Use `load_dictionary` or `load_dictionary_from_file` to load words.
     pub fn new(config: TypoConfig) -> Result<Self> {
-        let symspell: SymSpell<AsciiStringStrategy> = SymSpellBuilder::default()
+        let symspell: SymSpell<UnicodeStringStrategy> = SymSpellBuilder::default()
             .max_dictionary_edit_distance(config.max_edit_distance)
             .prefix_length(7)
             .count_threshold(1)
@@ -564,7 +564,7 @@ impl TypoCorrector {
 /// Split a string into (leading punctuation, word, trailing punctuation).
 fn split_punctuation(s: &str) -> (&str, &str, &str) {
     let start = s.find(|c: char| c.is_alphanumeric()).unwrap_or(s.len());
-    let end = s.rfind(|c: char| c.is_alphanumeric()).map(|i| i + 1).unwrap_or(0);
+    let end = s.char_indices().rev().find(|(_, c)| c.is_alphanumeric()).map(|(i, c)| i + c.len_utf8()).unwrap_or(0);
 
     if start >= end {
         return ("", s, "");
@@ -655,6 +655,16 @@ mod tests {
         assert_eq!(split_punctuation("(hello)"), ("(", "hello", ")"));
         assert_eq!(split_punctuation("hello,"), ("", "hello", ","));
         assert_eq!(split_punctuation("...test!!!"), ("...", "test", "!!!"));
+    }
+
+    #[test]
+    fn test_split_punctuation_multibyte() {
+        assert_eq!(split_punctuation("café"), ("", "café", ""));
+        assert_eq!(split_punctuation("¡café!"), ("¡", "café", "!"));
+        assert_eq!(split_punctuation("über"), ("", "über", ""));
+        assert_eq!(split_punctuation("日本語"), ("", "日本語", ""));
+        assert_eq!(split_punctuation("«résumé»"), ("«", "résumé", "»"));
+        assert_eq!(split_punctuation("naïve"), ("", "naïve", ""));
     }
 
     #[test]

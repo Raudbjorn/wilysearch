@@ -1,5 +1,7 @@
 mod common;
 
+use std::collections::HashMap;
+
 use common::TestContext;
 use wilysearch::core::MeilisearchOptions;
 use wilysearch::engine::Engine;
@@ -290,4 +292,85 @@ fn test_timestamps_persist_across_restart() {
     let index = engine2.get_index("movies").unwrap();
     assert_eq!(index.created_at, created_at, "created_at should survive restart");
     assert!(!index.updated_at.is_empty(), "updated_at should survive restart");
+}
+
+#[test]
+fn test_export_all_indexes() {
+    let ctx = TestContext::new();
+    common::create_test_index(&ctx, "movies");
+    common::create_test_index(&ctx, "books");
+
+    let export_dir = tempfile::TempDir::new().expect("failed to create export dir");
+    let result = ctx.engine.export(&ExportRequest {
+        url: export_dir.path().to_string_lossy().to_string(),
+        api_key: None,
+        indexes: None,
+    });
+    assert!(result.is_ok(), "export should succeed: {result:?}");
+
+    // Both index dirs should exist with documents.json and settings.json
+    for uid in &["movies", "books"] {
+        let index_dir = export_dir.path().join(uid);
+        assert!(index_dir.exists(), "{uid} dir should exist");
+        assert!(index_dir.join("documents.json").exists(), "{uid}/documents.json should exist");
+        assert!(index_dir.join("settings.json").exists(), "{uid}/settings.json should exist");
+
+        // Verify documents.json is valid JSON array with content
+        let docs: Vec<serde_json::Value> = serde_json::from_str(
+            &std::fs::read_to_string(index_dir.join("documents.json")).unwrap(),
+        )
+        .expect("documents.json should be valid JSON");
+        assert!(!docs.is_empty(), "{uid} should have documents");
+    }
+}
+
+#[test]
+fn test_export_filtered_indexes() {
+    let ctx = TestContext::new();
+    common::create_test_index(&ctx, "movies");
+    common::create_test_index(&ctx, "books");
+    common::create_test_index(&ctx, "songs");
+
+    let export_dir = tempfile::TempDir::new().expect("failed to create export dir");
+
+    let mut indexes = HashMap::new();
+    indexes.insert("movies".to_string(), ExportIndexConfig { override_settings: None });
+    indexes.insert("songs".to_string(), ExportIndexConfig { override_settings: None });
+
+    let result = ctx.engine.export(&ExportRequest {
+        url: export_dir.path().to_string_lossy().to_string(),
+        api_key: None,
+        indexes: Some(indexes),
+    });
+    assert!(result.is_ok(), "export should succeed: {result:?}");
+
+    // Only movies and songs should be exported
+    assert!(export_dir.path().join("movies").exists(), "movies should be exported");
+    assert!(export_dir.path().join("songs").exists(), "songs should be exported");
+    assert!(!export_dir.path().join("books").exists(), "books should NOT be exported");
+}
+
+#[test]
+fn test_export_without_settings() {
+    let ctx = TestContext::new();
+    common::create_test_index(&ctx, "movies");
+
+    let export_dir = tempfile::TempDir::new().expect("failed to create export dir");
+
+    let mut indexes = HashMap::new();
+    indexes.insert(
+        "movies".to_string(),
+        ExportIndexConfig { override_settings: Some(false) },
+    );
+
+    let result = ctx.engine.export(&ExportRequest {
+        url: export_dir.path().to_string_lossy().to_string(),
+        api_key: None,
+        indexes: Some(indexes),
+    });
+    assert!(result.is_ok(), "export should succeed: {result:?}");
+
+    let index_dir = export_dir.path().join("movies");
+    assert!(index_dir.join("documents.json").exists(), "documents.json should exist");
+    assert!(!index_dir.join("settings.json").exists(), "settings.json should NOT exist when override_settings=false");
 }

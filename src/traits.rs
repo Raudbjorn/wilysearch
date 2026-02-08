@@ -84,7 +84,7 @@ pub trait Search {
     ) -> Result<SimilarResponse>;
 
     /// POST /multi-search
-    fn multi_search(&self, request: &MultiSearchRequest) -> Result<MultiSearchResponse>;
+    fn multi_search(&self, request: &MultiSearchRequest) -> Result<MultiSearchResult>;
 
     /// POST /indexes/{indexUid}/facet-search
     fn facet_search(

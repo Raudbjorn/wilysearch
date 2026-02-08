@@ -56,6 +56,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## Configuration
+
+wilysearch provides unified configuration via TOML files, environment variables, and programmatic Rust structs. Sources are layered with later sources taking precedence: defaults < TOML file < environment variables < programmatic overrides.
+
+### From a config file
+
+```rust
+use wilysearch::engine::Engine;
+
+let engine = Engine::from_config_file("wilysearch.toml")?;
+```
+
+### Programmatic
+
+```rust
+use wilysearch::config::{WilysearchConfig, EngineConfig};
+use wilysearch::engine::Engine;
+
+let config = WilysearchConfig {
+    engine: EngineConfig {
+        db_path: "/var/lib/wilysearch".into(),
+        ..Default::default()
+    },
+    ..Default::default()
+};
+let engine = Engine::with_config(config)?;
+```
+
+### Minimal TOML example
+
+```toml
+[engine]
+db_path = "/var/lib/wilysearch"
+
+[preprocessing.typo]
+maxEditDistance = 1
+
+[search_defaults]
+limit = 50
+```
+
+### Environment variable overrides
+
+Any setting can be overridden at deploy time with `WILYSEARCH__<SECTION>__<FIELD>`:
+
+```bash
+export WILYSEARCH__ENGINE__DB_PATH=/data/search
+export WILYSEARCH__SEARCH_DEFAULTS__LIMIT=100
+```
+
+See [docs/configuration.md](docs/configuration.md) for the full configuration reference, including all sections, field types, defaults, validation rules, and the complete environment variable mapping table.
+
 ## Architecture
 
 ```
@@ -219,6 +271,7 @@ cargo run --example settings
 wilysearch/
 ├── src/
 │   ├── lib.rs              -- crate root (4 modules)
+│   ├── config.rs           -- WilysearchConfig unified configuration (805 LOC)
 │   ├── engine.rs           -- Engine struct (1,415 LOC)
 │   ├── traits.rs           -- 10 traits, 107 methods (340 LOC)
 │   ├── types.rs            -- 48 structs, 2 enums (669 LOC)
@@ -244,6 +297,7 @@ wilysearch/
 │   ├── preprocessing.rs
 │   └── settings.rs
 └── docs/
+    ├── configuration.md                 -- full configuration reference
     ├── dependency-reduction-analysis.md  -- future: replacing milli
     └── tool-execution-spec.md           -- future: LLM tool calling
 ```

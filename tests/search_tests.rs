@@ -391,3 +391,259 @@ fn test_search_crop() {
         );
     }
 }
+
+// ─── Federated multi-search ─────────────────────────────────────────────────
+
+/// Helper: create both "movies" and "books" indexes for federated tests.
+fn create_movies_and_books(ctx: &TestContext) {
+    common::create_test_index(ctx, "movies");
+
+    ctx.engine
+        .create_index(&CreateIndexRequest {
+            uid: "books".to_string(),
+            primary_key: Some("id".to_string()),
+        })
+        .expect("failed to create books index");
+
+    ctx.engine
+        .add_or_replace_documents("books", &common::sample_books(), &AddDocumentsQuery::default())
+        .expect("failed to add books");
+}
+
+#[test]
+fn test_federated_multi_search_basic() {
+    let ctx = TestContext::new();
+    create_movies_and_books(&ctx);
+
+    let request = MultiSearchRequest {
+        queries: vec![
+            MultiSearchQuery {
+                index_uid: "movies".to_string(),
+                search: SearchRequest {
+                    q: Some("dark".to_string()),
+                    ..Default::default()
+                },
+                federation_options: None,
+            },
+            MultiSearchQuery {
+                index_uid: "books".to_string(),
+                search: SearchRequest {
+                    q: Some("dark".to_string()),
+                    ..Default::default()
+                },
+                federation_options: None,
+            },
+        ],
+        federation: Some(FederationSettings::default()),
+    };
+
+    let result = ctx.engine.multi_search(&request).expect("federated search failed");
+
+    match result {
+        MultiSearchResult::Federated(fed) => {
+            assert!(!fed.hits.is_empty(), "expected merged hits from both indexes");
+            // Default pagination uses offset/limit
+            assert!(fed.offset.is_some() || fed.limit.is_some());
+        }
+        MultiSearchResult::PerIndex(_) => {
+            panic!("expected Federated variant, got PerIndex");
+        }
+    }
+}
+
+#[test]
+fn test_federated_multi_search_with_weights() {
+    let ctx = TestContext::new();
+    create_movies_and_books(&ctx);
+
+    // Give books a very high weight so they rank above movies.
+    let request = MultiSearchRequest {
+        queries: vec![
+            MultiSearchQuery {
+                index_uid: "movies".to_string(),
+                search: SearchRequest {
+                    q: Some("the".to_string()),
+                    ..Default::default()
+                },
+                federation_options: Some(FederationQueryOptions {
+                    weight: Some(0.1),
+                    query_position: None,
+                }),
+            },
+            MultiSearchQuery {
+                index_uid: "books".to_string(),
+                search: SearchRequest {
+                    q: Some("the".to_string()),
+                    ..Default::default()
+                },
+                federation_options: Some(FederationQueryOptions {
+                    weight: Some(10.0),
+                    query_position: None,
+                }),
+            },
+        ],
+        federation: Some(FederationSettings::default()),
+    };
+
+    let result = ctx.engine.multi_search(&request).expect("federated search failed");
+
+    match result {
+        MultiSearchResult::Federated(fed) => {
+            assert!(!fed.hits.is_empty(), "expected merged hits");
+        }
+        MultiSearchResult::PerIndex(_) => {
+            panic!("expected Federated variant, got PerIndex");
+        }
+    }
+}
+
+#[test]
+fn test_federated_multi_search_pagination() {
+    let ctx = TestContext::new();
+    create_movies_and_books(&ctx);
+
+    // Use page-based pagination: page 1 with 3 hits per page.
+    let request = MultiSearchRequest {
+        queries: vec![
+            MultiSearchQuery {
+                index_uid: "movies".to_string(),
+                search: SearchRequest {
+                    q: Some("the".to_string()),
+                    ..Default::default()
+                },
+                federation_options: None,
+            },
+            MultiSearchQuery {
+                index_uid: "books".to_string(),
+                search: SearchRequest {
+                    q: Some("the".to_string()),
+                    ..Default::default()
+                },
+                federation_options: None,
+            },
+        ],
+        federation: Some(FederationSettings {
+            page: Some(1),
+            hits_per_page: Some(3),
+            ..Default::default()
+        }),
+    };
+
+    let result = ctx.engine.multi_search(&request).expect("federated search failed");
+
+    match result {
+        MultiSearchResult::Federated(fed) => {
+            assert!(fed.hits.len() <= 3, "expected at most 3 hits, got {}", fed.hits.len());
+            assert_eq!(fed.page, Some(1));
+            assert_eq!(fed.hits_per_page, Some(3));
+            assert!(fed.total_hits.is_some());
+            assert!(fed.total_pages.is_some());
+        }
+        MultiSearchResult::PerIndex(_) => {
+            panic!("expected Federated variant, got PerIndex");
+        }
+    }
+
+    // Offset/limit pagination
+    let request2 = MultiSearchRequest {
+        queries: vec![
+            MultiSearchQuery {
+                index_uid: "movies".to_string(),
+                search: SearchRequest {
+                    q: Some("the".to_string()),
+                    ..Default::default()
+                },
+                federation_options: None,
+            },
+        ],
+        federation: Some(FederationSettings {
+            limit: Some(2),
+            offset: Some(1),
+            ..Default::default()
+        }),
+    };
+
+    let result2 = ctx.engine.multi_search(&request2).expect("federated search failed");
+
+    match result2 {
+        MultiSearchResult::Federated(fed) => {
+            assert!(fed.hits.len() <= 2, "expected at most 2 hits, got {}", fed.hits.len());
+            assert_eq!(fed.offset, Some(1));
+            assert_eq!(fed.limit, Some(2));
+            assert!(fed.estimated_total_hits.is_some());
+        }
+        MultiSearchResult::PerIndex(_) => {
+            panic!("expected Federated variant, got PerIndex");
+        }
+    }
+}
+
+#[test]
+fn test_federated_multi_search_single_index() {
+    let ctx = TestContext::new();
+    common::create_test_index(&ctx, "movies");
+
+    let request = MultiSearchRequest {
+        queries: vec![MultiSearchQuery {
+            index_uid: "movies".to_string(),
+            search: SearchRequest {
+                q: Some("knight".to_string()),
+                ..Default::default()
+            },
+            federation_options: None,
+        }],
+        federation: Some(FederationSettings::default()),
+    };
+
+    let result = ctx.engine.multi_search(&request).expect("federated search failed");
+
+    match result {
+        MultiSearchResult::Federated(fed) => {
+            assert!(!fed.hits.is_empty(), "expected hits from single index");
+        }
+        MultiSearchResult::PerIndex(_) => {
+            panic!("expected Federated variant, got PerIndex");
+        }
+    }
+}
+
+#[test]
+fn test_non_federated_multi_search_returns_per_index() {
+    let ctx = TestContext::new();
+    create_movies_and_books(&ctx);
+
+    let request = MultiSearchRequest {
+        queries: vec![
+            MultiSearchQuery {
+                index_uid: "movies".to_string(),
+                search: SearchRequest {
+                    q: Some("dark".to_string()),
+                    ..Default::default()
+                },
+                federation_options: None,
+            },
+            MultiSearchQuery {
+                index_uid: "books".to_string(),
+                search: SearchRequest {
+                    q: Some("great".to_string()),
+                    ..Default::default()
+                },
+                federation_options: None,
+            },
+        ],
+        federation: None,
+    };
+
+    let result = ctx.engine.multi_search(&request).expect("multi_search failed");
+
+    match result {
+        MultiSearchResult::PerIndex(per_index) => {
+            assert_eq!(per_index.results.len(), 2, "expected 2 per-index result sets");
+            assert!(!per_index.results[0].hits.is_empty(), "movies should have hits for 'dark'");
+            assert!(!per_index.results[1].hits.is_empty(), "books should have hits for 'great'");
+        }
+        MultiSearchResult::Federated(_) => {
+            panic!("expected PerIndex variant, got Federated");
+        }
+    }
+}

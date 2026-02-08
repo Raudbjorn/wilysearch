@@ -1237,82 +1237,93 @@ impl Index {
         }
 
         let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
-        let rtxn = self.inner.read_txn().map_err(Error::Heed)?;
 
-        // Count how many documents actually exist before deletion and
-        // collect their internal IDs for VectorStore cleanup.
-        let external_ids = self.inner.external_documents_ids();
-        let mut existing_count = 0u64;
-        let mut vector_ids_to_remove: Vec<u32> = Vec::new();
-
-        for id in &ids {
-            if let Some(internal_id) = external_ids.get(&rtxn, id).ok().flatten() {
-                existing_count += 1;
-                if self.vector_store.is_some() {
-                    vector_ids_to_remove.push(internal_id);
+        // Pre-deletion reads use a scoped rtxn. We extract owned data
+        // (existing_count, vector_ids) so the rtxn can be dropped immediately.
+        let (existing_count, vector_ids_to_remove) = {
+            let rtxn = self.inner.read_txn().map_err(Error::Heed)?;
+            let external_ids = self.inner.external_documents_ids();
+            let mut count = 0u64;
+            let mut to_remove: Vec<u32> = Vec::new();
+            for id in &ids {
+                if let Some(internal_id) = external_ids.get(&rtxn, id).ok().flatten() {
+                    count += 1;
+                    if self.vector_store.is_some() {
+                        to_remove.push(internal_id);
+                    }
                 }
             }
-        }
+            (count, to_remove)
+        };
 
         if existing_count == 0 {
             return Ok(0);
         }
 
-        let indexer_config = IndexerConfig::default();
-        let pool = &indexer_config.thread_pool;
+        // Scope the indexer rtxn: document_changes borrows rtxn (via into_changes),
+        // so both must live through the indexer::index call. The block ensures the
+        // rtxn is dropped before wtxn.commit(), allowing LMDB page reclamation.
+        {
+            let rtxn = self.inner.read_txn().map_err(Error::Heed)?;
 
-        let db_fields_ids_map = self.inner.fields_ids_map(&rtxn).map_err(Error::Heed)?;
-        let mut new_fields_ids_map = db_fields_ids_map.clone();
+            let indexer_config = IndexerConfig::default();
+            let pool = &indexer_config.thread_pool;
 
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-        let embedders = InnerIndexSettings::from_index(&self.inner, &rtxn, &ip_policy, None)
-            .map_err(Error::Milli)?
-            .runtime_embedders;
+            let db_fields_ids_map = self.inner.fields_ids_map(&rtxn).map_err(Error::Heed)?;
+            let mut new_fields_ids_map = db_fields_ids_map.clone();
 
-        let mut indexer_ops = indexer::IndexOperations::new();
-        let id_refs: Vec<&str> = ids.iter().map(AsRef::as_ref).collect();
-        indexer_ops.delete_documents(&id_refs);
+            let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
+            let embedders = InnerIndexSettings::from_index(&self.inner, &rtxn, &ip_policy, None)
+                .map_err(Error::Milli)?
+                .runtime_embedders;
 
-        let indexer_alloc = Bump::new();
-        let (document_changes, operation_stats, primary_key) = indexer_ops
-            .into_changes(
-                &indexer_alloc,
-                &self.inner,
-                &rtxn,
-                None,
-                &mut new_fields_ids_map,
-                &|| false,
-                milli::progress::Progress::default(),
-                None,
-            )
+            let mut indexer_ops = indexer::IndexOperations::new();
+            let id_refs: Vec<&str> = ids.iter().map(AsRef::as_ref).collect();
+            indexer_ops.delete_documents(&id_refs);
+
+            let indexer_alloc = Bump::new();
+            let (document_changes, operation_stats, primary_key) = indexer_ops
+                .into_changes(
+                    &indexer_alloc,
+                    &self.inner,
+                    &rtxn,
+                    None,
+                    &mut new_fields_ids_map,
+                    &|| false,
+                    milli::progress::Progress::default(),
+                    None,
+                )
+                .map_err(Error::Milli)?;
+
+            if let Some(error) = operation_stats.into_iter().find_map(|stat| stat.error) {
+                return Err(Error::Milli(error.into()));
+            }
+
+            let grenad_params = indexer_config.grenad_parameters();
+            let indexing_pool = milli::ThreadPoolNoAbortBuilder::new()
+                .build()
+                .map_err(|e| Error::Internal(format!("failed to build indexing thread pool: {e}")))?;
+
+            pool.install(|| {
+                indexer::index(
+                    &mut wtxn,
+                    &self.inner,
+                    &indexing_pool,
+                    grenad_params,
+                    &db_fields_ids_map,
+                    new_fields_ids_map,
+                    primary_key,
+                    &document_changes,
+                    embedders,
+                    &|| false,
+                    &milli::progress::Progress::default(),
+                    &ip_policy,
+                    &Default::default(),
+                )
+            })
+            .map_err(|e| Error::Internal(e.to_string()))?
             .map_err(Error::Milli)?;
-
-        // Check for errors in operation stats
-        if let Some(error) = operation_stats.into_iter().find_map(|stat| stat.error) {
-            return Err(Error::Milli(error.into()));
-        }
-
-        let grenad_params = indexer_config.grenad_parameters();
-
-        pool.install(|| {
-            indexer::index(
-                &mut wtxn,
-                &self.inner,
-                &milli::ThreadPoolNoAbortBuilder::new().build().unwrap(),
-                grenad_params,
-                &db_fields_ids_map,
-                new_fields_ids_map,
-                primary_key,
-                &document_changes,
-                embedders,
-                &|| false,
-                &milli::progress::Progress::default(),
-                &ip_policy,
-                &Default::default(),
-            )
-        })
-        .map_err(|e| Error::Internal(e.to_string()))?
-        .map_err(Error::Milli)?;
+        } // rtxn + document_changes dropped here, before commit
 
         // Remove vectors from the external VectorStore
         if let Some(store) = &self.vector_store {
@@ -1340,76 +1351,98 @@ impl Index {
         use milli::update::InnerIndexSettings;
 
         let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
-        let rtxn = self.inner.read_txn().map_err(Error::Heed)?;
 
-        // Parse and evaluate the filter to get matching document IDs
-        let filter = Filter::from_str(filter)
-            .map_err(|e| Error::Internal(format!("Invalid filter: {e}")))?
-            .ok_or_else(|| Error::Internal("Empty filter expression".to_string()))?;
+        // Pre-deletion reads use a scoped rtxn. We extract owned data
+        // (candidates, count, vector_ids) so the rtxn can be dropped immediately.
+        let (candidates, count, vector_ids_to_remove) = {
+            let rtxn = self.inner.read_txn().map_err(Error::Heed)?;
 
-        let candidates = filter.evaluate(&rtxn, &self.inner).map_err(Error::Milli)?;
+            let filter = Filter::from_str(filter)
+                .map_err(|e| Error::Internal(format!("Invalid filter: {e}")))?
+                .ok_or_else(|| Error::Internal("Empty filter expression".to_string()))?;
 
-        let count = candidates.len();
+            let candidates = filter.evaluate(&rtxn, &self.inner).map_err(Error::Milli)?;
+            let count = candidates.len();
+            let vector_ids: Vec<u32> = if self.vector_store.is_some() {
+                candidates.iter().collect()
+            } else {
+                Vec::new()
+            };
+
+            (candidates, count, vector_ids)
+        };
+
         if count == 0 {
             return Ok(0);
         }
 
-        // Collect internal IDs for VectorStore cleanup before the delete
-        let vector_ids_to_remove: Vec<u32> = if self.vector_store.is_some() {
-            candidates.iter().collect()
-        } else {
-            Vec::new()
-        };
+        // Scope the indexer rtxn: embedders borrows rtxn, and document_changes
+        // borrows indexer_alloc + primary_key. The block ensures the rtxn is
+        // dropped before wtxn.commit(), allowing LMDB page reclamation.
+        {
+            let rtxn = self.inner.read_txn().map_err(Error::Heed)?;
 
-        let indexer_config = IndexerConfig::default();
-        let pool = &indexer_config.thread_pool;
+            let indexer_config = IndexerConfig::default();
+            let pool = &indexer_config.thread_pool;
 
-        let db_fields_ids_map = self.inner.fields_ids_map(&rtxn).map_err(Error::Heed)?;
-        let new_fields_ids_map = db_fields_ids_map.clone();
+            let db_fields_ids_map = self.inner.fields_ids_map(&rtxn).map_err(Error::Heed)?;
+            let new_fields_ids_map = db_fields_ids_map.clone();
 
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-        let embedders =
-            InnerIndexSettings::from_index(&self.inner, &rtxn, &ip_policy, None)
-                .map_err(Error::Milli)?
-                .runtime_embedders;
+            let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
+            let embedders =
+                InnerIndexSettings::from_index(&self.inner, &rtxn, &ip_policy, None)
+                    .map_err(Error::Milli)?
+                    .runtime_embedders;
 
-        // Get the primary key
-        let primary_key_str =
-            self.inner.primary_key(&rtxn).map_err(Error::Heed)?.ok_or_else(|| {
-                Error::Internal("Index has no primary key configured".to_string())
-            })?;
-        let primary_key = PrimaryKey::new(primary_key_str, &db_fields_ids_map).ok_or_else(|| {
-            Error::Internal(format!("Primary key '{}' not found in fields map", primary_key_str))
-        })?;
+            let primary_key_str = self
+                .inner
+                .primary_key(&rtxn)
+                .map_err(Error::Heed)?
+                .ok_or_else(|| {
+                    Error::Internal("Index has no primary key configured".to_string())
+                })?
+                .to_string();
+            let primary_key =
+                PrimaryKey::new(&primary_key_str, &db_fields_ids_map).ok_or_else(|| {
+                    Error::Internal(format!(
+                        "Primary key '{}' not found in fields map",
+                        primary_key_str
+                    ))
+                })?;
 
-        // Create deletion operation
-        let mut deletion = DocumentDeletion::new();
-        deletion.delete_documents_by_docids(candidates);
+            let mut deletion = DocumentDeletion::new();
+            deletion.delete_documents_by_docids(candidates);
 
-        let indexer_alloc = Bump::new();
-        let document_changes = deletion.into_changes(&indexer_alloc, primary_key);
+            let indexer_alloc = Bump::new();
+            let document_changes = deletion.into_changes(&indexer_alloc, primary_key);
 
-        let grenad_params = indexer_config.grenad_parameters();
+            let grenad_params = indexer_config.grenad_parameters();
+            let indexing_pool = milli::ThreadPoolNoAbortBuilder::new()
+                .build()
+                .map_err(|e| {
+                    Error::Internal(format!("failed to build indexing thread pool: {e}"))
+                })?;
 
-        pool.install(|| {
-            indexer::index(
-                &mut wtxn,
-                &self.inner,
-                &milli::ThreadPoolNoAbortBuilder::new().build().unwrap(),
-                grenad_params,
-                &db_fields_ids_map,
-                new_fields_ids_map,
-                None, // primary_key already set
-                &document_changes,
-                embedders,
-                &|| false,
-                &milli::progress::Progress::default(),
-                &ip_policy,
-                &Default::default(),
-            )
-        })
-        .map_err(|e| Error::Internal(e.to_string()))?
-        .map_err(Error::Milli)?;
+            pool.install(|| {
+                indexer::index(
+                    &mut wtxn,
+                    &self.inner,
+                    &indexing_pool,
+                    grenad_params,
+                    &db_fields_ids_map,
+                    new_fields_ids_map,
+                    None, // primary_key already set
+                    &document_changes,
+                    embedders,
+                    &|| false,
+                    &milli::progress::Progress::default(),
+                    &ip_policy,
+                    &Default::default(),
+                )
+            })
+            .map_err(|e| Error::Internal(e.to_string()))?
+            .map_err(Error::Milli)?;
+        } // rtxn + embedders + document_changes dropped here, before commit
 
         // Remove vectors from the external VectorStore
         if let Some(store) = &self.vector_store {

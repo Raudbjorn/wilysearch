@@ -141,16 +141,15 @@ fn save_index_metadata(index_dir: &Path, meta: &IndexMetadata) -> Result<()> {
 
 /// Top-level handle for an embedded Meilisearch instance.
 ///
-/// `Meilisearch` owns the LMDB environment and an in-memory cache of loaded
-/// indexes. Indexes are created, opened, and deleted through this struct.
+/// `Meilisearch` manages an in-memory cache of loaded indexes, each with its
+/// own LMDB environment. Indexes are created, opened, and deleted through this
+/// struct.
 ///
 /// Thread safety: `Meilisearch` is `Send + Sync` and can be shared via `Arc`.
 pub struct Meilisearch {
     options: MeilisearchOptions,
     indexes: RwLock<HashMap<String, Arc<Index>>>,
     index_metadata: RwLock<HashMap<String, IndexMetadata>>,
-    #[allow(dead_code)] // Held to keep the LMDB environment open (RAII).
-    db_env: Arc<milli::heed::Env>,
     vector_store: Option<Arc<dyn VectorStore>>,
     experimental_features: RwLock<ExperimentalFeatures>,
 }
@@ -158,7 +157,8 @@ pub struct Meilisearch {
 impl Meilisearch {
     /// Create a new embedded Meilisearch instance with the given options.
     ///
-    /// Opens (or creates) the LMDB environment at `options.db_path`.
+    /// Creates the database directory at `options.db_path` if it does not exist
+    /// and loads persisted index metadata.
     ///
     /// # Example
     ///
@@ -174,17 +174,9 @@ impl Meilisearch {
     ///
     /// # Errors
     ///
-    /// Returns an error if the database directory cannot be created or the
-    /// LMDB environment fails to open.
+    /// Returns an error if the database directory cannot be created.
     pub fn new(options: MeilisearchOptions) -> Result<Self> {
         std::fs::create_dir_all(&options.db_path)?;
-
-        let mut env_builder = milli::heed::EnvOpenOptions::new();
-        env_builder.map_size(options.max_index_size);
-        env_builder.max_dbs(100); // Arbitrary limit for now
-
-        // unsafe { env_builder.open(...) } is required by heed
-        let db_env = Arc::new(unsafe { env_builder.open(&options.db_path).map_err(Error::Heed)? });
 
         // Load persisted metadata for all existing indexes, backfilling any that lack it
         let mut metadata_cache = HashMap::new();
@@ -215,7 +207,6 @@ impl Meilisearch {
             options,
             indexes: RwLock::new(HashMap::new()),
             index_metadata: RwLock::new(metadata_cache),
-            db_env,
             vector_store: None,
             experimental_features: RwLock::new(ExperimentalFeatures::default()),
         })
@@ -569,6 +560,70 @@ impl Meilisearch {
         })
     }
 
+    /// Export selected indexes to a filesystem directory.
+    ///
+    /// - `export_path` — destination directory (created if absent)
+    /// - `indexes` — `None` exports all; `Some(map)` filters to those UIDs.
+    ///   The bool value controls whether `settings.json` is written (`true` = include).
+    pub fn export(
+        &self,
+        export_path: &std::path::Path,
+        indexes: Option<&HashMap<String, bool>>,
+    ) -> Result<()> {
+        std::fs::create_dir_all(export_path)?;
+
+        let all_uids = self.list_indexes()?;
+        let uids_to_export: Vec<&str> = match indexes {
+            Some(map) => all_uids.iter().filter(|uid| map.contains_key(*uid)).map(|s| s.as_str()).collect(),
+            None => all_uids.iter().map(|s| s.as_str()).collect(),
+        };
+
+        for uid in &uids_to_export {
+            let index = self.get_index(uid)?;
+            let index_dir = export_path.join(uid);
+            std::fs::create_dir_all(&index_dir)?;
+
+            // Write settings if requested (default: true)
+            let include_settings = indexes
+                .and_then(|m| m.get(*uid))
+                .copied()
+                .unwrap_or(true);
+            if include_settings {
+                let settings = index.get_settings()?;
+                let settings_json = serde_json::to_string_pretty(&settings)?;
+                std::fs::write(index_dir.join("settings.json"), settings_json)?;
+            }
+
+            // Export documents in batches (same logic as create_dump)
+            let docs_file = std::fs::File::create(index_dir.join("documents.json"))?;
+            let mut writer = std::io::BufWriter::new(docs_file);
+            use std::io::Write;
+            write!(writer, "[")?;
+
+            const BATCH_SIZE: usize = 1000;
+            let mut offset = 0;
+            let mut first = true;
+            loop {
+                let batch = index.get_documents(offset, BATCH_SIZE)?;
+                for doc in &batch.documents {
+                    if !first {
+                        write!(writer, ",")?;
+                    }
+                    first = false;
+                    serde_json::to_writer_pretty(&mut writer, doc)?;
+                }
+                if batch.documents.len() < BATCH_SIZE {
+                    break;
+                }
+                offset += BATCH_SIZE;
+            }
+            write!(writer, "]")?;
+            writer.flush()?;
+        }
+
+        Ok(())
+    }
+
     /// Create a snapshot of the database at the specified directory.
     ///
     /// Uses LMDB's built-in copy API to produce a consistent snapshot
@@ -691,9 +746,16 @@ impl Meilisearch {
         // Remove from cache so we can close the LMDB environment
         {
             let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
-            let removed = indexes.remove(uid);
-            // Drop the Arc to close the LMDB environment
-            drop(removed);
+            if let Some(index) = indexes.remove(uid) {
+                // Check if there are other references to this index
+                // Arc::strong_count of 1 means we hold the only reference
+                if Arc::strong_count(&index) > 1 {
+                    // Put it back and return error
+                    indexes.insert(uid.to_string(), index);
+                    return Err(Error::IndexInUse(uid.to_string()));
+                }
+                drop(index);
+            }
         }
 
         // Perform copy-compact: open env, copy compact to temp, replace original
@@ -715,7 +777,7 @@ impl Meilisearch {
         let original_data = index_path.join("data.mdb");
         let compacted_data = tmp_path.join("data.mdb");
         if compacted_data.exists() {
-            std::fs::copy(&compacted_data, &original_data)?;
+            std::fs::rename(&compacted_data, &original_data)?;
         }
 
         // Clean up temp directory

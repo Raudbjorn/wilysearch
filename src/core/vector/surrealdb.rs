@@ -42,7 +42,8 @@ use tokio::runtime::Runtime;
 use super::VectorStore;
 
 /// Configuration for a SurrealDB vector store.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SurrealDbVectorStoreConfig {
     /// Connection string for SurrealDB.
     ///
@@ -80,11 +81,12 @@ pub struct SurrealDbVectorStoreConfig {
     pub quantized: bool,
 
     /// Optional authentication credentials.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub auth: Option<SurrealDbAuth>,
 }
 
 /// Authentication credentials for SurrealDB.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SurrealDbAuth {
     pub username: String,
     pub password: String,
@@ -418,12 +420,13 @@ impl SurrealDbVectorStore {
 
         let results: Vec<SearchResult> = response.take(0usize).context("Failed to parse search results")?;
 
-        // Deduplicate by doc_id (in case multiple vectors per document)
+        // Deduplicate by doc_id (in case multiple vectors per document),
+        // converting distance to similarity (1.0 - distance)
         let mut seen = std::collections::HashSet::new();
         let deduplicated: Vec<(u32, f32)> = results
             .into_iter()
             .filter(|r| seen.insert(r.doc_id))
-            .map(|r| (r.doc_id, r.distance))
+            .map(|r| (r.doc_id, 1.0 - r.distance))
             .collect();
 
         Ok(deduplicated)
@@ -559,6 +562,17 @@ impl SurrealDbVectorStore {
         Ok(())
     }
 
+    /// Run an async block, handling both sync and async calling contexts.
+    /// When called from within a tokio runtime, uses `block_in_place` to
+    /// avoid panicking. When called from outside a runtime, blocks directly.
+    fn block_on<F: std::future::Future>(&self, f: F) -> F::Output {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| self.runtime.block_on(f))
+        } else {
+            self.runtime.block_on(f)
+        }
+    }
+
     /// Remove all vectors from the store.
     pub async fn clear_async(&self) -> Result<()> {
         let table = &self.config.table;
@@ -624,7 +638,7 @@ impl VectorStore for SurrealDbVectorStore {
         let db = Arc::clone(&self.db);
         let table = self.config.table.clone();
 
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             for (doc_id, vectors) in &documents {
                 // Delete existing vectors for this doc_id to prevent stale records
                 let delete_query = format!(
@@ -671,7 +685,7 @@ impl VectorStore for SurrealDbVectorStore {
         let db = Arc::clone(&self.db);
         let table = self.config.table.clone();
 
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             let query = format!(
                 r#"
                 DELETE FROM {table} WHERE doc_id IN $ids;
@@ -698,7 +712,7 @@ impl VectorStore for SurrealDbVectorStore {
         let db = Arc::clone(&self.db);
         let table = self.config.table.clone();
 
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             let query = if let Some(ref allowed_ids) = filter_ids {
                 if allowed_ids.is_empty() {
                     return Ok(Vec::new());
@@ -742,12 +756,12 @@ impl VectorStore for SurrealDbVectorStore {
             let results: Vec<SearchResult> =
                 response.take(0usize).context("Failed to parse search results")?;
 
-            // Deduplicate by doc_id
+            // Deduplicate by doc_id, converting distance to similarity
             let mut seen = std::collections::HashSet::new();
             let deduplicated: Vec<(u32, f32)> = results
                 .into_iter()
                 .filter(|r| seen.insert(r.doc_id))
-                .map(|r| (r.doc_id, r.distance))
+                .map(|r| (r.doc_id, 1.0 - r.distance))
                 .collect();
 
             Ok(deduplicated)
@@ -762,7 +776,7 @@ impl VectorStore for SurrealDbVectorStore {
         let db = Arc::clone(&self.db);
         let table = self.config.table.clone();
 
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             let query = format!("DELETE FROM {table};");
             db.query(&query)
                 .await

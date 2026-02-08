@@ -13,10 +13,6 @@ pub enum PreprocessingError {
     #[error("Dictionary load failed: {0}")]
     DictionaryLoad(String),
 
-    /// Failed to load configuration file.
-    #[error("Failed to load configuration: {0}")]
-    ConfigLoadError(String),
-
     /// Configuration load failed (file I/O).
     #[error("Configuration load failed: {0}")]
     ConfigLoad(String),

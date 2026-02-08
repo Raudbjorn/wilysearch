@@ -22,6 +22,12 @@ pub struct Engine {
     task_counter: AtomicU64,
     dump_dir: std::path::PathBuf,
     snapshot_dir: std::path::PathBuf,
+    #[allow(dead_code)]
+    search_defaults: crate::config::SearchDefaultsConfig,
+    #[allow(dead_code)]
+    preprocessing_config: crate::core::preprocessing::config::PreprocessingConfig,
+    #[allow(dead_code)]
+    rag_config: crate::config::RagConfig,
 }
 
 impl Engine {
@@ -35,12 +41,76 @@ impl Engine {
             task_counter: AtomicU64::new(0),
             dump_dir,
             snapshot_dir,
+            search_defaults: crate::config::SearchDefaultsConfig::default(),
+            preprocessing_config: crate::core::preprocessing::config::PreprocessingConfig::default(),
+            rag_config: crate::config::RagConfig::default(),
         })
     }
 
     /// Create a new engine with default options.
     pub fn default_engine() -> Result<Self> {
         Self::new(crate::core::MeilisearchOptions::default())
+    }
+
+    /// Create a new engine from a [`WilysearchConfig`](crate::config::WilysearchConfig).
+    ///
+    /// This applies all configuration sections:
+    /// - **engine** -- LMDB database path and mmap sizes
+    /// - **experimental** -- runtime feature flags
+    /// - **vector_store** -- SurrealDB vector store (requires `surrealdb` feature)
+    /// - **search_defaults**, **preprocessing**, **rag** -- stored for later use
+    pub fn with_config(config: crate::config::WilysearchConfig) -> Result<Self> {
+        let options: crate::core::MeilisearchOptions = config.engine.into();
+        let dump_dir = options.db_path.join("dumps");
+        let snapshot_dir = options.db_path.join("snapshots");
+
+        #[allow(unused_mut)]
+        let mut inner = crate::core::Meilisearch::new(options)?;
+
+        // Attach SurrealDB vector store if configured (feature-gated).
+        #[cfg(feature = "surrealdb")]
+        {
+            if let Some(vs_config) = config.vector_store {
+                let surreal_config: crate::core::vector::surrealdb::SurrealDbVectorStoreConfig =
+                    vs_config.into();
+                let rt = tokio::runtime::Runtime::new().map_err(|e| {
+                    Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                })?;
+                let store = rt
+                    .block_on(
+                        crate::core::vector::surrealdb::SurrealDbVectorStore::new(surreal_config),
+                    )
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                        e.to_string().into()
+                    })?;
+                inner = inner.with_vector_store(std::sync::Arc::new(store));
+            }
+        }
+
+        // Apply experimental feature flags.
+        let exp_features: crate::core::ExperimentalFeatures = config.experimental.into();
+        let _ = inner.update_experimental_features(exp_features);
+
+        Ok(Self {
+            inner,
+            task_counter: AtomicU64::new(0),
+            dump_dir,
+            snapshot_dir,
+            search_defaults: config.search_defaults,
+            preprocessing_config: config.preprocessing,
+            rag_config: config.rag,
+        })
+    }
+
+    /// Create a new engine from a TOML configuration file.
+    ///
+    /// Loads the file with [`WilysearchConfig::from_file`](crate::config::WilysearchConfig::from_file),
+    /// applying environment variable overrides, then delegates to [`Engine::with_config`].
+    pub fn from_config_file(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let config = crate::config::WilysearchConfig::from_file(path).map_err(|e| {
+            Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        Self::with_config(config)
     }
 
     fn next_task(&self, task_type: &str, index_uid: Option<&str>) -> TaskInfo {
@@ -218,7 +288,85 @@ fn convert_hit(h: &crate::core::SearchHit) -> Value {
     serde_json::to_value(h).unwrap_or(Value::Null)
 }
 
-fn convert_settings_to_lib(s: &Settings) -> crate::core::Settings {
+fn convert_federation_settings(s: &FederationSettings) -> crate::core::search::Federation {
+    crate::core::search::Federation {
+        limit: s.limit.unwrap_or(20) as usize,
+        offset: s.offset.unwrap_or(0) as usize,
+        page: s.page.map(|p| p as usize),
+        hits_per_page: s.hits_per_page.map(|h| h as usize),
+        facets_by_index: s.facets_by_index.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        merge_facets: s.merge_facets.map(|mf| crate::core::search::MergeFacets {
+            max_values_per_facet: mf.max_values_per_facet.map(|v| v as usize),
+        }),
+    }
+}
+
+fn convert_federated_result(r: &crate::core::search::FederatedSearchResult) -> FederatedSearchResponse {
+    let (offset, limit, estimated_total_hits, total_hits, total_pages, page, hits_per_page) =
+        match &r.hits_info {
+            crate::core::search::HitsInfo::OffsetLimit {
+                limit,
+                offset,
+                estimated_total_hits,
+            } => (
+                Some(*offset as u32),
+                Some(*limit as u32),
+                Some(*estimated_total_hits as u64),
+                None,
+                None,
+                None,
+                None,
+            ),
+            crate::core::search::HitsInfo::Pagination {
+                hits_per_page,
+                page,
+                total_pages,
+                total_hits,
+            } => (
+                None,
+                None,
+                None,
+                Some(*total_hits as u64),
+                Some(*total_pages as u32),
+                Some(*page as u32),
+                Some(*hits_per_page as u32),
+            ),
+        };
+
+    let facet_distribution = r.facet_distribution.as_ref().map(|fd| {
+        fd.iter()
+            .map(|(k, v)| (k.clone(), v.iter().map(|(k2, v2)| (k2.clone(), *v2)).collect()))
+            .collect()
+    });
+    let facet_stats = r
+        .facet_stats
+        .as_ref()
+        .map(|fs| serde_json::to_value(fs).unwrap_or(Value::Null));
+
+    let facets_by_index: HashMap<String, Value> = r
+        .facets_by_index
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::to_value(v).unwrap_or(Value::Null)))
+        .collect();
+
+    FederatedSearchResponse {
+        hits: r.hits.iter().map(convert_hit).collect(),
+        processing_time_ms: r.processing_time_ms as u64,
+        offset,
+        limit,
+        estimated_total_hits,
+        total_hits,
+        total_pages,
+        page,
+        hits_per_page,
+        facet_distribution,
+        facet_stats,
+        facets_by_index,
+        semantic_hit_count: r.semantic_hit_count,
+    }
+}
+
+fn convert_settings_to_lib(s: &Settings) -> Result<crate::core::Settings> {
     let mut ms = crate::core::Settings::new();
     if let Some(ref rules) = s.ranking_rules {
         ms = ms.with_ranking_rules(rules.clone());
@@ -266,23 +414,23 @@ fn convert_settings_to_lib(s: &Settings) -> crate::core::Settings {
         ms = ms.with_pagination(lib_pag);
     }
     if let Some(ref fac) = s.faceting {
+        let sort_map = if let Some(ref m) = fac.sort_facet_values_by {
+            let mut result = std::collections::BTreeMap::new();
+            for (k, v) in m {
+                let sort = match v.as_str() {
+                    "alpha" => crate::core::settings::FacetValuesSort::Alpha,
+                    "count" => crate::core::settings::FacetValuesSort::Count,
+                    other => return Err(format!("unknown facet sort value: '{other}', expected 'alpha' or 'count'").into()),
+                };
+                result.insert(k.clone(), sort);
+            }
+            Some(result)
+        } else {
+            None
+        };
         let lib_fac = crate::core::settings::FacetingSettings {
             max_values_per_facet: fac.max_values_per_facet.map(|v| v as usize),
-            sort_facet_values_by: fac.sort_facet_values_by.as_ref().map(|m| {
-                m.iter()
-                    .map(|(k, v)| {
-                        let sort = match v.as_str() {
-                            "alpha" => crate::core::settings::FacetValuesSort::Alpha,
-                            "count" => crate::core::settings::FacetValuesSort::Count,
-                            _ => {
-                                log::warn!("unknown facet sort value '{v}', defaulting to alpha");
-                                crate::core::settings::FacetValuesSort::Alpha
-                            }
-                        };
-                        (k.clone(), sort)
-                    })
-                    .collect()
-            }),
+            sort_facet_values_by: sort_map,
         };
         ms = ms.with_faceting(lib_fac);
     }
@@ -341,7 +489,7 @@ fn convert_settings_to_lib(s: &Settings) -> crate::core::Settings {
             .collect();
         ms = ms.with_embedders(lib_embs);
     }
-    ms
+    Ok(ms)
 }
 
 /// Parse an embedder source string, accepting both camelCase and lowercase variants.
@@ -353,6 +501,17 @@ fn parse_embedder_source(s: &str) -> crate::core::EmbedderSource {
         "userprovided" | "userProvided" => crate::core::EmbedderSource::UserProvided,
         "rest" => crate::core::EmbedderSource::Rest,
         _ => crate::core::EmbedderSource::default(),
+    }
+}
+
+/// Convert an EmbedderSource to its canonical camelCase string.
+fn embedder_source_to_str(s: &crate::core::EmbedderSource) -> &'static str {
+    match s {
+        crate::core::EmbedderSource::OpenAi => "openAi",
+        crate::core::EmbedderSource::HuggingFace => "huggingFace",
+        crate::core::EmbedderSource::Ollama => "ollama",
+        crate::core::EmbedderSource::UserProvided => "userProvided",
+        crate::core::EmbedderSource::Rest => "rest",
     }
 }
 
@@ -426,9 +585,8 @@ fn convert_settings_from_lib(s: &crate::core::Settings) -> Settings {
                     let source = v
                         .source
                         .as_ref()
-                        .map(|s| format!("{s:?}"))
-                        .unwrap_or_default()
-                        .to_lowercase();
+                        .map(|s| embedder_source_to_str(s).to_string())
+                        .unwrap_or_default();
                     (
                         k.clone(),
                         EmbedderConfig {
@@ -652,18 +810,41 @@ impl traits::Search for Engine {
         })
     }
 
-    fn multi_search(&self, request: &MultiSearchRequest) -> Result<MultiSearchResponse> {
-        // If federation is set, use federated multi-search (returns merged hits).
-        // For simplicity we handle the non-federated case only here.
-        let mut results = Vec::with_capacity(request.queries.len());
-        for mq in &request.queries {
-            let idx = self.resolve_index(&mq.index_uid)?;
-            let query = convert_search_request(&mq.search);
-            let result = idx.search(&query)?;
-            let resp = convert_search_result(&result);
-            results.push(resp);
+    fn multi_search(&self, request: &MultiSearchRequest) -> Result<MultiSearchResult> {
+        if let Some(ref federation) = request.federation {
+            let core_federation = convert_federation_settings(federation);
+            let core_queries: Vec<crate::core::search::FederatedMultiSearchQuery> = request
+                .queries
+                .iter()
+                .map(|mq| {
+                    let query = convert_search_request(&mq.search);
+                    let federation_options = mq.federation_options.as_ref().map(|fo| {
+                        crate::core::search::FederationOptions {
+                            weight: fo.weight.unwrap_or(1.0),
+                            query_position: fo.query_position.map(|p| p as usize),
+                        }
+                    });
+                    crate::core::search::FederatedMultiSearchQuery {
+                        index_uid: mq.index_uid.clone(),
+                        query,
+                        federation_options,
+                    }
+                })
+                .collect();
+
+            let result = self.inner.multi_search_federated(core_queries, core_federation)?;
+            Ok(MultiSearchResult::Federated(convert_federated_result(&result)))
+        } else {
+            let mut results = Vec::with_capacity(request.queries.len());
+            for mq in &request.queries {
+                let idx = self.resolve_index(&mq.index_uid)?;
+                let query = convert_search_request(&mq.search);
+                let result = idx.search(&query)?;
+                let resp = convert_search_result(&result);
+                results.push(resp);
+            }
+            Ok(MultiSearchResult::PerIndex(MultiSearchResponse { results }))
         }
-        Ok(MultiSearchResponse { results })
     }
 
     fn facet_search(
@@ -829,7 +1010,7 @@ impl traits::SettingsApi for Engine {
 
     fn update_settings(&self, index_uid: &str, settings: &Settings) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
-        let lib_settings = convert_settings_to_lib(settings);
+        let lib_settings = convert_settings_to_lib(settings)?;
         idx.update_settings(&lib_settings)?;
         self.mutation_task(index_uid, "settingsUpdate")
     }
@@ -1250,9 +1431,9 @@ impl traits::SettingsApi for Engine {
                 .map(|(k, v)| {
                     let source = v
                         .source
-                        .map(|s| format!("{s:?}"))
-                        .unwrap_or_default()
-                        .to_lowercase();
+                        .as_ref()
+                        .map(|s| embedder_source_to_str(s).to_string())
+                        .unwrap_or_default();
                     (
                         k,
                         EmbedderConfig {
@@ -1404,8 +1585,17 @@ impl traits::System for Engine {
         Ok(self.next_task("snapshotCreation", None))
     }
 
-    fn export(&self, _request: &ExportRequest) -> Result<TaskInfo> {
-        Err("Export requires an HTTP target and is not supported in embedded mode".into())
+    fn export(&self, request: &ExportRequest) -> Result<TaskInfo> {
+        let export_path = std::path::Path::new(&request.url);
+
+        let index_settings: Option<HashMap<String, bool>> = request.indexes.as_ref().map(|m| {
+            m.iter()
+                .map(|(k, v)| (k.clone(), v.override_settings.unwrap_or(true)))
+                .collect()
+        });
+
+        self.inner.export(export_path, index_settings.as_ref())?;
+        Ok(self.next_task("export", None))
     }
 }
 

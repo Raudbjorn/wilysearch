@@ -432,6 +432,7 @@ impl Embedder for NoOpEmbedder {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "surrealdb")]
     #[test]
     fn test_truncate_reranker() {
         let reranker = TruncateReranker::<String>::new();
@@ -443,7 +444,7 @@ mod tests {
             RetrievalResult::new("doc3".to_string(), 0.7, RetrievalSource::Keyword),
         ];
 
-        // Run reranker synchronously in test
+        // Run reranker synchronously in test (tokio required)
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
@@ -457,6 +458,7 @@ mod tests {
             .all(|r| r.source == RetrievalSource::Reranked));
     }
 
+    #[cfg(feature = "surrealdb")]
     #[test]
     fn test_template_generator() {
         let generator = TemplateGenerator::new("Q: {question}\nA: Based on {context}");
@@ -472,6 +474,7 @@ mod tests {
         assert!(response.contains("Rust is a systems language"));
     }
 
+    #[cfg(feature = "surrealdb")]
     #[test]
     fn test_noop_embedder() {
         let embedder = NoOpEmbedder::new(384);
