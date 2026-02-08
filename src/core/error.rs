@@ -79,5 +79,17 @@ pub enum Error {
     InvalidPagination(String),
 }
 
+impl From<String> for Error {
+    fn from(s: String) -> Self {
+        Error::Internal(s)
+    }
+}
+
+impl From<&str> for Error {
+    fn from(s: &str) -> Self {
+        Error::Internal(s.to_string())
+    }
+}
+
 /// A specialized `Result` type for `meilisearch-lib` operations.
 pub type Result<T> = std::result::Result<T, Error>;

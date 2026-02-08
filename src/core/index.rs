@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
+use tracing::instrument;
 
 use crate::core::error::{Error, Result};
 use crate::core::search::{
@@ -255,6 +256,7 @@ impl Index {
     ///
     /// Returns an error if a document is not a JSON object or if the indexing
     /// operation fails.
+    #[instrument(skip(self, documents))]
     pub fn add_documents(&self, documents: Vec<Value>, primary_key: Option<&str>) -> Result<()> {
         let mut wtxn = self.inner.write_txn().map_err(|e| Error::Heed(e))?;
 
@@ -487,6 +489,7 @@ impl Index {
     /// }
     /// # Ok::<(), wilysearch::core::Error>(())
     /// ```
+    #[instrument(skip(self, query))]
     pub fn search(&self, query: &SearchQuery) -> Result<SearchResult> {
         let start_time = Instant::now();
         let rtxn = self.inner.read_txn().map_err(|e| Error::Heed(e))?;

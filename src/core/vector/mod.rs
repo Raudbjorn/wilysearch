@@ -3,7 +3,7 @@
 //! This module provides a trait-based abstraction for vector storage backends,
 //! enabling pluggable implementations for different vector databases.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -96,17 +96,17 @@ impl InMemoryVectorStore {
 
     /// Return a snapshot of all stored data for test inspection.
     pub fn snapshot(&self) -> HashMap<u32, Vec<Vec<f32>>> {
-        self.data.read().unwrap().clone()
+        self.data.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Return the number of documents in the store.
     pub fn len(&self) -> usize {
-        self.data.read().unwrap().len()
+        self.data.read().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Return true if the store is empty.
     pub fn is_empty(&self) -> bool {
-        self.data.read().unwrap().is_empty()
+        self.data.read().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 }
 
@@ -134,7 +134,11 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 impl VectorStore for InMemoryVectorStore {
     fn add_documents(&self, documents: &[(u32, Vec<Vec<f32>>)]) -> Result<()> {
-        let mut data = self.data.write().unwrap();
+        let mut data = self
+            .data
+            .write()
+            .map_err(|e| anyhow::anyhow!("vector store write lock poisoned: {e}"))
+            .context("InMemoryVectorStore::add_documents")?;
         for (id, vectors) in documents {
             data.insert(*id, vectors.clone());
         }
@@ -142,7 +146,11 @@ impl VectorStore for InMemoryVectorStore {
     }
 
     fn remove_documents(&self, ids: &[u32]) -> Result<()> {
-        let mut data = self.data.write().unwrap();
+        let mut data = self
+            .data
+            .write()
+            .map_err(|e| anyhow::anyhow!("vector store write lock poisoned: {e}"))
+            .context("InMemoryVectorStore::remove_documents")?;
         for id in ids {
             data.remove(id);
         }
@@ -155,7 +163,11 @@ impl VectorStore for InMemoryVectorStore {
         limit: usize,
         filter: Option<&RoaringBitmap>,
     ) -> Result<Vec<(u32, f32)>> {
-        let data = self.data.read().unwrap();
+        let data = self
+            .data
+            .read()
+            .map_err(|e| anyhow::anyhow!("vector store read lock poisoned: {e}"))
+            .context("InMemoryVectorStore::search")?;
         let mut scored: Vec<(u32, f32)> = data
             .iter()
             .filter(|(id, _)| filter.map_or(true, |f| f.contains(**id)))
@@ -179,7 +191,11 @@ impl VectorStore for InMemoryVectorStore {
     }
 
     fn dimensions(&self) -> Result<Option<usize>> {
-        let data = self.data.read().unwrap();
+        let data = self
+            .data
+            .read()
+            .map_err(|e| anyhow::anyhow!("vector store read lock poisoned: {e}"))
+            .context("InMemoryVectorStore::dimensions")?;
         Ok(data
             .values()
             .flat_map(|vecs| vecs.first())
@@ -188,7 +204,11 @@ impl VectorStore for InMemoryVectorStore {
     }
 
     fn clear(&self) -> Result<()> {
-        self.data.write().unwrap().clear();
+        self.data
+            .write()
+            .map_err(|e| anyhow::anyhow!("vector store write lock poisoned: {e}"))
+            .context("InMemoryVectorStore::clear")?
+            .clear();
         Ok(())
     }
 }

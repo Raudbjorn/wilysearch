@@ -46,3 +46,16 @@ pub use rag::{
     RetrievalQuery, RetrievalResult, Retriever, SearchType,
 };
 pub use rag::PipelineConfig as RagPipelineConfig;
+
+/// Return the current UTC time as an RFC 3339 / ISO 8601 string.
+///
+/// Falls back to the Unix epoch if formatting fails (should never happen in
+/// practice, but avoids a panic).
+pub(crate) fn now_iso8601() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| {
+            tracing::warn!("RFC3339 formatting of OffsetDateTime failed, using epoch fallback");
+            "1970-01-01T00:00:00Z".to_string()
+        })
+}

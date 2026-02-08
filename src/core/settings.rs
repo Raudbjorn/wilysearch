@@ -25,6 +25,8 @@ pub enum EmbedderSource {
     UserProvided,
     /// Generic REST API endpoint
     Rest,
+    /// Composite (multi-source) embedder.
+    Composite,
 }
 
 impl From<EmbedderSource> for milli::vector::settings::EmbedderSource {
@@ -35,6 +37,7 @@ impl From<EmbedderSource> for milli::vector::settings::EmbedderSource {
             EmbedderSource::Ollama => milli::vector::settings::EmbedderSource::Ollama,
             EmbedderSource::UserProvided => milli::vector::settings::EmbedderSource::UserProvided,
             EmbedderSource::Rest => milli::vector::settings::EmbedderSource::Rest,
+            EmbedderSource::Composite => milli::vector::settings::EmbedderSource::Composite,
         }
     }
 }
@@ -47,7 +50,7 @@ impl From<milli::vector::settings::EmbedderSource> for EmbedderSource {
             milli::vector::settings::EmbedderSource::Ollama => EmbedderSource::Ollama,
             milli::vector::settings::EmbedderSource::UserProvided => EmbedderSource::UserProvided,
             milli::vector::settings::EmbedderSource::Rest => EmbedderSource::Rest,
-            milli::vector::settings::EmbedderSource::Composite => EmbedderSource::Rest, // Map composite to REST as fallback
+            milli::vector::settings::EmbedderSource::Composite => EmbedderSource::Composite,
         }
     }
 }

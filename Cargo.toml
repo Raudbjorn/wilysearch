@@ -43,9 +43,16 @@ symspell = "0.4"
 strsim = "0.11"
 unicode-normalization = "0.1"
 
-# candle-core 0.9.2 pulls in zip 7.x -> typed-path 0.12, which introduces an
-# ambiguous AsRef impl that breaks milli. Pin to 0.9.1 to match upstream's
-# Cargo.lock (Meilisearch v1.35.0).
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ CRITICAL PIN: candle-core/nn/transformers MUST stay at =0.9.1           │
+# │                                                                          │
+# │ candle 0.9.2 pulls in zip 7.x -> typed-path 0.12, which introduces an  │
+# │ ambiguous AsRef impl that breaks milli compilation. This matches the    │
+# │ Meilisearch v1.35.0 upstream Cargo.lock. Exact version pins in a        │
+# │ library crate are viral -- any downstream crate that needs a different   │
+# │ candle version will get a dependency conflict. If upgrading milli,       │
+# │ verify candle compatibility first.                                       │
+# └──────────────────────────────────────────────────────────────────────────┘
 candle-core = "=0.9.1"
 candle-nn = "=0.9.1"
 candle-transformers = "=0.9.1"

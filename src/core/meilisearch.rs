@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
+use tracing::{debug, instrument};
 use uuid::Uuid;
 
 use crate::core::error::{Error, Result};
@@ -120,11 +121,7 @@ pub struct IndexMetadata {
 
 const METADATA_FILE: &str = "metadata.json";
 
-fn now_iso8601() -> String {
-    time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
-}
+use crate::core::now_iso8601;
 
 fn load_index_metadata(index_dir: &Path) -> Option<IndexMetadata> {
     let path = index_dir.join(METADATA_FILE);
@@ -146,9 +143,20 @@ fn save_index_metadata(index_dir: &Path, meta: &IndexMetadata) -> Result<()> {
 /// struct.
 ///
 /// Thread safety: `Meilisearch` is `Send + Sync` and can be shared via `Arc`.
+///
+/// # Drop behavior
+///
+/// When dropped, `Meilisearch` releases all `Arc<Index>` handles.
+/// The underlying `milli::Index` and `heed::Env` handle their own cleanup
+/// (flushing writes, closing environments) safely.
 pub struct Meilisearch {
     options: MeilisearchOptions,
-    indexes: RwLock<HashMap<String, Arc<Index>>>,
+    /// In-memory cache of opened index handles, keyed by index UID.
+    ///
+    /// Uses an `RwLock<Arc<HashMap>>` (COW pattern) to optimize for read-heavy workloads.
+    /// Readers acquire a read lock, clone the Arc (cheap), and release the lock immediately.
+    /// Writers acquire a write lock and clone the HashMap (expensive) to update it.
+    indexes: RwLock<Arc<HashMap<String, Arc<Index>>>>,
     index_metadata: RwLock<HashMap<String, IndexMetadata>>,
     vector_store: Option<Arc<dyn VectorStore>>,
     experimental_features: RwLock<ExperimentalFeatures>,
@@ -205,7 +213,7 @@ impl Meilisearch {
 
         Ok(Self {
             options,
-            indexes: RwLock::new(HashMap::new()),
+            indexes: RwLock::new(Arc::new(HashMap::new())),
             index_metadata: RwLock::new(metadata_cache),
             vector_store: None,
             experimental_features: RwLock::new(ExperimentalFeatures::default()),
@@ -237,16 +245,25 @@ impl Meilisearch {
     ///
     /// - [`Error::InvalidIndexUid`] if the UID contains invalid characters.
     /// - [`Error::IndexAlreadyExists`] if an index with this UID already exists.
+    ///
+    /// **Thread parallelism:** milli uses `rayon` internally for indexing
+    /// operations. The default `IndexerConfig` inherits the global rayon
+    /// thread pool size, which defaults to the number of available CPU cores.
+    /// To limit indexing threads, configure the global rayon pool before
+    /// creating the engine: `rayon::ThreadPoolBuilder::new().num_threads(4).build_global().unwrap();`
+    #[instrument(skip(self))]
+    #[instrument(skip(self))]
     pub fn create_index(&self, uid: &str, primary_key: Option<&str>) -> Result<Arc<Index>> {
         // Validation
         if !is_valid_uid(uid) {
             return Err(Error::InvalidIndexUid(uid.to_string()));
         }
 
-        let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
-
-        if indexes.contains_key(uid) {
-            return Err(Error::IndexAlreadyExists(uid.to_string()));
+        {
+            let lock = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+            if lock.contains_key(uid) {
+                 return Err(Error::IndexAlreadyExists(uid.to_string()));
+            }
         }
 
         let index_path = self.options.db_path.join("indexes").join(uid);
@@ -287,7 +304,12 @@ impl Meilisearch {
         }
 
         let index = Arc::new(Index::new(milli_index, self.vector_store.clone()));
-        indexes.insert(uid.to_string(), index.clone());
+
+        // COW update
+        let mut lock = self.indexes.write().unwrap_or_else(|e| e.into_inner());
+        let mut new_map = (**lock).clone();
+        new_map.insert(uid.to_string(), index.clone());
+        *lock = Arc::new(new_map);
 
         // Persist creation metadata
         let now = now_iso8601();
@@ -309,8 +331,10 @@ impl Meilisearch {
     /// # Errors
     ///
     /// Returns [`Error::IndexNotFound`] if no index with the given UID exists.
+    #[instrument(skip(self))]
     pub fn get_index(&self, uid: &str) -> Result<Arc<Index>> {
-        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        // COW read: clone the Arc, release the lock
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(index) = indexes.get(uid) {
             return Ok(index.clone());
         }
@@ -318,14 +342,17 @@ impl Meilisearch {
         // Try to load it if it exists on disk
         let index_path = self.options.db_path.join("indexes").join(uid);
         if index_path.exists() {
-            drop(indexes); // Drop read lock before acquiring write lock
-            let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
+            // Drop read lock arc
+            drop(indexes);
+
+            let mut lock = self.indexes.write().unwrap_or_else(|e| e.into_inner());
 
             // Check again in case someone else loaded it
-            if let Some(index) = indexes.get(uid) {
+            if let Some(index) = lock.get(uid) {
                 return Ok(index.clone());
             }
 
+            debug!(uid, "loading index from disk");
             let mut options = milli::heed::EnvOpenOptions::new().read_txn_without_tls();
             options.map_size(self.options.max_index_size);
 
@@ -333,7 +360,12 @@ impl Meilisearch {
             let milli_index =
                 milli::Index::new(options, &index_path, false).map_err(Error::Milli)?;
             let index = Arc::new(Index::new(milli_index, self.vector_store.clone()));
-            indexes.insert(uid.to_string(), index.clone());
+
+            // COW write
+            let mut new_map = (**lock).clone();
+            new_map.insert(uid.to_string(), index.clone());
+            *lock = Arc::new(new_map);
+
             return Ok(index);
         }
 
@@ -349,6 +381,7 @@ impl Meilisearch {
     /// Returns an error if:
     /// - The index does not exist
     /// - The index is still in use (has other references)
+    #[instrument(skip(self))]
     pub fn delete_index(&self, uid: &str) -> Result<()> {
         let index_path = self.options.db_path.join("indexes").join(uid);
 
@@ -359,17 +392,26 @@ impl Meilisearch {
 
         // Remove from memory cache if present
         {
-            let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
+            let mut lock = self.indexes.write().unwrap_or_else(|e| e.into_inner());
+            let mut indexes = (**lock).clone();
+
             if let Some(index) = indexes.remove(uid) {
                 // Check if there are other references to this index
                 // Arc::strong_count of 1 means we hold the only reference
-                if Arc::strong_count(&index) > 1 {
-                    // Put it back and return error
-                    indexes.insert(uid.to_string(), index);
+                // (Same logic as compact_index)
+                if Arc::strong_count(&index) > 2 {
+                     // Check again with accurate count logic if needed, but for delete
+                     // we arguably should force it? The original code returned IndexInUse.
+                     // The references are: 1 in `index`, 1 in `lock` (original map).
+                     // So > 2 means someone else has it.
                     return Err(Error::IndexInUse(uid.to_string()));
                 }
+
                 // Drop the index to close LMDB environment before deleting files
                 drop(index);
+
+                // Update the lock
+                *lock = Arc::new(indexes);
             }
         }
 
@@ -422,6 +464,7 @@ impl Meilisearch {
     ///
     /// This will load the index if it's not already in memory.
     pub fn index_stats(&self, uid: &str) -> Result<IndexStats> {
+        debug!(uid, "collecting index stats");
         let index = self.get_index(uid)?;
 
         let rtxn = index.inner.read_txn().map_err(Error::Heed)?;
@@ -478,6 +521,7 @@ impl Meilisearch {
     }
 
     /// Get aggregate statistics across all indexes.
+    #[instrument(skip(self))]
     pub fn stats(&self) -> Result<GlobalStats> {
         let index_uids = self.list_indexes()?;
         let mut indexes = HashMap::new();
@@ -512,6 +556,7 @@ impl Meilisearch {
     }
 
     /// Create a database dump at the specified directory.
+    #[instrument(skip(self))]
     pub fn create_dump(&self, dump_dir: &std::path::Path) -> Result<DumpInfo> {
         let uid = Uuid::new_v4().to_string();
         let dump_path = dump_dir.join(&uid);
@@ -629,6 +674,7 @@ impl Meilisearch {
     ///
     /// Uses LMDB's built-in copy API to produce a consistent snapshot
     /// without risking corruption from copying live data files.
+    #[instrument(skip(self))]
     pub fn create_snapshot(&self, snapshot_dir: &std::path::Path) -> Result<()> {
         std::fs::create_dir_all(snapshot_dir)?;
 
@@ -679,6 +725,7 @@ impl Meilisearch {
     // ========================================================================
 
     /// Atomically swap the contents of pairs of indexes.
+    #[instrument(skip(self, swaps))]
     pub fn swap_indexes(&self, swaps: &[(&str, &str)]) -> Result<()> {
         // Validate all indexes exist
         for (a, b) in swaps {
@@ -690,7 +737,8 @@ impl Meilisearch {
             }
         }
 
-        let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
+        let mut lock = self.indexes.write().unwrap_or_else(|e| e.into_inner());
+        let mut indexes = (**lock).clone();
 
         for (a, b) in swaps {
             let index_path_a = self.options.db_path.join("indexes").join(a);
@@ -731,6 +779,8 @@ impl Meilisearch {
             }
         }
 
+        *lock = Arc::new(indexes);
+
         // Indexes will be re-loaded on next access via get_index()
         Ok(())
     }
@@ -752,16 +802,41 @@ impl Meilisearch {
 
         // Remove from cache so we can close the LMDB environment
         {
-            let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
+            let mut lock = self.indexes.write().unwrap_or_else(|e| e.into_inner());
+            let mut indexes = (**lock).clone();
+
             if let Some(index) = indexes.remove(uid) {
                 // Check if there are other references to this index
                 // Arc::strong_count of 1 means we hold the only reference
-                if Arc::strong_count(&index) > 1 {
-                    // Put it back and return error
-                    indexes.insert(uid.to_string(), index);
+                // Note: We just cloned the map, so the map holds a reference, and we removed it from *our* map.
+                // But the *original* map (in the lock) still holds a reference until we update the lock.
+                // However, we need to know if *other* threads are holding the index.
+                // If we replace the map in the lock, the original map will be dropped, dropping its reference.
+                // But we haven't replaced it yet.
+
+                // Optimistic check: if we are the only one holding the lock, and the index is only in the map...
+                // Actually, since we hold the write lock on indexes, no one else can be getting the index *now*.
+                // But someone might have an Arc<Index> from before.
+
+                // To properly check strong_count, we need to ensure *we* (the map) are the only holder.
+                // The current `index` variable holds one reference.
+                // The `indexes` map (our clone) held one, which we removed.
+                // The `lock` (original map inside Arc) still holds one.
+
+                // We want to verify that `index` has ref count 2 (one in `lock`, one in `index` variable),
+                // assuming no one else has it.
+                // If someone else has it, ref count > 2.
+
+                if Arc::strong_count(&index) > 2 {
+                    // Put it back (conceptually - checking logic)
+                    // Actually, we fail the operation.
                     return Err(Error::IndexInUse(uid.to_string()));
                 }
-                drop(index);
+
+                drop(index); // drop our reference
+
+                // Update the lock to the new map (without the index)
+                *lock = Arc::new(indexes);
             }
         }
 
@@ -859,6 +934,7 @@ impl Meilisearch {
     /// }
     /// # Ok::<(), wilysearch::core::Error>(())
     /// ```
+    #[instrument(skip(self, queries))]
     pub fn multi_search(&self, queries: Vec<MultiSearchQuery>) -> Result<MultiSearchResult> {
         let mut results = Vec::with_capacity(queries.len());
 
@@ -916,6 +992,7 @@ impl Meilisearch {
     /// println!("Total merged hits: {}", result.hits.len());
     /// # Ok::<(), wilysearch::core::Error>(())
     /// ```
+    #[instrument(skip(self, queries, federation))]
     pub fn multi_search_federated(
         &self,
         queries: Vec<FederatedMultiSearchQuery>,

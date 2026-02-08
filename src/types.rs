@@ -669,7 +669,7 @@ pub struct UpdateWebhookRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub header: Option<HashMap<String, Value>>,
+    pub headers: Option<HashMap<String, Value>>,
 }
 
 // ─── Stats ───────────────────────────────────────────────────────────────────

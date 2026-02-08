@@ -1,8 +1,22 @@
+//! Synchronous trait definitions for the Meilisearch API surface.
+//!
+//! All trait methods are synchronous by design. This keeps the public API
+//! simple for the common embedded use-case where callers operate on a single
+//! thread or use their own async wrappers.
+//!
+//! **Thread-blocking note:** The optional SurrealDB vector store backend
+//! bridges async SurrealDB calls via `tokio::runtime::Runtime::block_on()`.
+//! When using `Engine` from within an existing tokio runtime, the SurrealDB
+//! store uses `tokio::task::block_in_place()` to avoid panics, but this
+//! still blocks the current thread. For high-concurrency async applications,
+//! consider wrapping `Engine` method calls in `spawn_blocking()`.
+
 use serde_json::Value;
 
 use crate::types::*;
+use crate::error::Error;
 
-pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+pub type Result<T> = std::result::Result<T, Error>;
 
 // ─── Documents ───────────────────────────────────────────────────────────────
 
@@ -163,86 +177,290 @@ pub trait SettingsApi {
     fn reset_settings(&self, index_uid: &str) -> Result<TaskInfo>;
 
     // ── Sub-settings: each follows get / update / reset ──────────────────
+    //
+    // Default implementations delegate to get_settings / update_settings /
+    // reset_settings so that alternative backends only need to implement
+    // the three core methods above.
 
-    fn get_ranking_rules(&self, index_uid: &str) -> Result<Vec<String>>;
-    fn update_ranking_rules(&self, index_uid: &str, rules: &[String]) -> Result<TaskInfo>;
-    fn reset_ranking_rules(&self, index_uid: &str) -> Result<TaskInfo>;
+    fn get_ranking_rules(&self, index_uid: &str) -> Result<Vec<String>> {
+        Ok(self.get_settings(index_uid)?.ranking_rules.unwrap_or_default())
+    }
+    fn update_ranking_rules(&self, index_uid: &str, rules: &[String]) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.ranking_rules = Some(rules.to_vec());
+        self.update_settings(index_uid, &s)
+    }
+    fn reset_ranking_rules(&self, index_uid: &str) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.ranking_rules = Some(vec![]);
+        self.update_settings(index_uid, &s)
+    }
 
-    fn get_distinct_attribute(&self, index_uid: &str) -> Result<Option<String>>;
-    fn update_distinct_attribute(&self, index_uid: &str, attr: &str) -> Result<TaskInfo>;
-    fn reset_distinct_attribute(&self, index_uid: &str) -> Result<TaskInfo>;
+    fn get_distinct_attribute(&self, index_uid: &str) -> Result<Option<String>> {
+        Ok(self.get_settings(index_uid)?.distinct_attribute)
+    }
+    fn update_distinct_attribute(&self, index_uid: &str, attr: &str) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.distinct_attribute = Some(attr.to_string());
+        self.update_settings(index_uid, &s)
+    }
+    fn reset_distinct_attribute(&self, index_uid: &str) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.distinct_attribute = None;
+        self.update_settings(index_uid, &s)
+    }
 
-    fn get_searchable_attributes(&self, index_uid: &str) -> Result<Vec<String>>;
-    fn update_searchable_attributes(&self, index_uid: &str, attrs: &[String]) -> Result<TaskInfo>;
-    fn reset_searchable_attributes(&self, index_uid: &str) -> Result<TaskInfo>;
+    fn get_searchable_attributes(&self, index_uid: &str) -> Result<Vec<String>> {
+        Ok(self.get_settings(index_uid)?.searchable_attributes.unwrap_or_default())
+    }
+    fn update_searchable_attributes(&self, index_uid: &str, attrs: &[String]) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.searchable_attributes = Some(attrs.to_vec());
+        self.update_settings(index_uid, &s)
+    }
+    fn reset_searchable_attributes(&self, index_uid: &str) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.searchable_attributes = Some(vec![]);
+        self.update_settings(index_uid, &s)
+    }
 
-    fn get_displayed_attributes(&self, index_uid: &str) -> Result<Vec<String>>;
-    fn update_displayed_attributes(&self, index_uid: &str, attrs: &[String]) -> Result<TaskInfo>;
-    fn reset_displayed_attributes(&self, index_uid: &str) -> Result<TaskInfo>;
+    fn get_displayed_attributes(&self, index_uid: &str) -> Result<Vec<String>> {
+        Ok(self.get_settings(index_uid)?.displayed_attributes.unwrap_or_default())
+    }
+    fn update_displayed_attributes(&self, index_uid: &str, attrs: &[String]) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.displayed_attributes = Some(attrs.to_vec());
+        self.update_settings(index_uid, &s)
+    }
+    fn reset_displayed_attributes(&self, index_uid: &str) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.displayed_attributes = Some(vec![]);
+        self.update_settings(index_uid, &s)
+    }
 
-    fn get_synonyms(&self, index_uid: &str) -> Result<std::collections::HashMap<String, Vec<String>>>;
-    fn update_synonyms(&self, index_uid: &str, synonyms: &std::collections::HashMap<String, Vec<String>>) -> Result<TaskInfo>;
-    fn reset_synonyms(&self, index_uid: &str) -> Result<TaskInfo>;
+    fn get_synonyms(&self, index_uid: &str) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        Ok(self.get_settings(index_uid)?.synonyms.unwrap_or_default())
+    }
+    fn update_synonyms(&self, index_uid: &str, synonyms: &std::collections::HashMap<String, Vec<String>>) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.synonyms = Some(synonyms.clone());
+        self.update_settings(index_uid, &s)
+    }
+    fn reset_synonyms(&self, index_uid: &str) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.synonyms = Some(std::collections::HashMap::new());
+        self.update_settings(index_uid, &s)
+    }
 
-    fn get_stop_words(&self, index_uid: &str) -> Result<Vec<String>>;
-    fn update_stop_words(&self, index_uid: &str, words: &[String]) -> Result<TaskInfo>;
-    fn reset_stop_words(&self, index_uid: &str) -> Result<TaskInfo>;
+    fn get_stop_words(&self, index_uid: &str) -> Result<Vec<String>> {
+        Ok(self.get_settings(index_uid)?.stop_words.unwrap_or_default())
+    }
+    fn update_stop_words(&self, index_uid: &str, words: &[String]) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.stop_words = Some(words.to_vec());
+        self.update_settings(index_uid, &s)
+    }
+    fn reset_stop_words(&self, index_uid: &str) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.stop_words = Some(vec![]);
+        self.update_settings(index_uid, &s)
+    }
 
-    fn get_filterable_attributes(&self, index_uid: &str) -> Result<Vec<String>>;
-    fn update_filterable_attributes(&self, index_uid: &str, attrs: &[String]) -> Result<TaskInfo>;
-    fn reset_filterable_attributes(&self, index_uid: &str) -> Result<TaskInfo>;
+    fn get_filterable_attributes(&self, index_uid: &str) -> Result<Vec<String>> {
+        Ok(self.get_settings(index_uid)?.filterable_attributes.unwrap_or_default())
+    }
+    fn update_filterable_attributes(&self, index_uid: &str, attrs: &[String]) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.filterable_attributes = Some(attrs.to_vec());
+        self.update_settings(index_uid, &s)
+    }
+    fn reset_filterable_attributes(&self, index_uid: &str) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.filterable_attributes = Some(vec![]);
+        self.update_settings(index_uid, &s)
+    }
 
-    fn get_sortable_attributes(&self, index_uid: &str) -> Result<Vec<String>>;
-    fn update_sortable_attributes(&self, index_uid: &str, attrs: &[String]) -> Result<TaskInfo>;
-    fn reset_sortable_attributes(&self, index_uid: &str) -> Result<TaskInfo>;
+    fn get_sortable_attributes(&self, index_uid: &str) -> Result<Vec<String>> {
+        Ok(self.get_settings(index_uid)?.sortable_attributes.unwrap_or_default())
+    }
+    fn update_sortable_attributes(&self, index_uid: &str, attrs: &[String]) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.sortable_attributes = Some(attrs.to_vec());
+        self.update_settings(index_uid, &s)
+    }
+    fn reset_sortable_attributes(&self, index_uid: &str) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.sortable_attributes = Some(vec![]);
+        self.update_settings(index_uid, &s)
+    }
 
-    fn get_typo_tolerance(&self, index_uid: &str) -> Result<TypoTolerance>;
-    fn update_typo_tolerance(&self, index_uid: &str, config: &TypoTolerance) -> Result<TaskInfo>;
-    fn reset_typo_tolerance(&self, index_uid: &str) -> Result<TaskInfo>;
+    fn get_typo_tolerance(&self, index_uid: &str) -> Result<TypoTolerance> {
+        Ok(self.get_settings(index_uid)?.typo_tolerance.unwrap_or_default())
+    }
+    fn update_typo_tolerance(&self, index_uid: &str, config: &TypoTolerance) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.typo_tolerance = Some(config.clone());
+        self.update_settings(index_uid, &s)
+    }
+    fn reset_typo_tolerance(&self, index_uid: &str) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.typo_tolerance = Some(TypoTolerance::default());
+        self.update_settings(index_uid, &s)
+    }
 
-    fn get_pagination(&self, index_uid: &str) -> Result<Pagination>;
-    fn update_pagination(&self, index_uid: &str, config: &Pagination) -> Result<TaskInfo>;
-    fn reset_pagination(&self, index_uid: &str) -> Result<TaskInfo>;
+    fn get_pagination(&self, index_uid: &str) -> Result<Pagination> {
+        Ok(self.get_settings(index_uid)?.pagination.unwrap_or_default())
+    }
+    fn update_pagination(&self, index_uid: &str, config: &Pagination) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.pagination = Some(config.clone());
+        self.update_settings(index_uid, &s)
+    }
+    fn reset_pagination(&self, index_uid: &str) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.pagination = Some(Pagination::default());
+        self.update_settings(index_uid, &s)
+    }
 
-    fn get_faceting(&self, index_uid: &str) -> Result<Faceting>;
-    fn update_faceting(&self, index_uid: &str, config: &Faceting) -> Result<TaskInfo>;
-    fn reset_faceting(&self, index_uid: &str) -> Result<TaskInfo>;
+    fn get_faceting(&self, index_uid: &str) -> Result<Faceting> {
+        Ok(self.get_settings(index_uid)?.faceting.unwrap_or_default())
+    }
+    fn update_faceting(&self, index_uid: &str, config: &Faceting) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.faceting = Some(config.clone());
+        self.update_settings(index_uid, &s)
+    }
+    fn reset_faceting(&self, index_uid: &str) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.faceting = Some(Faceting::default());
+        self.update_settings(index_uid, &s)
+    }
 
-    fn get_dictionary(&self, index_uid: &str) -> Result<Vec<String>>;
-    fn update_dictionary(&self, index_uid: &str, words: &[String]) -> Result<TaskInfo>;
-    fn reset_dictionary(&self, index_uid: &str) -> Result<TaskInfo>;
+    fn get_dictionary(&self, index_uid: &str) -> Result<Vec<String>> {
+        Ok(self.get_settings(index_uid)?.dictionary.unwrap_or_default())
+    }
+    fn update_dictionary(&self, index_uid: &str, words: &[String]) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.dictionary = Some(words.to_vec());
+        self.update_settings(index_uid, &s)
+    }
+    fn reset_dictionary(&self, index_uid: &str) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.dictionary = Some(vec![]);
+        self.update_settings(index_uid, &s)
+    }
 
-    fn get_separator_tokens(&self, index_uid: &str) -> Result<Vec<String>>;
-    fn update_separator_tokens(&self, index_uid: &str, tokens: &[String]) -> Result<TaskInfo>;
-    fn reset_separator_tokens(&self, index_uid: &str) -> Result<TaskInfo>;
+    fn get_separator_tokens(&self, index_uid: &str) -> Result<Vec<String>> {
+        Ok(self.get_settings(index_uid)?.separator_tokens.unwrap_or_default())
+    }
+    fn update_separator_tokens(&self, index_uid: &str, tokens: &[String]) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.separator_tokens = Some(tokens.to_vec());
+        self.update_settings(index_uid, &s)
+    }
+    fn reset_separator_tokens(&self, index_uid: &str) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.separator_tokens = Some(vec![]);
+        self.update_settings(index_uid, &s)
+    }
 
-    fn get_non_separator_tokens(&self, index_uid: &str) -> Result<Vec<String>>;
-    fn update_non_separator_tokens(&self, index_uid: &str, tokens: &[String]) -> Result<TaskInfo>;
-    fn reset_non_separator_tokens(&self, index_uid: &str) -> Result<TaskInfo>;
+    fn get_non_separator_tokens(&self, index_uid: &str) -> Result<Vec<String>> {
+        Ok(self.get_settings(index_uid)?.non_separator_tokens.unwrap_or_default())
+    }
+    fn update_non_separator_tokens(&self, index_uid: &str, tokens: &[String]) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.non_separator_tokens = Some(tokens.to_vec());
+        self.update_settings(index_uid, &s)
+    }
+    fn reset_non_separator_tokens(&self, index_uid: &str) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.non_separator_tokens = Some(vec![]);
+        self.update_settings(index_uid, &s)
+    }
 
-    fn get_proximity_precision(&self, index_uid: &str) -> Result<String>;
-    fn update_proximity_precision(&self, index_uid: &str, precision: &str) -> Result<TaskInfo>;
-    fn reset_proximity_precision(&self, index_uid: &str) -> Result<TaskInfo>;
+    fn get_proximity_precision(&self, index_uid: &str) -> Result<String> {
+        Ok(self.get_settings(index_uid)?.proximity_precision.unwrap_or_else(|| "byWord".to_string()))
+    }
+    fn update_proximity_precision(&self, index_uid: &str, precision: &str) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.proximity_precision = Some(precision.to_string());
+        self.update_settings(index_uid, &s)
+    }
+    fn reset_proximity_precision(&self, index_uid: &str) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.proximity_precision = None;
+        self.update_settings(index_uid, &s)
+    }
 
-    fn get_facet_search(&self, index_uid: &str) -> Result<bool>;
-    fn update_facet_search(&self, index_uid: &str, enabled: bool) -> Result<TaskInfo>;
-    fn reset_facet_search(&self, index_uid: &str) -> Result<TaskInfo>;
+    fn get_facet_search(&self, index_uid: &str) -> Result<bool> {
+        Ok(self.get_settings(index_uid)?.facet_search.unwrap_or(true))
+    }
+    fn update_facet_search(&self, index_uid: &str, enabled: bool) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.facet_search = Some(enabled);
+        self.update_settings(index_uid, &s)
+    }
+    fn reset_facet_search(&self, index_uid: &str) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.facet_search = None;
+        self.update_settings(index_uid, &s)
+    }
 
-    fn get_prefix_search(&self, index_uid: &str) -> Result<String>;
-    fn update_prefix_search(&self, index_uid: &str, mode: &str) -> Result<TaskInfo>;
-    fn reset_prefix_search(&self, index_uid: &str) -> Result<TaskInfo>;
+    fn get_prefix_search(&self, index_uid: &str) -> Result<String> {
+        Ok(self.get_settings(index_uid)?.prefix_search.unwrap_or_else(|| "indexingTime".to_string()))
+    }
+    fn update_prefix_search(&self, index_uid: &str, mode: &str) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.prefix_search = Some(mode.to_string());
+        self.update_settings(index_uid, &s)
+    }
+    fn reset_prefix_search(&self, index_uid: &str) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.prefix_search = None;
+        self.update_settings(index_uid, &s)
+    }
 
-    fn get_search_cutoff_ms(&self, index_uid: &str) -> Result<Option<u64>>;
-    fn update_search_cutoff_ms(&self, index_uid: &str, ms: u64) -> Result<TaskInfo>;
-    fn reset_search_cutoff_ms(&self, index_uid: &str) -> Result<TaskInfo>;
+    fn get_search_cutoff_ms(&self, index_uid: &str) -> Result<Option<u64>> {
+        Ok(self.get_settings(index_uid)?.search_cutoff_ms)
+    }
+    fn update_search_cutoff_ms(&self, index_uid: &str, ms: u64) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.search_cutoff_ms = Some(ms);
+        self.update_settings(index_uid, &s)
+    }
+    fn reset_search_cutoff_ms(&self, index_uid: &str) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.search_cutoff_ms = None;
+        self.update_settings(index_uid, &s)
+    }
 
-    fn get_localized_attributes(&self, index_uid: &str) -> Result<Option<Vec<LocalizedAttribute>>>;
-    fn update_localized_attributes(&self, index_uid: &str, attrs: &[LocalizedAttribute]) -> Result<TaskInfo>;
-    fn reset_localized_attributes(&self, index_uid: &str) -> Result<TaskInfo>;
+    fn get_localized_attributes(&self, index_uid: &str) -> Result<Option<Vec<LocalizedAttribute>>> {
+        Ok(self.get_settings(index_uid)?.localized_attributes)
+    }
+    fn update_localized_attributes(&self, index_uid: &str, attrs: &[LocalizedAttribute]) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.localized_attributes = Some(attrs.to_vec());
+        self.update_settings(index_uid, &s)
+    }
+    fn reset_localized_attributes(&self, index_uid: &str) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.localized_attributes = None;
+        self.update_settings(index_uid, &s)
+    }
 
-    fn get_embedders(&self, index_uid: &str) -> Result<Option<std::collections::HashMap<String, EmbedderConfig>>>;
-    fn update_embedders(&self, index_uid: &str, embedders: &std::collections::HashMap<String, EmbedderConfig>) -> Result<TaskInfo>;
-    fn reset_embedders(&self, index_uid: &str) -> Result<TaskInfo>;
+    fn get_embedders(&self, index_uid: &str) -> Result<Option<std::collections::HashMap<String, EmbedderConfig>>> {
+        Ok(self.get_settings(index_uid)?.embedders)
+    }
+    fn update_embedders(&self, index_uid: &str, embedders: &std::collections::HashMap<String, EmbedderConfig>) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.embedders = Some(embedders.clone());
+        self.update_settings(index_uid, &s)
+    }
+    fn reset_embedders(&self, index_uid: &str) -> Result<TaskInfo> {
+        let mut s = Settings::default();
+        s.embedders = None;
+        self.update_settings(index_uid, &s)
+    }
 }
 
 // ─── Keys ────────────────────────────────────────────────────────────────────

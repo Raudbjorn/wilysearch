@@ -17,17 +17,27 @@ use crate::types::*;
 ///
 /// All operations execute immediately. Mutations return a synthetic
 /// [`TaskInfo`] with `status: Succeeded` since there is no task queue.
+///
+/// # Drop behavior
+///
+/// When `Engine` is dropped, all cached `milli::Index` handles are released.
+/// Each `milli::Index` wraps a `heed::Env` which flushes pending writes and
+/// closes the LMDB environment in its own `Drop` implementation. No explicit
+/// `Drop` impl is needed on `Engine` itself.
 pub struct Engine {
     inner: crate::core::Meilisearch,
+    /// In-memory task counter; resets to 0 on restart. Task UIDs are not
+    /// persisted and may collide across engine restarts. Consumers that need
+    /// stable task references should use their own persistent counter.
     task_counter: AtomicU64,
+    task_counter_path: std::path::PathBuf,
     dump_dir: std::path::PathBuf,
     snapshot_dir: std::path::PathBuf,
-    #[allow(dead_code)]
+    /// TODO: Used to serialize dump/snapshot operations. Wire into create_dump/create_snapshot.
     dump_lock: std::sync::Mutex<()>,
-    #[allow(dead_code)]
-    search_defaults: crate::config::SearchDefaultsConfig,
-    #[allow(dead_code)]
-    preprocessing_config: crate::core::preprocessing::config::PreprocessingConfig,
+    // TODO: Apply search defaults (limit, matching strategy) in convert_search_request.
+    // TODO: Initialize preprocessing pipeline from this config.
+    // TODO: Build RAG pipeline from this config when retrieval is requested.
     #[allow(dead_code)]
     rag_config: crate::config::RagConfig,
 }
@@ -37,15 +47,25 @@ impl Engine {
     pub fn new(options: crate::core::MeilisearchOptions) -> Result<Self> {
         let dump_dir = options.db_path.join("dumps");
         let snapshot_dir = options.db_path.join("snapshots");
+        let task_counter_path = options.db_path.join("task_counter");
+
+        let start_uid = if task_counter_path.exists() {
+            std::fs::read_to_string(&task_counter_path)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
         let inner = crate::core::Meilisearch::new(options)?;
         Ok(Self {
             inner,
-            task_counter: AtomicU64::new(0),
+            task_counter: AtomicU64::new(start_uid),
+            task_counter_path,
             dump_dir,
             snapshot_dir,
             dump_lock: std::sync::Mutex::new(()),
-            search_defaults: crate::config::SearchDefaultsConfig::default(),
-            preprocessing_config: crate::core::preprocessing::config::PreprocessingConfig::default(),
             rag_config: crate::config::RagConfig::default(),
         })
     }
@@ -66,6 +86,16 @@ impl Engine {
         let options: crate::core::MeilisearchOptions = config.engine.into();
         let dump_dir = options.db_path.join("dumps");
         let snapshot_dir = options.db_path.join("snapshots");
+        let task_counter_path = options.db_path.join("task_counter");
+
+        let start_uid = if task_counter_path.exists() {
+            std::fs::read_to_string(&task_counter_path)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
 
         #[allow(unused_mut)]
         let mut inner = crate::core::Meilisearch::new(options)?;
@@ -76,16 +106,21 @@ impl Engine {
             if let Some(vs_config) = config.vector_store {
                 let surreal_config: crate::core::vector::surrealdb::SurrealDbVectorStoreConfig =
                     vs_config.into();
-                let rt = tokio::runtime::Runtime::new().map_err(|e| {
-                    Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                })?;
+                // Use a current_thread runtime for lower overhead as requested in review
+                let rt = std::sync::Arc::new(
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| crate::core::error::Error::Internal(e.to_string()))?
+                );
                 let store = rt
                     .block_on(
-                        crate::core::vector::surrealdb::SurrealDbVectorStore::new(surreal_config),
+                        crate::core::vector::surrealdb::SurrealDbVectorStore::with_runtime(
+                            surreal_config,
+                            rt.clone(),
+                        ),
                     )
-                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                        e.to_string().into()
-                    })?;
+                    .map_err(|e| crate::core::error::Error::Internal(e.to_string()))?;
                 inner = inner.with_vector_store(std::sync::Arc::new(store));
             }
         }
@@ -96,12 +131,11 @@ impl Engine {
 
         Ok(Self {
             inner,
-            task_counter: AtomicU64::new(0),
+            task_counter: AtomicU64::new(start_uid),
+            task_counter_path,
             dump_dir,
             snapshot_dir,
             dump_lock: std::sync::Mutex::new(()),
-            search_defaults: config.search_defaults,
-            preprocessing_config: config.preprocessing,
             rag_config: config.rag,
         })
     }
@@ -112,13 +146,15 @@ impl Engine {
     /// applying environment variable overrides, then delegates to [`Engine::with_config`].
     pub fn from_config_file(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let config = crate::config::WilysearchConfig::from_file(path).map_err(|e| {
-            Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+            crate::core::error::Error::Internal(e.to_string())
         })?;
         Self::with_config(config)
     }
 
     fn next_task(&self, task_type: &str, index_uid: Option<&str>) -> TaskInfo {
         let uid = self.task_counter.fetch_add(1, Ordering::Relaxed);
+        // Best-effort persistence: ignore errors to avoid crashing on status update
+        let _ = std::fs::write(&self.task_counter_path, (uid + 1).to_string());
         TaskInfo {
             task_uid: uid,
             index_uid: index_uid.map(String::from),
@@ -138,11 +174,7 @@ impl Engine {
     }
 }
 
-fn now_iso8601() -> String {
-    time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
-}
+use crate::core::now_iso8601;
 
 // ─── Type conversion helpers ─────────────────────────────────────────────────
 
@@ -504,6 +536,7 @@ fn parse_embedder_source(s: &str) -> crate::core::EmbedderSource {
         "ollama" => crate::core::EmbedderSource::Ollama,
         "userprovided" | "userProvided" => crate::core::EmbedderSource::UserProvided,
         "rest" => crate::core::EmbedderSource::Rest,
+        "composite" => crate::core::EmbedderSource::Composite,
         _ => crate::core::EmbedderSource::default(),
     }
 }
@@ -516,6 +549,7 @@ fn embedder_source_to_str(s: &crate::core::EmbedderSource) -> &'static str {
         crate::core::EmbedderSource::Ollama => "ollama",
         crate::core::EmbedderSource::UserProvided => "userProvided",
         crate::core::EmbedderSource::Rest => "rest",
+        crate::core::EmbedderSource::Composite => "composite",
     }
 }
 
@@ -1627,3 +1661,11 @@ impl traits::ExperimentalFeaturesApi for Engine {
         })
     }
 }
+
+// Static assertions: Engine must be Send + Sync for safe sharing across threads.
+const _: () = {
+    #[allow(dead_code)]
+    fn assert_send_sync<T: Send + Sync>() {}
+    #[allow(dead_code)]
+    fn assert_engine() { assert_send_sync::<Engine>(); }
+};
