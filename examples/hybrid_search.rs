@@ -135,7 +135,7 @@ fn main() -> wilysearch::core::Result<()> {
     println!(
         "Hits: {}, Semantic hits: {:?}",
         hybrid_result.result.hits.len(),
-        hybrid_result.semantic_hit_count
+        hybrid_result.result.semantic_hit_count
     );
     for hit in &hybrid_result.result.hits {
         println!(

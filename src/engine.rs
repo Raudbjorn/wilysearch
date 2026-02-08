@@ -670,7 +670,7 @@ impl traits::Documents for Engine {
             .as_ref()
             .map(|f| f.split(',').map(|s| s.trim().to_string()).collect());
         let doc = idx.get_document_with_fields(document_id, fields.as_deref())?;
-        doc.ok_or_else(|| format!("Document not found: {document_id}").into())
+        doc.ok_or_else(|| crate::core::error::Error::DocumentNotFound(document_id.to_string()))
     }
 
     fn get_documents(
@@ -1010,7 +1010,7 @@ impl traits::Indexes for Engine {
 
 impl traits::Tasks for Engine {
     fn get_task(&self, _task_uid: u64) -> Result<Task> {
-        Err("Tasks are not supported in embedded mode".into())
+        Err(crate::core::error::Error::Internal("Tasks are not supported in embedded mode".to_string()))
     }
 
     fn list_tasks(&self, _filter: &TaskFilter) -> Result<TaskList> {
@@ -1024,11 +1024,11 @@ impl traits::Tasks for Engine {
     }
 
     fn cancel_tasks(&self, _filter: &TaskFilter) -> Result<TaskInfo> {
-        Err("Tasks are not supported in embedded mode".into())
+        Err(crate::core::error::Error::Internal("Tasks are not supported in embedded mode".to_string()))
     }
 
     fn delete_tasks(&self, _filter: &TaskFilter) -> Result<TaskInfo> {
-        Err("Tasks are not supported in embedded mode".into())
+        Err(crate::core::error::Error::Internal("Tasks are not supported in embedded mode".to_string()))
     }
 }
 
@@ -1036,7 +1036,7 @@ impl traits::Tasks for Engine {
 
 impl traits::Batches for Engine {
     fn get_batch(&self, _batch_uid: u64) -> Result<Batch> {
-        Err("Batches are not supported in embedded mode".into())
+        Err(crate::core::error::Error::Internal("Batches are not supported in embedded mode".to_string()))
     }
 
     fn list_batches(&self, _filter: &TaskFilter) -> Result<BatchList> {
@@ -1547,16 +1547,16 @@ impl traits::Keys for Engine {
         })
     }
     fn get_key(&self, _key_id: &str) -> Result<ApiKey> {
-        Err("API keys are not supported in embedded mode".into())
+        Err(crate::core::error::Error::Internal("API keys are not supported in embedded mode".to_string()))
     }
     fn create_key(&self, _request: &CreateApiKeyRequest) -> Result<ApiKey> {
-        Err("API keys are not supported in embedded mode".into())
+        Err(crate::core::error::Error::Internal("API keys are not supported in embedded mode".to_string()))
     }
     fn update_key(&self, _key_id: &str, _request: &UpdateApiKeyRequest) -> Result<ApiKey> {
-        Err("API keys are not supported in embedded mode".into())
+        Err(crate::core::error::Error::Internal("API keys are not supported in embedded mode".to_string()))
     }
     fn delete_key(&self, _key_id: &str) -> Result<()> {
-        Err("API keys are not supported in embedded mode".into())
+        Err(crate::core::error::Error::Internal("API keys are not supported in embedded mode".to_string()))
     }
 }
 
@@ -1567,16 +1567,16 @@ impl traits::Webhooks for Engine {
         Ok(vec![])
     }
     fn get_webhook(&self, _webhook_uid: &str) -> Result<Webhook> {
-        Err("Webhooks are not supported in embedded mode".into())
+        Err(crate::core::error::Error::Internal("Webhooks are not supported in embedded mode".to_string()))
     }
     fn create_webhook(&self, _request: &CreateWebhookRequest) -> Result<Webhook> {
-        Err("Webhooks are not supported in embedded mode".into())
+        Err(crate::core::error::Error::Internal("Webhooks are not supported in embedded mode".to_string()))
     }
     fn update_webhook(&self, _uid: &str, _request: &UpdateWebhookRequest) -> Result<Webhook> {
-        Err("Webhooks are not supported in embedded mode".into())
+        Err(crate::core::error::Error::Internal("Webhooks are not supported in embedded mode".to_string()))
     }
     fn delete_webhook(&self, _webhook_uid: &str) -> Result<()> {
-        Err("Webhooks are not supported in embedded mode".into())
+        Err(crate::core::error::Error::Internal("Webhooks are not supported in embedded mode".to_string()))
     }
 }
 

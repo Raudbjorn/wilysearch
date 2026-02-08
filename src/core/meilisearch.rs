@@ -172,6 +172,11 @@ pub struct Meilisearch {
     experimental_features: RwLock<ExperimentalFeatures>,
 }
 
+// Lock ordering: always acquire `indexes` before `index_metadata`.
+// Violating this order risks deadlock. For example, `swap_indexes` acquires
+// `indexes` (write) then `index_metadata` (write). Any code that needs both
+// locks must follow this same order.
+
 impl Meilisearch {
     /// Create a new embedded Meilisearch instance with the given options.
     ///
@@ -420,6 +425,18 @@ impl Meilisearch {
         }
 
         if let Some(index) = indexes.remove(uid) {
+            // SAFETY: Arc::strong_count is generally unreliable for synchronization
+            // because other threads can clone/drop Arcs concurrently. However, this
+            // usage is sound because:
+            //  1. We hold the WRITE lock on `indexes`, so no thread can enter
+            //     `get_index` (which requires at least a READ lock) to obtain a new
+            //     clone of this Arc.
+            //  2. The only way to obtain an Arc<Index> is through `get_index` or
+            //     `create_index`, both of which acquire the `indexes` lock.
+            //  3. Therefore the strong count cannot increase while we hold the write
+            //     lock. Existing clones may still be live (count > 2), and that is
+            //     exactly what we are detecting here.
+            //  4. Count == 2: one in the original map (inside `lock`), one in `index`.
             if Arc::strong_count(&index) > 2 {
                 return Err(Error::IndexInUse(uid.to_string()));
             }
@@ -556,7 +573,7 @@ impl Meilisearch {
         for uid in &index_uids {
             match self.index_stats(uid) {
                 Ok(stats) => { indexes.insert(uid.clone(), stats); }
-                Err(e) => { log::warn!("Failed to collect stats for index '{uid}': {e}"); }
+                Err(e) => { tracing::warn!(uid, error = %e, "failed to collect index stats"); }
             }
         }
 
@@ -603,30 +620,7 @@ impl Meilisearch {
             std::fs::write(index_dump_dir.join("settings.json"), settings_json)?;
 
             // Export documents in batches to avoid OOM on large indexes
-            let docs_file = std::fs::File::create(index_dump_dir.join("documents.json"))?;
-            let mut writer = std::io::BufWriter::new(docs_file);
-            use std::io::Write;
-            write!(writer, "[")?;
-
-            const BATCH_SIZE: usize = 1000;
-            let mut offset = 0;
-            let mut first = true;
-            loop {
-                let batch = index.get_documents(offset, BATCH_SIZE)?;
-                for doc in &batch.documents {
-                    if !first {
-                        write!(writer, ",")?;
-                    }
-                    first = false;
-                    serde_json::to_writer_pretty(&mut writer, doc)?;
-                }
-                if batch.documents.len() < BATCH_SIZE {
-                    break;
-                }
-                offset += BATCH_SIZE;
-            }
-            write!(writer, "]")?;
-            writer.flush()?;
+            write_documents_to_json(&index, &index_dump_dir.join("documents.json"))?;
         }
 
         Ok(DumpInfo {
@@ -669,31 +663,8 @@ impl Meilisearch {
                 std::fs::write(index_dir.join("settings.json"), settings_json)?;
             }
 
-            // Export documents in batches (same logic as create_dump)
-            let docs_file = std::fs::File::create(index_dir.join("documents.json"))?;
-            let mut writer = std::io::BufWriter::new(docs_file);
-            use std::io::Write;
-            write!(writer, "[")?;
-
-            const BATCH_SIZE: usize = 1000;
-            let mut offset = 0;
-            let mut first = true;
-            loop {
-                let batch = index.get_documents(offset, BATCH_SIZE)?;
-                for doc in &batch.documents {
-                    if !first {
-                        write!(writer, ",")?;
-                    }
-                    first = false;
-                    serde_json::to_writer_pretty(&mut writer, doc)?;
-                }
-                if batch.documents.len() < BATCH_SIZE {
-                    break;
-                }
-                offset += BATCH_SIZE;
-            }
-            write!(writer, "]")?;
-            writer.flush()?;
+            // Export documents in batches
+            write_documents_to_json(&index, &index_dir.join("documents.json"))?;
         }
 
         Ok(())
@@ -701,41 +672,34 @@ impl Meilisearch {
 
     /// Create a snapshot of the database at the specified directory.
     ///
-    /// Uses LMDB's built-in copy API to produce a consistent snapshot
-    /// without risking corruption from copying live data files.
+    /// Uses LMDB's built-in copy API on the already-open index environments to
+    /// produce a consistent snapshot without risking corruption from copying live
+    /// data files or opening duplicate LMDB environments.
     #[instrument(skip(self))]
     pub fn create_snapshot(&self, snapshot_dir: &std::path::Path) -> Result<()> {
         std::fs::create_dir_all(snapshot_dir)?;
 
-        let indexes_dir = self.options.db_path.join("indexes");
-        if indexes_dir.exists() {
-            let snapshot_indexes = snapshot_dir.join("indexes");
-            std::fs::create_dir_all(&snapshot_indexes)?;
+        let index_uids = self.list_indexes()?;
+        if index_uids.is_empty() {
+            return Ok(());
+        }
 
-            for entry in std::fs::read_dir(&indexes_dir)? {
-                let entry = entry?;
-                if entry.file_type()?.is_dir() {
-                    let name = entry.file_name();
-                    let dest = snapshot_indexes.join(&name);
-                    std::fs::create_dir_all(&dest)?;
+        let snapshot_indexes = snapshot_dir.join("indexes");
+        std::fs::create_dir_all(&snapshot_indexes)?;
 
-                    // Use LMDB's copy_to_file for a consistent snapshot of live data
-                    let mut options = milli::heed::EnvOpenOptions::new().read_txn_without_tls();
-                    options.map_size(self.options.max_index_size);
+        for uid in &index_uids {
+            let index = self.get_index(uid)?;
+            let dest = snapshot_indexes.join(uid);
+            std::fs::create_dir_all(&dest)?;
 
-                    // SAFETY: The LMDB environment is opened read-only on an existing
-                    // database directory. The path comes from our own `indexes/` dir
-                    // (validated by `read_dir`), and the env is short-lived — used only
-                    // for `copy_to_file` and dropped before the next iteration.
-                    let env = unsafe {
-                        options.open(entry.path()).map_err(Error::Heed)?
-                    };
-                    let snapshot_file = dest.join("data.mdb");
-                    let mut file = std::fs::File::create(&snapshot_file)?;
-                    env.copy_to_file(&mut file, milli::heed::CompactionOption::Disabled)
-                        .map_err(Error::Heed)?;
-                }
-            }
+            // Use the already-open milli::Index to copy the LMDB env, avoiding
+            // the danger of opening a second LMDB env on the same data directory.
+            let snapshot_file = dest.join("data.mdb");
+            let mut file = std::fs::File::create(&snapshot_file)?;
+            index
+                .inner
+                .copy_to_file(&mut file, milli::heed::CompactionOption::Disabled)
+                .map_err(Error::Milli)?;
         }
 
         Ok(())
@@ -789,28 +753,33 @@ impl Meilisearch {
             let index_path_b = self.options.db_path.join("indexes").join(b);
             let tmp_path = self.options.db_path.join("indexes").join(format!("_swap_tmp_{}", Uuid::new_v4()));
 
-            // Remove from memory cache to close LMDB environments
-            let idx_a = indexes.remove(*a);
-            let idx_b = indexes.remove(*b);
-            drop(idx_a);
-            drop(idx_b);
-
+            // Perform filesystem renames FIRST, before evicting from cache.
+            // On Linux, renaming directories with open LMDB envs is safe because
+            // mmap tracks by inode, not by path. If a rename fails the cache
+            // remains consistent with the (unchanged) disk layout.
             std::fs::rename(&index_path_a, &tmp_path)?;
             if let Err(e) = std::fs::rename(&index_path_b, &index_path_a) {
                 if let Err(re) = std::fs::rename(&tmp_path, &index_path_a) {
-                    log::error!("Swap recovery failed: could not restore {a} from tmp: {re}");
+                    tracing::error!(index = *a, error = %re, "swap recovery failed: could not restore index from tmp");
                 }
                 return Err(e.into());
             }
             if let Err(e) = std::fs::rename(&tmp_path, &index_path_b) {
                 if let Err(re) = std::fs::rename(&index_path_a, &index_path_b) {
-                    log::error!("Swap recovery failed: could not restore {b}: {re}");
+                    tracing::error!(index = *b, error = %re, "swap recovery failed: could not restore index");
                 }
                 if let Err(re) = std::fs::rename(&tmp_path, &index_path_a) {
-                    log::error!("Swap recovery failed: could not restore {a} from tmp: {re}");
+                    tracing::error!(index = *a, error = %re, "swap recovery failed: could not restore index from tmp");
                 }
                 return Err(e.into());
             }
+
+            // Renames succeeded — now evict from cache so the indexes are
+            // re-opened from their new (swapped) paths on next access.
+            let idx_a = indexes.remove(*a);
+            let idx_b = indexes.remove(*b);
+            drop(idx_a);
+            drop(idx_b);
 
             // Swap metadata entries and bump updated_at
             let now = now_iso8601();
@@ -866,30 +835,19 @@ impl Meilisearch {
             let mut indexes = (**lock).clone();
 
             if let Some(index) = indexes.remove(uid) {
-                // Check if there are other references to this index
-                // Arc::strong_count of 1 means we hold the only reference
-                // Note: We just cloned the map, so the map holds a reference, and we removed it from *our* map.
-                // But the *original* map (in the lock) still holds a reference until we update the lock.
-                // However, we need to know if *other* threads are holding the index.
-                // If we replace the map in the lock, the original map will be dropped, dropping its reference.
-                // But we haven't replaced it yet.
-
-                // Optimistic check: if we are the only one holding the lock, and the index is only in the map...
-                // Actually, since we hold the write lock on indexes, no one else can be getting the index *now*.
-                // But someone might have an Arc<Index> from before.
-
-                // To properly check strong_count, we need to ensure *we* (the map) are the only holder.
-                // The current `index` variable holds one reference.
-                // The `indexes` map (our clone) held one, which we removed.
-                // The `lock` (original map inside Arc) still holds one.
-
-                // We want to verify that `index` has ref count 2 (one in `lock`, one in `index` variable),
-                // assuming no one else has it.
-                // If someone else has it, ref count > 2.
-
+                // SAFETY: Arc::strong_count is generally unreliable for synchronization
+                // because other threads can clone/drop Arcs concurrently. However, this
+                // usage is sound because:
+                //  1. We hold the WRITE lock on `indexes`, so no thread can enter
+                //     `get_index` (which requires at least a READ lock) to obtain a new
+                //     clone of this Arc.
+                //  2. The only way to obtain an Arc<Index> is through `get_index` or
+                //     `create_index`, both of which acquire the `indexes` lock.
+                //  3. Therefore the strong count cannot increase while we hold the write
+                //     lock. Existing clones may still be live (count > 2), and that is
+                //     exactly what we are detecting here.
+                //  4. Count == 2: one in the original map (inside `lock`), one in `index`.
                 if Arc::strong_count(&index) > 2 {
-                    // Put it back (conceptually - checking logic)
-                    // Actually, we fail the operation.
                     return Err(Error::IndexInUse(uid.to_string()));
                 }
 
@@ -941,10 +899,18 @@ impl Meilisearch {
 
         let paginated: Vec<String> = all_uids.into_iter().skip(offset).take(limit).collect();
 
-        let meta_cache = self.index_metadata.read().unwrap_or_else(|e| {
-            tracing::warn!("index_metadata RwLock poisoned in list_indexes_with_pagination, recovering");
-            e.into_inner()
-        });
+        // Clone the metadata snapshot under the read lock, then drop the lock
+        // before calling `get_index` which may acquire the `indexes` write lock.
+        // This preserves the lock ordering invariant: indexes before index_metadata.
+        let meta_snapshot: HashMap<String, IndexMetadata> = self
+            .index_metadata
+            .read()
+            .unwrap_or_else(|e| {
+                tracing::warn!("index_metadata RwLock poisoned in list_indexes_with_pagination, recovering");
+                e.into_inner()
+            })
+            .clone();
+
         let mut infos = Vec::with_capacity(paginated.len());
         for uid in paginated {
             let primary_key = if let Ok(index) = self.get_index(&uid) {
@@ -953,7 +919,7 @@ impl Meilisearch {
                 None
             };
 
-            let (created_at, updated_at) = meta_cache
+            let (created_at, updated_at) = meta_snapshot
                 .get(&uid)
                 .map(|m| (Some(m.created_at.clone()), Some(m.updated_at.clone())))
                 .unwrap_or((None, None));
@@ -1169,6 +1135,39 @@ impl Meilisearch {
             },
         })
     }
+}
+
+/// Write all documents from an index to a JSON array file in batches.
+///
+/// Streams documents in batches of 1,000 to avoid loading an entire index into
+/// memory at once. The output is a single JSON array written with pretty printing.
+fn write_documents_to_json(index: &Index, path: &Path) -> Result<()> {
+    use std::io::Write;
+
+    let docs_file = std::fs::File::create(path)?;
+    let mut writer = std::io::BufWriter::new(docs_file);
+    write!(writer, "[")?;
+
+    const BATCH_SIZE: usize = 1000;
+    let mut offset = 0;
+    let mut first = true;
+    loop {
+        let batch = index.get_documents(offset, BATCH_SIZE)?;
+        for doc in &batch.documents {
+            if !first {
+                write!(writer, ",")?;
+            }
+            first = false;
+            serde_json::to_writer_pretty(&mut writer, doc)?;
+        }
+        if batch.documents.len() < BATCH_SIZE {
+            break;
+        }
+        offset += BATCH_SIZE;
+    }
+    write!(writer, "]")?;
+    writer.flush()?;
+    Ok(())
 }
 
 fn is_valid_uid(uid: &str) -> bool {

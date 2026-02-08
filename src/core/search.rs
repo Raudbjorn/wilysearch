@@ -135,11 +135,11 @@ impl SearchQuery {
     pub fn new(query: impl Into<String>) -> Self {
         Self {
             q: Some(query.into()),
-            limit: 20,
-            crop_length: 10,
-            crop_marker: "...".to_string(),
-            highlight_pre_tag: "<em>".to_string(),
-            highlight_post_tag: "</em>".to_string(),
+            limit: default_limit(),
+            crop_length: default_crop_length(),
+            crop_marker: default_crop_marker(),
+            highlight_pre_tag: default_highlight_pre_tag(),
+            highlight_post_tag: default_highlight_post_tag(),
             ..Default::default()
         }
     }
@@ -535,17 +535,18 @@ impl HybridSearchQuery {
 #[serde(rename_all = "camelCase")]
 pub struct HybridSearchResult {
     /// The underlying search result (hits, pagination, facets).
+    /// Note: `semantic_hit_count` lives on `SearchResult` — do not duplicate it here.
     #[serde(flatten)]
     pub result: SearchResult,
-    /// Number of hits that came from semantic/vector search.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub semantic_hit_count: Option<u32>,
 }
 
 impl HybridSearchResult {
     /// Create a new hybrid search result from a search result and semantic hit count.
-    pub fn new(result: SearchResult, semantic_hit_count: Option<u32>) -> Self {
-        Self { result, semantic_hit_count }
+    ///
+    /// The `semantic_hit_count` is stored on the inner `SearchResult`.
+    pub fn new(mut result: SearchResult, semantic_hit_count: Option<u32>) -> Self {
+        result.semantic_hit_count = semantic_hit_count;
+        Self { result }
     }
 }
 

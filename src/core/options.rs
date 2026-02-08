@@ -2,6 +2,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("wilysearch requires a 64-bit target (default map sizes exceed 32-bit usize)");
+
 /// Configuration options for an embedded [`Meilisearch`](crate::Meilisearch) instance.
 ///
 /// Controls where the LMDB database is stored on disk and the maximum memory

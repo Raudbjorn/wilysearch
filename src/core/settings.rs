@@ -57,7 +57,7 @@ impl From<milli::vector::settings::EmbedderSource> for EmbedderSource {
 }
 
 /// Configuration for an embedder
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EmbedderSettings {
     /// The source/type of embedder to use
@@ -107,6 +107,25 @@ pub struct EmbedderSettings {
     /// Response template for REST embedders
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response: Option<serde_json::Value>,
+}
+
+impl std::fmt::Debug for EmbedderSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbedderSettings")
+            .field("source", &self.source)
+            .field("model", &self.model)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("url", &self.url)
+            .field("dimensions", &self.dimensions)
+            .field("document_template", &self.document_template)
+            .field("document_template_max_bytes", &self.document_template_max_bytes)
+            .field("binary_quantized", &self.binary_quantized)
+            .field("revision", &self.revision)
+            .field("headers", &self.headers)
+            .field("request", &self.request)
+            .field("response", &self.response)
+            .finish()
+    }
 }
 
 impl EmbedderSettings {
@@ -685,7 +704,13 @@ impl<'a, 't, 'i> SettingsApplier<'a, 't, 'i> {
                                 // Language derives Deserialize but not FromStr;
                                 // use serde_json to convert the string to a Language variant
                                 let json_str = serde_json::Value::String(l.clone());
-                                serde_json::from_value::<milli::tokenizer::Language>(json_str).ok()
+                                match serde_json::from_value::<milli::tokenizer::Language>(json_str) {
+                                    Ok(lang) => Some(lang),
+                                    Err(_) => {
+                                        tracing::warn!(locale = %l, "unrecognized locale, skipping");
+                                        None
+                                    }
+                                }
                             })
                             .collect(),
                     )

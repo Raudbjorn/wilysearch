@@ -25,6 +25,54 @@ use crate::core::settings::{
 };
 use crate::core::vector::VectorStore;
 
+/// Parse a filter `Value` into a filter expression string.
+///
+/// Returns `Ok(None)` for empty/null values.
+/// Returns `Err(InvalidFilter)` for unsupported shapes.
+fn parse_filter_to_string(filter_val: &Value) -> Result<Option<String>> {
+    match filter_val {
+        Value::String(s) if s.is_empty() => Ok(None),
+        Value::String(s) => Ok(Some(s.clone())),
+        Value::Array(arr) if arr.is_empty() => Ok(None),
+        Value::Array(arr) => {
+            let mut and_clauses = Vec::with_capacity(arr.len());
+            for item in arr {
+                match item {
+                    Value::String(s) => and_clauses.push(s.clone()),
+                    Value::Array(inner) => {
+                        let or_parts: Vec<&str> = inner
+                            .iter()
+                            .filter_map(|v| v.as_str())
+                            .collect();
+                        if or_parts.is_empty() {
+                            continue;
+                        }
+                        if or_parts.len() == 1 {
+                            and_clauses.push(or_parts[0].to_string());
+                        } else {
+                            and_clauses.push(format!("({})", or_parts.join(" OR ")));
+                        }
+                    }
+                    _ => {
+                        return Err(Error::InvalidFilter(
+                            "filter array elements must be strings or arrays of strings".to_string(),
+                        ));
+                    }
+                }
+            }
+            if and_clauses.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(and_clauses.join(" AND ")))
+            }
+        }
+        Value::Null => Ok(None),
+        _ => Err(Error::InvalidFilter(
+            "filter must be a string or array".to_string(),
+        )),
+    }
+}
+
 /// Convert a primary key JSON value to the string form milli uses for external ID mapping.
 fn pk_value_to_string(val: &Value) -> String {
     match val {
@@ -263,6 +311,36 @@ impl Index {
     /// operation fails.
     #[instrument(skip(self, documents))]
     pub fn add_documents(&self, documents: Vec<Value>, primary_key: Option<&str>) -> Result<()> {
+        self.index_documents_impl(documents, primary_key, milli::update::IndexDocumentsConfig::default())
+    }
+
+    /// Update (partially merge) documents into the index.
+    ///
+    /// Unlike `add_documents`, this uses `IndexDocumentsMethod::UpdateDocuments`
+    /// which merges the provided fields into existing documents rather than
+    /// replacing them entirely. Only the fields present in the new document
+    /// are overwritten; other existing fields are preserved.
+    pub fn update_documents(&self, documents: Vec<Value>, primary_key: Option<&str>) -> Result<()> {
+        self.index_documents_impl(
+            documents,
+            primary_key,
+            milli::update::IndexDocumentsConfig {
+                update_method: milli::update::IndexDocumentsMethod::UpdateDocuments,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Shared implementation for `add_documents` and `update_documents`.
+    ///
+    /// The only difference between the two is the `IndexDocumentsConfig`
+    /// (default = replace, `UpdateDocuments` = merge).
+    fn index_documents_impl(
+        &self,
+        documents: Vec<Value>,
+        primary_key: Option<&str>,
+        config: milli::update::IndexDocumentsConfig,
+    ) -> Result<()> {
         let mut wtxn = self.inner.write_txn().map_err(|e| Error::Heed(e))?;
 
         // If a primary key is provided and the index doesn't have one yet, set it
@@ -288,9 +366,7 @@ impl Index {
         };
         let pending_vectors = Self::extract_pending_vectors(&documents, pk_name.as_deref())?;
 
-        let config = milli::update::IndexDocumentsConfig::default();
         let indexer_config = IndexerConfig::default();
-
         let embedder_stats = Arc::new(EmbedderStats::default());
         let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
 
@@ -321,10 +397,7 @@ impl Index {
         let reader = DocumentsBatchReader::from_reader(std::io::Cursor::new(vector))
             .map_err(|e| Error::Internal(e.to_string()))?;
 
-        // Add documents
         let (builder, _user_result) = builder.add_documents(reader).map_err(Error::Milli)?;
-
-        // Execute
         builder.execute().map_err(Error::Milli)?;
 
         wtxn.commit().map_err(|e| Error::Heed(e))?;
@@ -332,89 +405,6 @@ impl Index {
         // Sync extracted vectors to the external VectorStore AFTER LMDB commit
         // so that LMDB remains the source of truth. If vector sync fails the
         // documents are still safely persisted and vectors can be re-synced.
-        self.sync_pending_vectors_post_commit(pending_vectors)?;
-
-        Ok(())
-    }
-
-    /// Update (partially merge) documents into the index.
-    ///
-    /// Unlike `add_documents`, this uses `IndexDocumentsMethod::UpdateDocuments`
-    /// which merges the provided fields into existing documents rather than
-    /// replacing them entirely. Only the fields present in the new document
-    /// are overwritten; other existing fields are preserved.
-    pub fn update_documents(&self, documents: Vec<Value>, primary_key: Option<&str>) -> Result<()> {
-        use milli::update::IndexDocumentsMethod;
-
-        let mut wtxn = self.inner.write_txn().map_err(|e| Error::Heed(e))?;
-
-        // If a primary key is provided and the index doesn't have one yet, set it
-        if let Some(pk) = primary_key {
-            let existing_pk = self.inner.primary_key(&wtxn).map_err(Error::Heed)?;
-            if existing_pk.is_none() {
-                let indexer_config = IndexerConfig::default();
-                let mut settings = milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
-                settings.set_primary_key(pk.to_string());
-                let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-                let embedder_stats = Arc::new(EmbedderStats::default());
-                let progress = milli::progress::Progress::default();
-                settings.execute(&|| false, &progress, &ip_policy, embedder_stats)
-                    .map_err(Error::Milli)?;
-            }
-        }
-
-        // Extract pending vectors before the batch loop consumes documents.
-        let pk_name = match primary_key {
-            Some(pk) => Some(pk.to_string()),
-            None => self.inner.primary_key(&wtxn).map_err(Error::Heed)?.map(|s| s.to_string()),
-        };
-        let pending_vectors = Self::extract_pending_vectors(&documents, pk_name.as_deref())?;
-
-        let config = milli::update::IndexDocumentsConfig {
-            update_method: IndexDocumentsMethod::UpdateDocuments,
-            ..Default::default()
-        };
-        let indexer_config = IndexerConfig::default();
-
-        let embedder_stats = Arc::new(EmbedderStats::default());
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-
-        let builder = milli::update::IndexDocuments::new(
-            &mut wtxn,
-            &self.inner,
-            &indexer_config,
-            config,
-            move |_| (),
-            || false,
-            &embedder_stats,
-            &ip_policy,
-        )
-        .map_err(Error::Milli)?;
-
-        // Convert JSON documents to DocumentsBatchReader
-        let mut batch_builder = DocumentsBatchBuilder::new(Vec::new());
-        for doc in documents {
-            if let Value::Object(obj) = doc {
-                batch_builder
-                    .append_json_object(&obj)
-                    .map_err(|e| Error::Internal(e.to_string()))?;
-            } else {
-                return Err(Error::Internal("Document must be a JSON object".to_string()));
-            }
-        }
-        let vector = batch_builder.into_inner().map_err(|e| Error::Internal(e.to_string()))?;
-        let reader = DocumentsBatchReader::from_reader(std::io::Cursor::new(vector))
-            .map_err(|e| Error::Internal(e.to_string()))?;
-
-        // Add documents (using UpdateDocuments method)
-        let (builder, _user_result) = builder.add_documents(reader).map_err(Error::Milli)?;
-
-        // Execute
-        builder.execute().map_err(Error::Milli)?;
-
-        wtxn.commit().map_err(|e| Error::Heed(e))?;
-
-        // Sync extracted vectors AFTER LMDB commit (see add_documents)
         self.sync_pending_vectors_post_commit(pending_vectors)?;
 
         Ok(())
@@ -548,11 +538,13 @@ impl Index {
         search.terms_matching_strategy(tms);
 
         // ------------------------------------------------------------------
-        // Filter
+        // Filter (supports string, array-of-strings, and array-of-arrays)
         // ------------------------------------------------------------------
+        let filter_owned;
         if let Some(filter_val) = &query.filter {
-            if let Some(filter_str) = filter_val.as_str() {
-                if let Some(filter) = Filter::from_str(filter_str).map_err(Error::Milli)? {
+            if let Some(fs) = parse_filter_to_string(filter_val)? {
+                filter_owned = fs;
+                if let Some(filter) = Filter::from_str(&filter_owned).map_err(Error::Milli)? {
                     search.filter(filter);
                 }
             }
@@ -899,7 +891,7 @@ impl Index {
     ///     .with_limit(10);
     ///
     /// let result = index.hybrid_search(&query)?;
-    /// println!("Semantic hits: {:?}", result.semantic_hit_count);
+    /// println!("Semantic hits: {:?}", result.result.semantic_hit_count);
     /// # Ok::<(), wilysearch::core::Error>(())
     /// ```
     pub fn hybrid_search(&self, query: &HybridSearchQuery) -> Result<HybridSearchResult> {
@@ -924,9 +916,11 @@ impl Index {
             let rtxn = self.inner.read_txn().map_err(|e| Error::Heed(e))?;
 
             // Get filter candidates if filter is specified
+            let filter_string_owned;
             let filter_bitmap = if let Some(filter_val) = &query.search.filter {
-                if let Some(filter_str) = filter_val.as_str() {
-                    if let Some(filter) = Filter::from_str(filter_str).map_err(Error::Milli)? {
+                if let Some(fs) = parse_filter_to_string(filter_val)? {
+                    filter_string_owned = fs;
+                    if let Some(filter) = Filter::from_str(&filter_string_owned).map_err(Error::Milli)? {
                         Some(filter.evaluate(&rtxn, &self.inner).map_err(Error::Milli)?)
                     } else {
                         None
@@ -1340,7 +1334,11 @@ impl Index {
             .map_err(Error::Milli)?;
         } // rtxn + document_changes dropped here, before commit
 
-        // Remove vectors from the external VectorStore
+        wtxn.commit().map_err(Error::Heed)?;
+
+        // Remove vectors from the external VectorStore AFTER LMDB commit
+        // so that LMDB remains the source of truth. If vector sync fails the
+        // documents are still safely deleted and vectors can be re-synced.
         if let Some(store) = &self.vector_store {
             if !vector_ids_to_remove.is_empty() {
                 store
@@ -1348,8 +1346,6 @@ impl Index {
                     .map_err(|e| Error::VectorStore(e.to_string()))?;
             }
         }
-
-        wtxn.commit().map_err(Error::Heed)?;
 
         Ok(existing_count)
     }
@@ -1459,7 +1455,11 @@ impl Index {
             .map_err(Error::Milli)?;
         } // rtxn + embedders + document_changes dropped here, before commit
 
-        // Remove vectors from the external VectorStore
+        wtxn.commit().map_err(Error::Heed)?;
+
+        // Remove vectors from the external VectorStore AFTER LMDB commit
+        // so that LMDB remains the source of truth. If vector sync fails the
+        // documents are still safely deleted and vectors can be re-synced.
         if let Some(store) = &self.vector_store {
             if !vector_ids_to_remove.is_empty() {
                 store
@@ -1467,8 +1467,6 @@ impl Index {
                     .map_err(|e| Error::VectorStore(e.to_string()))?;
             }
         }
-
-        wtxn.commit().map_err(Error::Heed)?;
 
         Ok(count)
     }
@@ -1538,9 +1536,11 @@ impl Index {
         }
 
         // Get candidate document IDs (filtered or all)
+        let gdwo_filter_owned;
         let candidate_ids = if let Some(filter_val) = &options.filter {
-            if let Some(filter_str) = filter_val.as_str() {
-                if let Some(filter) = Filter::from_str(filter_str).map_err(Error::Milli)? {
+            if let Some(fs) = parse_filter_to_string(filter_val)? {
+                gdwo_filter_owned = fs;
+                if let Some(filter) = Filter::from_str(&gdwo_filter_owned).map_err(Error::Milli)? {
                     filter.evaluate(&rtxn, &self.inner).map_err(Error::Milli)?
                 } else {
                     self.inner.documents_ids(&rtxn).map_err(Error::Heed)?
@@ -1562,9 +1562,11 @@ impl Index {
                 let mut search = self.inner.search(&rtxn, &progress);
 
                 // Apply the filter again to scope the search
+                let sort_filter_owned;
                 if let Some(filter_val) = &options.filter {
-                    if let Some(filter_str) = filter_val.as_str() {
-                        if let Some(filter) = Filter::from_str(filter_str).map_err(Error::Milli)? {
+                    if let Some(fs) = parse_filter_to_string(filter_val)? {
+                        sort_filter_owned = fs;
+                        if let Some(filter) = Filter::from_str(&sort_filter_owned).map_err(Error::Milli)? {
                             search.filter(filter);
                         }
                     }
@@ -1638,16 +1640,15 @@ impl Index {
     /// The primary key can only be set on an empty index. If the index already
     /// contains documents, this returns `Error::PrimaryKeyAlreadyPresent`.
     pub fn update_primary_key(&self, primary_key: &str) -> Result<()> {
-        // Check if the index already has documents
-        let rtxn = self.inner.read_txn().map_err(Error::Heed)?;
-        let doc_count = self.inner.number_of_documents(&rtxn).map_err(Error::Milli)?;
+        // Use a single write txn for both the check and the update to avoid
+        // a TOCTOU race (documents could be inserted between read and write).
+        let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
+
+        let doc_count = self.inner.number_of_documents(&wtxn).map_err(Error::Milli)?;
         if doc_count > 0 {
             return Err(Error::PrimaryKeyAlreadyPresent);
         }
-        drop(rtxn);
 
-        // Use the milli Settings builder to set the primary key
-        let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
         let indexer_config = IndexerConfig::default();
         let mut milli_settings =
             milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
@@ -1690,10 +1691,12 @@ impl Index {
         };
         inner_search.terms_matching_strategy(tms);
 
-        // Apply filter
+        // Apply filter (supports string, array-of-strings, and array-of-arrays)
+        let facet_filter_owned;
         if let Some(ref filter_val) = query.filter {
-            if let Some(filter_str) = filter_val.as_str() {
-                if let Some(filter) = Filter::from_str(filter_str).map_err(Error::Milli)? {
+            if let Some(fs) = parse_filter_to_string(filter_val)? {
+                facet_filter_owned = fs;
+                if let Some(filter) = Filter::from_str(&facet_filter_owned).map_err(Error::Milli)? {
                     inner_search.filter(filter);
                 }
             }
@@ -1830,10 +1833,12 @@ impl Index {
             &progress,
         );
 
-        // Apply optional filter
+        // Apply optional filter (supports string, array-of-strings, and array-of-arrays)
+        let similar_filter_owned;
         if let Some(ref filter_val) = query.filter {
-            if let Some(filter_str) = filter_val.as_str() {
-                if let Some(filter) = Filter::from_str(filter_str).map_err(Error::Milli)? {
+            if let Some(fs) = parse_filter_to_string(filter_val)? {
+                similar_filter_owned = fs;
+                if let Some(filter) = Filter::from_str(&similar_filter_owned).map_err(Error::Milli)? {
                     similar.filter(filter);
                 }
             }
@@ -2053,6 +2058,31 @@ impl Index {
         Ok(())
     }
 
+    /// Helper: open a write transaction, create a milli settings builder,
+    /// apply a single reset closure, execute, and commit.
+    fn execute_settings_reset(
+        &self,
+        apply: impl FnOnce(&mut milli::update::Settings<'_, '_, '_>),
+    ) -> Result<()> {
+        let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
+        let indexer_config = IndexerConfig::default();
+        let mut milli_settings =
+            milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
+        apply(&mut milli_settings);
+        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
+        let embedder_stats = Arc::new(EmbedderStats::default());
+        milli_settings
+            .execute(
+                &|| false,
+                &milli::progress::Progress::default(),
+                &ip_policy,
+                embedder_stats,
+            )
+            .map_err(Error::Milli)?;
+        wtxn.commit().map_err(Error::Heed)?;
+        Ok(())
+    }
+
     // ========================================================================
     // Individual Settings Accessors
     // ========================================================================
@@ -2073,15 +2103,7 @@ impl Index {
 
     /// Reset the displayed attributes to their default value.
     pub fn reset_displayed_attributes(&self) -> Result<()> {
-        let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
-        let indexer_config = IndexerConfig::default();
-        let mut milli_settings = milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
-        milli_settings.reset_displayed_fields();
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-        let embedder_stats = Arc::new(EmbedderStats::default());
-        milli_settings.execute(&|| false, &milli::progress::Progress::default(), &ip_policy, embedder_stats).map_err(Error::Milli)?;
-        wtxn.commit().map_err(Error::Heed)?;
-        Ok(())
+        self.execute_settings_reset(|s| s.reset_displayed_fields())
     }
 
     // --- searchable_attributes ---
@@ -2100,15 +2122,7 @@ impl Index {
 
     /// Reset the searchable attributes to their default value.
     pub fn reset_searchable_attributes(&self) -> Result<()> {
-        let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
-        let indexer_config = IndexerConfig::default();
-        let mut milli_settings = milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
-        milli_settings.reset_searchable_fields();
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-        let embedder_stats = Arc::new(EmbedderStats::default());
-        milli_settings.execute(&|| false, &milli::progress::Progress::default(), &ip_policy, embedder_stats).map_err(Error::Milli)?;
-        wtxn.commit().map_err(Error::Heed)?;
-        Ok(())
+        self.execute_settings_reset(|s| s.reset_searchable_fields())
     }
 
     // --- filterable_attributes ---
@@ -2127,15 +2141,7 @@ impl Index {
 
     /// Reset the filterable attributes to their default value.
     pub fn reset_filterable_attributes(&self) -> Result<()> {
-        let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
-        let indexer_config = IndexerConfig::default();
-        let mut milli_settings = milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
-        milli_settings.reset_filterable_fields();
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-        let embedder_stats = Arc::new(EmbedderStats::default());
-        milli_settings.execute(&|| false, &milli::progress::Progress::default(), &ip_policy, embedder_stats).map_err(Error::Milli)?;
-        wtxn.commit().map_err(Error::Heed)?;
-        Ok(())
+        self.execute_settings_reset(|s| s.reset_filterable_fields())
     }
 
     // --- sortable_attributes ---
@@ -2154,15 +2160,7 @@ impl Index {
 
     /// Reset the sortable attributes to their default value.
     pub fn reset_sortable_attributes(&self) -> Result<()> {
-        let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
-        let indexer_config = IndexerConfig::default();
-        let mut milli_settings = milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
-        milli_settings.reset_sortable_fields();
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-        let embedder_stats = Arc::new(EmbedderStats::default());
-        milli_settings.execute(&|| false, &milli::progress::Progress::default(), &ip_policy, embedder_stats).map_err(Error::Milli)?;
-        wtxn.commit().map_err(Error::Heed)?;
-        Ok(())
+        self.execute_settings_reset(|s| s.reset_sortable_fields())
     }
 
     // --- ranking_rules ---
@@ -2181,15 +2179,7 @@ impl Index {
 
     /// Reset the ranking rules to their default value.
     pub fn reset_ranking_rules(&self) -> Result<()> {
-        let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
-        let indexer_config = IndexerConfig::default();
-        let mut milli_settings = milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
-        milli_settings.reset_criteria();
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-        let embedder_stats = Arc::new(EmbedderStats::default());
-        milli_settings.execute(&|| false, &milli::progress::Progress::default(), &ip_policy, embedder_stats).map_err(Error::Milli)?;
-        wtxn.commit().map_err(Error::Heed)?;
-        Ok(())
+        self.execute_settings_reset(|s| s.reset_criteria())
     }
 
     // --- stop_words ---
@@ -2208,15 +2198,7 @@ impl Index {
 
     /// Reset the stop words to their default value.
     pub fn reset_stop_words(&self) -> Result<()> {
-        let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
-        let indexer_config = IndexerConfig::default();
-        let mut milli_settings = milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
-        milli_settings.reset_stop_words();
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-        let embedder_stats = Arc::new(EmbedderStats::default());
-        milli_settings.execute(&|| false, &milli::progress::Progress::default(), &ip_policy, embedder_stats).map_err(Error::Milli)?;
-        wtxn.commit().map_err(Error::Heed)?;
-        Ok(())
+        self.execute_settings_reset(|s| s.reset_stop_words())
     }
 
     // --- non_separator_tokens ---
@@ -2235,15 +2217,7 @@ impl Index {
 
     /// Reset the non-separator tokens to their default value.
     pub fn reset_non_separator_tokens(&self) -> Result<()> {
-        let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
-        let indexer_config = IndexerConfig::default();
-        let mut milli_settings = milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
-        milli_settings.reset_non_separator_tokens();
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-        let embedder_stats = Arc::new(EmbedderStats::default());
-        milli_settings.execute(&|| false, &milli::progress::Progress::default(), &ip_policy, embedder_stats).map_err(Error::Milli)?;
-        wtxn.commit().map_err(Error::Heed)?;
-        Ok(())
+        self.execute_settings_reset(|s| s.reset_non_separator_tokens())
     }
 
     // --- separator_tokens ---
@@ -2262,15 +2236,7 @@ impl Index {
 
     /// Reset the separator tokens to their default value.
     pub fn reset_separator_tokens(&self) -> Result<()> {
-        let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
-        let indexer_config = IndexerConfig::default();
-        let mut milli_settings = milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
-        milli_settings.reset_separator_tokens();
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-        let embedder_stats = Arc::new(EmbedderStats::default());
-        milli_settings.execute(&|| false, &milli::progress::Progress::default(), &ip_policy, embedder_stats).map_err(Error::Milli)?;
-        wtxn.commit().map_err(Error::Heed)?;
-        Ok(())
+        self.execute_settings_reset(|s| s.reset_separator_tokens())
     }
 
     // --- dictionary ---
@@ -2289,15 +2255,7 @@ impl Index {
 
     /// Reset the dictionary to its default value.
     pub fn reset_dictionary(&self) -> Result<()> {
-        let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
-        let indexer_config = IndexerConfig::default();
-        let mut milli_settings = milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
-        milli_settings.reset_dictionary();
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-        let embedder_stats = Arc::new(EmbedderStats::default());
-        milli_settings.execute(&|| false, &milli::progress::Progress::default(), &ip_policy, embedder_stats).map_err(Error::Milli)?;
-        wtxn.commit().map_err(Error::Heed)?;
-        Ok(())
+        self.execute_settings_reset(|s| s.reset_dictionary())
     }
 
     // --- synonyms ---
@@ -2316,15 +2274,7 @@ impl Index {
 
     /// Reset the synonyms to their default value.
     pub fn reset_synonyms(&self) -> Result<()> {
-        let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
-        let indexer_config = IndexerConfig::default();
-        let mut milli_settings = milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
-        milli_settings.reset_synonyms();
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-        let embedder_stats = Arc::new(EmbedderStats::default());
-        milli_settings.execute(&|| false, &milli::progress::Progress::default(), &ip_policy, embedder_stats).map_err(Error::Milli)?;
-        wtxn.commit().map_err(Error::Heed)?;
-        Ok(())
+        self.execute_settings_reset(|s| s.reset_synonyms())
     }
 
     // --- distinct_attribute ---
@@ -2343,15 +2293,7 @@ impl Index {
 
     /// Reset the distinct attribute to its default value.
     pub fn reset_distinct_attribute(&self) -> Result<()> {
-        let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
-        let indexer_config = IndexerConfig::default();
-        let mut milli_settings = milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
-        milli_settings.reset_distinct_field();
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-        let embedder_stats = Arc::new(EmbedderStats::default());
-        milli_settings.execute(&|| false, &milli::progress::Progress::default(), &ip_policy, embedder_stats).map_err(Error::Milli)?;
-        wtxn.commit().map_err(Error::Heed)?;
-        Ok(())
+        self.execute_settings_reset(|s| s.reset_distinct_field())
     }
 
     // --- proximity_precision ---
@@ -2370,15 +2312,7 @@ impl Index {
 
     /// Reset the proximity precision to its default value.
     pub fn reset_proximity_precision(&self) -> Result<()> {
-        let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
-        let indexer_config = IndexerConfig::default();
-        let mut milli_settings = milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
-        milli_settings.reset_proximity_precision();
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-        let embedder_stats = Arc::new(EmbedderStats::default());
-        milli_settings.execute(&|| false, &milli::progress::Progress::default(), &ip_policy, embedder_stats).map_err(Error::Milli)?;
-        wtxn.commit().map_err(Error::Heed)?;
-        Ok(())
+        self.execute_settings_reset(|s| s.reset_proximity_precision())
     }
 
     // --- typo_tolerance ---
@@ -2397,19 +2331,13 @@ impl Index {
 
     /// Reset the typo tolerance to its default value.
     pub fn reset_typo_tolerance(&self) -> Result<()> {
-        let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
-        let indexer_config = IndexerConfig::default();
-        let mut milli_settings = milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
-        milli_settings.reset_authorize_typos();
-        milli_settings.reset_min_word_len_one_typo();
-        milli_settings.reset_min_word_len_two_typos();
-        milli_settings.reset_exact_words();
-        milli_settings.reset_exact_attributes();
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-        let embedder_stats = Arc::new(EmbedderStats::default());
-        milli_settings.execute(&|| false, &milli::progress::Progress::default(), &ip_policy, embedder_stats).map_err(Error::Milli)?;
-        wtxn.commit().map_err(Error::Heed)?;
-        Ok(())
+        self.execute_settings_reset(|s| {
+            s.reset_authorize_typos();
+            s.reset_min_word_len_one_typo();
+            s.reset_min_word_len_two_typos();
+            s.reset_exact_words();
+            s.reset_exact_attributes();
+        })
     }
 
     // --- faceting ---
@@ -2428,15 +2356,7 @@ impl Index {
 
     /// Reset the faceting to its default value.
     pub fn reset_faceting(&self) -> Result<()> {
-        let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
-        let indexer_config = IndexerConfig::default();
-        let mut milli_settings = milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
-        milli_settings.reset_max_values_per_facet();
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-        let embedder_stats = Arc::new(EmbedderStats::default());
-        milli_settings.execute(&|| false, &milli::progress::Progress::default(), &ip_policy, embedder_stats).map_err(Error::Milli)?;
-        wtxn.commit().map_err(Error::Heed)?;
-        Ok(())
+        self.execute_settings_reset(|s| s.reset_max_values_per_facet())
     }
 
     // --- pagination ---
@@ -2455,15 +2375,7 @@ impl Index {
 
     /// Reset the pagination to its default value.
     pub fn reset_pagination(&self) -> Result<()> {
-        let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
-        let indexer_config = IndexerConfig::default();
-        let mut milli_settings = milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
-        milli_settings.reset_pagination_max_total_hits();
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-        let embedder_stats = Arc::new(EmbedderStats::default());
-        milli_settings.execute(&|| false, &milli::progress::Progress::default(), &ip_policy, embedder_stats).map_err(Error::Milli)?;
-        wtxn.commit().map_err(Error::Heed)?;
-        Ok(())
+        self.execute_settings_reset(|s| s.reset_pagination_max_total_hits())
     }
 
     // --- embedders ---
@@ -2482,15 +2394,7 @@ impl Index {
 
     /// Reset the embedders to their default value.
     pub fn reset_embedders(&self) -> Result<()> {
-        let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
-        let indexer_config = IndexerConfig::default();
-        let mut milli_settings = milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
-        milli_settings.reset_embedder_settings();
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-        let embedder_stats = Arc::new(EmbedderStats::default());
-        milli_settings.execute(&|| false, &milli::progress::Progress::default(), &ip_policy, embedder_stats).map_err(Error::Milli)?;
-        wtxn.commit().map_err(Error::Heed)?;
-        Ok(())
+        self.execute_settings_reset(|s| s.reset_embedder_settings())
     }
 
     // --- search_cutoff_ms ---
@@ -2509,15 +2413,7 @@ impl Index {
 
     /// Reset the search cutoff to its default value.
     pub fn reset_search_cutoff_ms(&self) -> Result<()> {
-        let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
-        let indexer_config = IndexerConfig::default();
-        let mut milli_settings = milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
-        milli_settings.reset_search_cutoff();
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-        let embedder_stats = Arc::new(EmbedderStats::default());
-        milli_settings.execute(&|| false, &milli::progress::Progress::default(), &ip_policy, embedder_stats).map_err(Error::Milli)?;
-        wtxn.commit().map_err(Error::Heed)?;
-        Ok(())
+        self.execute_settings_reset(|s| s.reset_search_cutoff())
     }
 
     // --- localized_attributes ---
@@ -2536,15 +2432,7 @@ impl Index {
 
     /// Reset the localized attributes to their default value.
     pub fn reset_localized_attributes(&self) -> Result<()> {
-        let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
-        let indexer_config = IndexerConfig::default();
-        let mut milli_settings = milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
-        milli_settings.reset_localized_attributes_rules();
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-        let embedder_stats = Arc::new(EmbedderStats::default());
-        milli_settings.execute(&|| false, &milli::progress::Progress::default(), &ip_policy, embedder_stats).map_err(Error::Milli)?;
-        wtxn.commit().map_err(Error::Heed)?;
-        Ok(())
+        self.execute_settings_reset(|s| s.reset_localized_attributes_rules())
     }
 
     // --- facet_search ---
@@ -2563,15 +2451,7 @@ impl Index {
 
     /// Reset the facet search to its default value.
     pub fn reset_facet_search(&self) -> Result<()> {
-        let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
-        let indexer_config = IndexerConfig::default();
-        let mut milli_settings = milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
-        milli_settings.reset_facet_search();
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-        let embedder_stats = Arc::new(EmbedderStats::default());
-        milli_settings.execute(&|| false, &milli::progress::Progress::default(), &ip_policy, embedder_stats).map_err(Error::Milli)?;
-        wtxn.commit().map_err(Error::Heed)?;
-        Ok(())
+        self.execute_settings_reset(|s| s.reset_facet_search())
     }
 
     // --- prefix_search ---
@@ -2590,15 +2470,7 @@ impl Index {
 
     /// Reset the prefix search to its default value.
     pub fn reset_prefix_search(&self) -> Result<()> {
-        let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
-        let indexer_config = IndexerConfig::default();
-        let mut milli_settings = milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
-        milli_settings.reset_prefix_search();
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-        let embedder_stats = Arc::new(EmbedderStats::default());
-        milli_settings.execute(&|| false, &milli::progress::Progress::default(), &ip_policy, embedder_stats).map_err(Error::Milli)?;
-        wtxn.commit().map_err(Error::Heed)?;
-        Ok(())
+        self.execute_settings_reset(|s| s.reset_prefix_search())
     }
 
     /// Get the primary key field name for this index.
