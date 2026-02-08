@@ -6,6 +6,8 @@
 
 mod common;
 
+use figment::providers::Format;
+use figment::Figment;
 use tempfile::TempDir;
 use wilysearch::config::*;
 use wilysearch::engine::Engine;
@@ -196,24 +198,25 @@ fn test_invalid_task_db_size_error() {
     }
 }
 
-/// Invalid `rag.default_search_type` should produce a validation error.
+/// Invalid `rag.default_search_type` should be rejected at deserialization.
 #[test]
 fn test_invalid_search_type_error() {
-    let mut config = WilysearchConfig::default();
-    config.rag.default_search_type = "fulltext".to_string();
+    let toml = r#"
+        [engine]
+        db_path = "/tmp/test"
 
-    let err = config.validate().unwrap_err();
-    match err {
-        ConfigError::Validation {
-            ref field,
-            ref value,
-            ..
-        } => {
-            assert_eq!(field, "rag.default_search_type");
-            assert_eq!(value, "fulltext");
-        }
-        _ => panic!("expected ConfigError::Validation, got: {err:?}"),
-    }
+        [rag]
+        default_search_type = "fulltext"
+    "#;
+    let figment = Figment::from(figment::providers::Serialized::defaults(
+        WilysearchConfig::default(),
+    ))
+    .merge(figment::providers::Toml::string(toml));
+    let result: std::result::Result<WilysearchConfig, _> = figment.extract();
+    assert!(
+        result.is_err(),
+        "invalid search type 'fulltext' should fail at deserialization"
+    );
 }
 
 /// `semantic_ratio` outside `[0.0, 1.0]` should be caught by validation.
@@ -401,7 +404,7 @@ fn test_config_provider_round_trip() {
         },
         rag: RagConfig {
             retrieval_limit: 77,
-            default_search_type: "semantic".to_string(),
+            default_search_type: SearchType::Semantic,
             ..Default::default()
         },
         search_defaults: SearchDefaultsConfig {
@@ -422,7 +425,7 @@ fn test_config_provider_round_trip() {
     assert_eq!(extracted.engine.max_index_size, 555);
     assert_eq!(extracted.engine.max_task_db_size, 111);
     assert_eq!(extracted.rag.retrieval_limit, 77);
-    assert_eq!(extracted.rag.default_search_type, "semantic");
+    assert_eq!(extracted.rag.default_search_type, SearchType::Semantic);
     assert_eq!(extracted.search_defaults.limit, 99);
 }
 
@@ -483,7 +486,7 @@ fn test_rag_config_hybrid_conversion() {
         rerank_limit: 8,
         max_context_chars: 4000,
         include_snippets: false,
-        default_search_type: "hybrid".to_string(),
+        default_search_type: SearchType::Hybrid,
         semantic_ratio: 0.3,
     };
 
@@ -500,28 +503,24 @@ fn test_rag_config_hybrid_conversion() {
     }
 }
 
-/// Verify that `RagConfig` with an invalid search type fails `TryFrom`.
+/// Verify that invalid search type is rejected at deserialization, not TryFrom.
 #[test]
-fn test_rag_config_invalid_search_type_try_from() {
-    let rc = RagConfig {
-        default_search_type: "bm25".to_string(),
-        ..Default::default()
-    };
+fn test_rag_config_invalid_search_type_deserialization() {
+    // With a typed enum, invalid values are caught by serde, so we test TOML parsing
+    let toml = r#"
+        [engine]
+        db_path = "/tmp/test"
 
-    let result: std::result::Result<wilysearch::core::rag::PipelineConfig, ConfigError> =
-        rc.try_into();
-    assert!(result.is_err(), "invalid search type should fail TryFrom");
-
-    let err = result.unwrap_err();
-    match err {
-        ConfigError::Validation {
-            ref field,
-            ref value,
-            ..
-        } => {
-            assert_eq!(field, "rag.default_search_type");
-            assert_eq!(value, "bm25");
-        }
-        _ => panic!("expected ConfigError::Validation, got: {err:?}"),
-    }
+        [rag]
+        default_search_type = "bm25"
+    "#;
+    let figment = Figment::from(figment::providers::Serialized::defaults(
+        WilysearchConfig::default(),
+    ))
+    .merge(figment::providers::Toml::string(toml));
+    let result: std::result::Result<WilysearchConfig, _> = figment.extract();
+    assert!(
+        result.is_err(),
+        "invalid search type 'bm25' should fail at deserialization"
+    );
 }

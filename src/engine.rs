@@ -127,7 +127,7 @@ impl Engine {
 
         // Apply experimental feature flags.
         let exp_features: crate::core::ExperimentalFeatures = config.experimental.into();
-        let _ = inner.update_experimental_features(exp_features);
+        inner.update_experimental_features(exp_features);
 
         Ok(Self {
             inner,
@@ -153,8 +153,9 @@ impl Engine {
 
     fn next_task(&self, task_type: &str, index_uid: Option<&str>) -> TaskInfo {
         let uid = self.task_counter.fetch_add(1, Ordering::Relaxed);
-        // Best-effort persistence: ignore errors to avoid crashing on status update
-        let _ = std::fs::write(&self.task_counter_path, (uid + 1).to_string());
+        if let Err(e) = std::fs::write(&self.task_counter_path, (uid + 1).to_string()) {
+            tracing::warn!(error = %e, "failed to persist task counter");
+        }
         TaskInfo {
             task_uid: uid,
             index_uid: index_uid.map(String::from),
@@ -465,10 +466,9 @@ fn convert_settings_to_lib(s: &Settings) -> Result<crate::core::Settings> {
         let sort_map = if let Some(ref m) = fac.sort_facet_values_by {
             let mut result = std::collections::BTreeMap::new();
             for (k, v) in m {
-                let sort = match v.as_str() {
-                    "alpha" => crate::core::settings::FacetValuesSort::Alpha,
-                    "count" => crate::core::settings::FacetValuesSort::Count,
-                    other => return Err(format!("unknown facet sort value: '{other}', expected 'alpha' or 'count'").into()),
+                let sort = match v {
+                    FacetValuesSort::Alpha => crate::core::settings::FacetValuesSort::Alpha,
+                    FacetValuesSort::Count => crate::core::settings::FacetValuesSort::Count,
                 };
                 result.insert(k.clone(), sort);
             }
@@ -492,13 +492,9 @@ fn convert_settings_to_lib(s: &Settings) -> Result<crate::core::Settings> {
         ms = ms.with_non_separator_tokens(tokens.iter().cloned().collect());
     }
     if let Some(ref prec) = s.proximity_precision {
-        let lib_prec = match prec.as_str() {
-            "byWord" => crate::core::settings::ProximityPrecision::ByWord,
-            "byAttribute" => crate::core::settings::ProximityPrecision::ByAttribute,
-            _ => {
-                log::warn!("unknown proximity_precision '{prec}', defaulting to byWord");
-                crate::core::settings::ProximityPrecision::ByWord
-            }
+        let lib_prec = match prec {
+            ProximityPrecision::ByWord => crate::core::settings::ProximityPrecision::ByWord,
+            ProximityPrecision::ByAttribute => crate::core::settings::ProximityPrecision::ByAttribute,
         };
         ms = ms.with_proximity_precision(lib_prec);
     }
@@ -506,7 +502,11 @@ fn convert_settings_to_lib(s: &Settings) -> Result<crate::core::Settings> {
         ms = ms.with_facet_search(enabled);
     }
     if let Some(ref mode) = s.prefix_search {
-        ms = ms.with_prefix_search(mode.clone());
+        let mode_str = match mode {
+            PrefixSearch::IndexingTime => "indexingTime".to_string(),
+            PrefixSearch::Disabled => "disabled".to_string(),
+        };
+        ms = ms.with_prefix_search(mode_str);
     }
     if let Some(ms_val) = s.search_cutoff_ms {
         ms = ms.with_search_cutoff_ms(ms_val);
@@ -600,10 +600,10 @@ fn convert_settings_from_lib(s: &crate::core::Settings) -> Settings {
                 m.iter()
                     .map(|(k, v)| {
                         let s = match v {
-                            crate::core::settings::FacetValuesSort::Count => "count",
-                            crate::core::settings::FacetValuesSort::Alpha => "alpha",
+                            crate::core::settings::FacetValuesSort::Count => FacetValuesSort::Count,
+                            crate::core::settings::FacetValuesSort::Alpha => FacetValuesSort::Alpha,
                         };
-                        (k.clone(), s.to_string())
+                        (k.clone(), s)
                     })
                     .collect()
             }),
@@ -611,14 +611,15 @@ fn convert_settings_from_lib(s: &crate::core::Settings) -> Settings {
         dictionary: s.dictionary.as_ref().map(|d| d.iter().cloned().collect()),
         separator_tokens: s.separator_tokens.as_ref().map(|t| t.iter().cloned().collect()),
         non_separator_tokens: s.non_separator_tokens.as_ref().map(|t| t.iter().cloned().collect()),
-        proximity_precision: s.proximity_precision.as_ref().map(|p| {
-            match p {
-                crate::core::settings::ProximityPrecision::ByWord => "byWord".to_string(),
-                crate::core::settings::ProximityPrecision::ByAttribute => "byAttribute".to_string(),
-            }
+        proximity_precision: s.proximity_precision.as_ref().map(|p| match p {
+            crate::core::settings::ProximityPrecision::ByWord => ProximityPrecision::ByWord,
+            crate::core::settings::ProximityPrecision::ByAttribute => ProximityPrecision::ByAttribute,
         }),
         facet_search: s.facet_search,
-        prefix_search: s.prefix_search.clone(),
+        prefix_search: s.prefix_search.as_ref().map(|s| match s.as_str() {
+            "disabled" => PrefixSearch::Disabled,
+            _ => PrefixSearch::IndexingTime,
+        }),
         search_cutoff_ms: s.search_cutoff_ms,
         localized_attributes: s.localized_attributes.as_ref().map(|rules| {
             rules
@@ -1278,10 +1279,10 @@ impl traits::SettingsApi for Engine {
                     m.into_iter()
                         .map(|(k, v)| {
                             let s = match v {
-                                crate::core::settings::FacetValuesSort::Count => "count",
-                                crate::core::settings::FacetValuesSort::Alpha => "alpha",
+                                crate::core::settings::FacetValuesSort::Count => FacetValuesSort::Count,
+                                crate::core::settings::FacetValuesSort::Alpha => FacetValuesSort::Alpha,
                             };
-                            (k, s.to_string())
+                            (k, s)
                         })
                         .collect()
                 }),
@@ -1293,10 +1294,9 @@ impl traits::SettingsApi for Engine {
         let sort_map = if let Some(m) = config.sort_facet_values_by.as_ref() {
             let mut result = std::collections::BTreeMap::new();
             for (k, v) in m {
-                let sort = match v.as_str() {
-                    "alpha" => crate::core::settings::FacetValuesSort::Alpha,
-                    "count" => crate::core::settings::FacetValuesSort::Count,
-                    other => return Err(format!("invalid facet sort value: '{other}', expected 'alpha' or 'count'").into()),
+                let sort = match v {
+                    FacetValuesSort::Alpha => crate::core::settings::FacetValuesSort::Alpha,
+                    FacetValuesSort::Count => crate::core::settings::FacetValuesSort::Count,
                 };
                 result.insert(k.clone(), sort);
             }
@@ -1361,24 +1361,21 @@ impl traits::SettingsApi for Engine {
         self.mutation_task(index_uid, "settingsUpdate")
     }
 
-    fn get_proximity_precision(&self, index_uid: &str) -> Result<String> {
+    fn get_proximity_precision(&self, index_uid: &str) -> Result<ProximityPrecision> {
         let idx = self.resolve_index(index_uid)?;
         Ok(idx
             .get_proximity_precision()?
             .map(|p| match p {
-                crate::core::settings::ProximityPrecision::ByWord => "byWord".to_string(),
-                crate::core::settings::ProximityPrecision::ByAttribute => {
-                    "byAttribute".to_string()
-                }
+                crate::core::settings::ProximityPrecision::ByWord => ProximityPrecision::ByWord,
+                crate::core::settings::ProximityPrecision::ByAttribute => ProximityPrecision::ByAttribute,
             })
-            .unwrap_or_else(|| "byWord".to_string()))
+            .unwrap_or(ProximityPrecision::ByWord))
     }
-    fn update_proximity_precision(&self, index_uid: &str, precision: &str) -> Result<TaskInfo> {
+    fn update_proximity_precision(&self, index_uid: &str, precision: ProximityPrecision) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
         let p = match precision {
-            "byWord" => crate::core::settings::ProximityPrecision::ByWord,
-            "byAttribute" => crate::core::settings::ProximityPrecision::ByAttribute,
-            other => return Err(format!("invalid proximity_precision: '{other}', expected 'byWord' or 'byAttribute'").into()),
+            ProximityPrecision::ByWord => crate::core::settings::ProximityPrecision::ByWord,
+            ProximityPrecision::ByAttribute => crate::core::settings::ProximityPrecision::ByAttribute,
         };
         idx.update_proximity_precision(p)?;
         self.mutation_task(index_uid, "settingsUpdate")
@@ -1404,13 +1401,23 @@ impl traits::SettingsApi for Engine {
         self.mutation_task(index_uid, "settingsUpdate")
     }
 
-    fn get_prefix_search(&self, index_uid: &str) -> Result<String> {
+    fn get_prefix_search(&self, index_uid: &str) -> Result<PrefixSearch> {
         let idx = self.resolve_index(index_uid)?;
-        Ok(idx.get_prefix_search()?.unwrap_or_else(|| "indexingTime".to_string()))
+        Ok(idx
+            .get_prefix_search()?
+            .map(|s| match s.as_str() {
+                "disabled" => PrefixSearch::Disabled,
+                _ => PrefixSearch::IndexingTime,
+            })
+            .unwrap_or(PrefixSearch::IndexingTime))
     }
-    fn update_prefix_search(&self, index_uid: &str, mode: &str) -> Result<TaskInfo> {
+    fn update_prefix_search(&self, index_uid: &str, mode: PrefixSearch) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
-        idx.update_prefix_search(mode.to_string())?;
+        let mode_str = match mode {
+            PrefixSearch::IndexingTime => "indexingTime".to_string(),
+            PrefixSearch::Disabled => "disabled".to_string(),
+        };
+        idx.update_prefix_search(mode_str)?;
         self.mutation_task(index_uid, "settingsUpdate")
     }
     fn reset_prefix_search(&self, index_uid: &str) -> Result<TaskInfo> {
@@ -1623,15 +1630,20 @@ impl traits::System for Engine {
     }
 
     fn create_dump(&self) -> Result<TaskInfo> {
-        let _guard = self.dump_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self.dump_lock.lock().unwrap_or_else(|e| {
+            tracing::warn!("dump_lock Mutex poisoned in create_dump, recovering");
+            e.into_inner()
+        });
         std::fs::create_dir_all(&self.dump_dir)?;
-        let info = self.inner.create_dump(&self.dump_dir)?;
-        let _ = info; // dump completed successfully
+        self.inner.create_dump(&self.dump_dir)?;
         Ok(self.next_task("dumpCreation", None))
     }
 
     fn create_snapshot(&self) -> Result<TaskInfo> {
-        let _guard = self.dump_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self.dump_lock.lock().unwrap_or_else(|e| {
+            tracing::warn!("dump_lock Mutex poisoned in create_snapshot, recovering");
+            e.into_inner()
+        });
         std::fs::create_dir_all(&self.snapshot_dir)?;
         self.inner.create_snapshot(&self.snapshot_dir)?;
         Ok(self.next_task("snapshotCreation", None))

@@ -151,11 +151,9 @@ fn test_document_not_found() {
     let ctx = TestContext::new();
     common::create_test_index(&ctx, "movies");
 
-    // Attempting to get a non-existent document should error
+    // Attempting to get a non-existent document should return an error
     let result = ctx
         .engine
         .get_document("movies", "99999", &DocumentQuery::default());
-    // The engine may return an error or an empty/null doc — depends on implementation
-    // For now, just verify it doesn't panic
-    let _ = result;
+    assert!(result.is_err(), "getting a non-existent document should return an error");
 }

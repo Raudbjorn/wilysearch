@@ -402,12 +402,12 @@ pub trait SettingsApi {
         self.update_settings(index_uid, &s)
     }
 
-    fn get_proximity_precision(&self, index_uid: &str) -> Result<String> {
-        Ok(self.get_settings(index_uid)?.proximity_precision.unwrap_or_else(|| "byWord".to_string()))
+    fn get_proximity_precision(&self, index_uid: &str) -> Result<ProximityPrecision> {
+        Ok(self.get_settings(index_uid)?.proximity_precision.unwrap_or(ProximityPrecision::ByWord))
     }
-    fn update_proximity_precision(&self, index_uid: &str, precision: &str) -> Result<TaskInfo> {
+    fn update_proximity_precision(&self, index_uid: &str, precision: ProximityPrecision) -> Result<TaskInfo> {
         let mut s = Settings::default();
-        s.proximity_precision = Some(precision.to_string());
+        s.proximity_precision = Some(precision);
         self.update_settings(index_uid, &s)
     }
     fn reset_proximity_precision(&self, index_uid: &str) -> Result<TaskInfo> {
@@ -430,12 +430,12 @@ pub trait SettingsApi {
         self.update_settings(index_uid, &s)
     }
 
-    fn get_prefix_search(&self, index_uid: &str) -> Result<String> {
-        Ok(self.get_settings(index_uid)?.prefix_search.unwrap_or_else(|| "indexingTime".to_string()))
+    fn get_prefix_search(&self, index_uid: &str) -> Result<PrefixSearch> {
+        Ok(self.get_settings(index_uid)?.prefix_search.unwrap_or(PrefixSearch::IndexingTime))
     }
-    fn update_prefix_search(&self, index_uid: &str, mode: &str) -> Result<TaskInfo> {
+    fn update_prefix_search(&self, index_uid: &str, mode: PrefixSearch) -> Result<TaskInfo> {
         let mut s = Settings::default();
-        s.prefix_search = Some(mode.to_string());
+        s.prefix_search = Some(mode);
         self.update_settings(index_uid, &s)
     }
     fn reset_prefix_search(&self, index_uid: &str) -> Result<TaskInfo> {

@@ -292,6 +292,162 @@ pub enum MatchingStrategy {
     Frequency,
 }
 
+/// Precision level for the proximity ranking rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProximityPrecision {
+    ByWord,
+    ByAttribute,
+}
+
+/// Whether prefix search is performed at indexing time or disabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PrefixSearch {
+    IndexingTime,
+    Disabled,
+}
+
+/// Sort order for facet values in search results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FacetValuesSort {
+    Alpha,
+    Count,
+}
+
+impl SearchRequest {
+    pub fn query(mut self, q: impl Into<String>) -> Self {
+        self.q = Some(q.into());
+        self
+    }
+
+    pub fn offset(mut self, offset: u32) -> Self {
+        self.offset = Some(offset);
+        self
+    }
+
+    pub fn limit(mut self, limit: u32) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    pub fn attributes_to_retrieve(mut self, attrs: Vec<String>) -> Self {
+        self.attributes_to_retrieve = Some(attrs);
+        self
+    }
+
+    pub fn attributes_to_crop(mut self, attrs: Vec<String>) -> Self {
+        self.attributes_to_crop = Some(attrs);
+        self
+    }
+
+    pub fn attributes_to_highlight(mut self, attrs: Vec<String>) -> Self {
+        self.attributes_to_highlight = Some(attrs);
+        self
+    }
+
+    pub fn crop_length(mut self, len: u32) -> Self {
+        self.crop_length = Some(len);
+        self
+    }
+
+    pub fn crop_marker(mut self, marker: impl Into<String>) -> Self {
+        self.crop_marker = Some(marker.into());
+        self
+    }
+
+    pub fn filter(mut self, filter: Value) -> Self {
+        self.filter = Some(filter);
+        self
+    }
+
+    pub fn show_matches_position(mut self, show: bool) -> Self {
+        self.show_matches_position = Some(show);
+        self
+    }
+
+    pub fn facets(mut self, facets: Vec<String>) -> Self {
+        self.facets = Some(facets);
+        self
+    }
+
+    pub fn sort(mut self, sort: Vec<String>) -> Self {
+        self.sort = Some(sort);
+        self
+    }
+
+    pub fn highlight_pre_tag(mut self, tag: impl Into<String>) -> Self {
+        self.highlight_pre_tag = Some(tag.into());
+        self
+    }
+
+    pub fn highlight_post_tag(mut self, tag: impl Into<String>) -> Self {
+        self.highlight_post_tag = Some(tag.into());
+        self
+    }
+
+    pub fn matching_strategy(mut self, strategy: MatchingStrategy) -> Self {
+        self.matching_strategy = Some(strategy);
+        self
+    }
+
+    pub fn page(mut self, page: u32) -> Self {
+        self.page = Some(page);
+        self
+    }
+
+    pub fn hits_per_page(mut self, hits_per_page: u32) -> Self {
+        self.hits_per_page = Some(hits_per_page);
+        self
+    }
+
+    pub fn show_ranking_score(mut self, show: bool) -> Self {
+        self.show_ranking_score = Some(show);
+        self
+    }
+
+    pub fn show_ranking_score_details(mut self, show: bool) -> Self {
+        self.show_ranking_score_details = Some(show);
+        self
+    }
+
+    pub fn attributes_to_search_on(mut self, attrs: Vec<String>) -> Self {
+        self.attributes_to_search_on = Some(attrs);
+        self
+    }
+
+    pub fn retrieve_vectors(mut self, retrieve: bool) -> Self {
+        self.retrieve_vectors = Some(retrieve);
+        self
+    }
+
+    pub fn ranking_score_threshold(mut self, threshold: f64) -> Self {
+        self.ranking_score_threshold = Some(threshold);
+        self
+    }
+
+    pub fn distinct(mut self, distinct: impl Into<String>) -> Self {
+        self.distinct = Some(distinct.into());
+        self
+    }
+
+    pub fn locales(mut self, locales: Vec<String>) -> Self {
+        self.locales = Some(locales);
+        self
+    }
+
+    pub fn hybrid(mut self, hybrid: Value) -> Self {
+        self.hybrid = Some(hybrid);
+        self
+    }
+
+    pub fn vector(mut self, vector: Vec<f64>) -> Self {
+        self.vector = Some(vector);
+        self
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchResponse {
@@ -522,11 +678,11 @@ pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub non_separator_tokens: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub proximity_precision: Option<String>,
+    pub proximity_precision: Option<ProximityPrecision>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub facet_search: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefix_search: Option<String>,
+    pub prefix_search: Option<PrefixSearch>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search_cutoff_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -572,7 +728,7 @@ pub struct Faceting {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_values_per_facet: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sort_facet_values_by: Option<HashMap<String, String>>,
+    pub sort_facet_values_by: Option<HashMap<String, FacetValuesSort>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

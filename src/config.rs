@@ -255,6 +255,15 @@ impl From<VectorStoreConfig> for crate::core::vector::surrealdb::SurrealDbVector
 
 // ─── RAG config ──────────────────────────────────────────────────────────────
 
+/// Default search strategy for the RAG pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SearchType {
+    Keyword,
+    Semantic,
+    Hybrid,
+}
+
 /// RAG pipeline configuration.
 ///
 /// Flattens the `SearchType` enum to two scalar fields (`default_search_type`
@@ -274,9 +283,8 @@ pub struct RagConfig {
     /// Whether to include source snippets in the response. Default: true
     pub include_snippets: bool,
 
-    /// Default search type: `"keyword"`, `"semantic"`, or `"hybrid"`.
-    /// Default: `"hybrid"`
-    pub default_search_type: String,
+    /// Default search strategy. Default: `Hybrid`
+    pub default_search_type: SearchType,
 
     /// Semantic weight for hybrid search `[0.0, 1.0]`.
     /// Only used when `default_search_type = "hybrid"`.
@@ -291,7 +299,7 @@ impl Default for RagConfig {
             rerank_limit: 5,
             max_context_chars: 8000,
             include_snippets: true,
-            default_search_type: "hybrid".to_string(),
+            default_search_type: SearchType::Hybrid,
             semantic_ratio: 0.5,
         }
     }
@@ -301,19 +309,12 @@ impl TryFrom<RagConfig> for crate::core::rag::PipelineConfig {
     type Error = ConfigError;
 
     fn try_from(c: RagConfig) -> std::result::Result<Self, ConfigError> {
-        let search_type = match c.default_search_type.as_str() {
-            "keyword" => crate::core::rag::SearchType::Keyword,
-            "semantic" => crate::core::rag::SearchType::Semantic,
-            "hybrid" => crate::core::rag::SearchType::Hybrid {
+        let search_type = match c.default_search_type {
+            SearchType::Keyword => crate::core::rag::SearchType::Keyword,
+            SearchType::Semantic => crate::core::rag::SearchType::Semantic,
+            SearchType::Hybrid => crate::core::rag::SearchType::Hybrid {
                 semantic_ratio: c.semantic_ratio,
             },
-            other => {
-                return Err(ConfigError::Validation {
-                    field: "rag.default_search_type".to_string(),
-                    value: other.to_string(),
-                    message: "must be 'keyword', 'semantic', or 'hybrid'".to_string(),
-                });
-            }
         };
 
         Ok(Self {
@@ -515,13 +516,7 @@ impl WilysearchConfig {
             });
         }
 
-        if !["keyword", "semantic", "hybrid"].contains(&self.rag.default_search_type.as_str()) {
-            return Err(ConfigError::Validation {
-                field: "rag.default_search_type".to_string(),
-                value: self.rag.default_search_type.clone(),
-                message: "must be 'keyword', 'semantic', or 'hybrid'".to_string(),
-            });
-        }
+        // default_search_type is now an enum — invalid values are rejected at deserialization
 
         Ok(())
     }
@@ -602,7 +597,7 @@ mod tests {
         assert_eq!(config.engine.db_path, PathBuf::from("/var/lib/wilysearch"));
         assert_eq!(config.engine.max_index_size, 53687091200);
         assert_eq!(config.rag.retrieval_limit, 30);
-        assert_eq!(config.rag.default_search_type, "keyword");
+        assert_eq!(config.rag.default_search_type, SearchType::Keyword);
         assert!(!config.rag.include_snippets);
         assert!(config.experimental.metrics);
         assert!(config.experimental.contains_filter);
@@ -699,16 +694,18 @@ mod tests {
     }
 
     #[test]
-    fn test_validation_catches_invalid_search_type() {
-        let mut config = WilysearchConfig::default();
-        config.rag.default_search_type = "vector".to_string();
-        let err = config.validate().unwrap_err();
-        match err {
-            ConfigError::Validation { field, .. } => {
-                assert_eq!(field, "rag.default_search_type");
-            }
-            _ => panic!("expected Validation error"),
-        }
+    fn test_invalid_search_type_rejected_at_deserialization() {
+        let toml = r#"
+            [engine]
+            db_path = "/tmp/test"
+
+            [rag]
+            default_search_type = "vector"
+        "#;
+        let figment = Figment::from(Serialized::defaults(WilysearchConfig::default()))
+            .merge(Toml::string(toml));
+        let result: std::result::Result<WilysearchConfig, _> = figment.extract();
+        assert!(result.is_err(), "invalid search type should fail at deserialization");
     }
 
     #[test]
@@ -727,7 +724,7 @@ mod tests {
     #[test]
     fn test_rag_config_to_pipeline_config_hybrid() {
         let rc = RagConfig {
-            default_search_type: "hybrid".to_string(),
+            default_search_type: SearchType::Hybrid,
             semantic_ratio: 0.7,
             ..Default::default()
         };
@@ -744,7 +741,7 @@ mod tests {
     #[test]
     fn test_rag_config_to_pipeline_config_keyword() {
         let rc = RagConfig {
-            default_search_type: "keyword".to_string(),
+            default_search_type: SearchType::Keyword,
             ..Default::default()
         };
         let pc: crate::core::rag::PipelineConfig = rc.try_into().unwrap();
@@ -757,7 +754,7 @@ mod tests {
     #[test]
     fn test_rag_config_to_pipeline_config_semantic() {
         let rc = RagConfig {
-            default_search_type: "semantic".to_string(),
+            default_search_type: SearchType::Semantic,
             ..Default::default()
         };
         let pc: crate::core::rag::PipelineConfig = rc.try_into().unwrap();

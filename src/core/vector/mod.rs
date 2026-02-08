@@ -96,17 +96,26 @@ impl InMemoryVectorStore {
 
     /// Return a snapshot of all stored data for test inspection.
     pub fn snapshot(&self) -> HashMap<u32, Vec<Vec<f32>>> {
-        self.data.read().unwrap_or_else(|e| e.into_inner()).clone()
+        self.data.read().unwrap_or_else(|e| {
+            tracing::warn!("InMemoryVectorStore RwLock poisoned in snapshot, recovering");
+            e.into_inner()
+        }).clone()
     }
 
     /// Return the number of documents in the store.
     pub fn len(&self) -> usize {
-        self.data.read().unwrap_or_else(|e| e.into_inner()).len()
+        self.data.read().unwrap_or_else(|e| {
+            tracing::warn!("InMemoryVectorStore RwLock poisoned in len, recovering");
+            e.into_inner()
+        }).len()
     }
 
     /// Return true if the store is empty.
     pub fn is_empty(&self) -> bool {
-        self.data.read().unwrap_or_else(|e| e.into_inner()).is_empty()
+        self.data.read().unwrap_or_else(|e| {
+            tracing::warn!("InMemoryVectorStore RwLock poisoned in is_empty, recovering");
+            e.into_inner()
+        }).is_empty()
     }
 }
 
