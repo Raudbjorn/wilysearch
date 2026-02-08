@@ -95,27 +95,30 @@ impl InMemoryVectorStore {
     }
 
     /// Return a snapshot of all stored data for test inspection.
-    pub fn snapshot(&self) -> HashMap<u32, Vec<Vec<f32>>> {
-        self.data.read().unwrap_or_else(|e| {
-            tracing::warn!("InMemoryVectorStore RwLock poisoned in snapshot, recovering");
-            e.into_inner()
-        }).clone()
+    pub fn snapshot(&self) -> Result<HashMap<u32, Vec<Vec<f32>>>> {
+        let data = self
+            .data
+            .read()
+            .map_err(|e| Error::VectorStore(format!("read lock poisoned: {e}")))?;
+        Ok(data.clone())
     }
 
     /// Return the number of documents in the store.
-    pub fn len(&self) -> usize {
-        self.data.read().unwrap_or_else(|e| {
-            tracing::warn!("InMemoryVectorStore RwLock poisoned in len, recovering");
-            e.into_inner()
-        }).len()
+    pub fn len(&self) -> Result<usize> {
+        let data = self
+            .data
+            .read()
+            .map_err(|e| Error::VectorStore(format!("read lock poisoned: {e}")))?;
+        Ok(data.len())
     }
 
     /// Return true if the store is empty.
-    pub fn is_empty(&self) -> bool {
-        self.data.read().unwrap_or_else(|e| {
-            tracing::warn!("InMemoryVectorStore RwLock poisoned in is_empty, recovering");
-            e.into_inner()
-        }).is_empty()
+    pub fn is_empty(&self) -> Result<bool> {
+        let data = self
+            .data
+            .read()
+            .map_err(|e| Error::VectorStore(format!("read lock poisoned: {e}")))?;
+        Ok(data.is_empty())
     }
 }
 
@@ -141,9 +144,6 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if denom == 0.0 { 0.0 } else { dot / denom }
 }
 
-// VectorStore trait methods propagate lock-poison errors via Error::VectorStore,
-// while the non-trait helper methods (snapshot, len, is_empty) use the recovery
-// pattern (unwrap_or_else + into_inner) since they are infallible accessors.
 impl VectorStore for InMemoryVectorStore {
     fn add_documents(&self, documents: &[(u32, Vec<Vec<f32>>)]) -> Result<()> {
         let mut data = self

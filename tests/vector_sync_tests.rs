@@ -47,7 +47,7 @@ fn test_add_documents_with_vectors_syncs_to_store() {
 
     index.add_documents(docs, None).unwrap();
 
-    let snapshot = store.snapshot();
+    let snapshot = store.snapshot().unwrap();
     assert_eq!(snapshot.len(), 2, "store should have 2 documents");
 
     // Internal IDs are assigned by milli; verify both have vectors
@@ -66,7 +66,7 @@ fn test_add_documents_without_vectors_leaves_store_empty() {
     ];
 
     index.add_documents(docs, None).unwrap();
-    assert!(store.is_empty(), "store should be empty when no _vectors");
+    assert!(store.is_empty().unwrap(), "store should be empty when no _vectors");
 }
 
 #[test]
@@ -80,7 +80,7 @@ fn test_update_documents_with_vectors_syncs_to_store() {
         json!({"id": 2, "title": "Inception"}),
     ];
     index.add_documents(docs, None).unwrap();
-    assert!(store.is_empty());
+    assert!(store.is_empty().unwrap());
 
     // Update with vectors
     let updates = vec![json!({
@@ -93,7 +93,7 @@ fn test_update_documents_with_vectors_syncs_to_store() {
 
     index.update_documents(updates, None).unwrap();
 
-    let snapshot = store.snapshot();
+    let snapshot = store.snapshot().unwrap();
     assert_eq!(snapshot.len(), 1, "only doc 1 should have vectors");
 }
 
@@ -121,12 +121,12 @@ fn test_delete_documents_removes_from_store() {
     ];
 
     index.add_documents(docs, None).unwrap();
-    assert_eq!(store.len(), 3);
+    assert_eq!(store.len().unwrap(), 3);
 
     // Delete doc 2
     let deleted = index.delete_documents(vec!["2".to_string()]).unwrap();
     assert_eq!(deleted, 1);
-    assert_eq!(store.len(), 2, "store should have 2 docs after deleting 1");
+    assert_eq!(store.len().unwrap(), 2, "store should have 2 docs after deleting 1");
 }
 
 #[test]
@@ -157,7 +157,7 @@ fn test_delete_by_filter_removes_from_store() {
     ];
 
     index.add_documents(docs, None).unwrap();
-    assert_eq!(store.len(), 3);
+    assert_eq!(store.len().unwrap(), 3);
 
     // Configure filterable attributes
     let settings = wilysearch::core::Settings {
@@ -169,7 +169,7 @@ fn test_delete_by_filter_removes_from_store() {
     // Delete all movies before 2010
     let deleted = index.delete_by_filter("year < 2010").unwrap();
     assert_eq!(deleted, 1); // The Dark Knight (2008)
-    assert_eq!(store.len(), 2, "store should have 2 docs after filter delete");
+    assert_eq!(store.len().unwrap(), 2, "store should have 2 docs after filter delete");
 }
 
 #[test]
@@ -191,11 +191,11 @@ fn test_clear_empties_store() {
     ];
 
     index.add_documents(docs, None).unwrap();
-    assert_eq!(store.len(), 2);
+    assert_eq!(store.len().unwrap(), 2);
 
     let cleared = index.clear().unwrap();
     assert_eq!(cleared, 2);
-    assert!(store.is_empty(), "store should be empty after clear");
+    assert!(store.is_empty().unwrap(), "store should be empty after clear");
 }
 
 #[test]
@@ -213,7 +213,7 @@ fn test_multi_vector_format() {
 
     index.add_documents(docs, None).unwrap();
 
-    let snapshot = store.snapshot();
+    let snapshot = store.snapshot().unwrap();
     assert_eq!(snapshot.len(), 1);
     // The document should have 2 vectors
     let vecs = snapshot.values().next().unwrap();
@@ -238,7 +238,7 @@ fn test_structured_vectors_format() {
 
     index.add_documents(docs, None).unwrap();
 
-    let snapshot = store.snapshot();
+    let snapshot = store.snapshot().unwrap();
     assert_eq!(snapshot.len(), 1);
     let vecs = snapshot.values().next().unwrap();
     assert_eq!(vecs.len(), 2, "structured format should produce 2 vectors");
@@ -260,7 +260,7 @@ fn test_multiple_embedders() {
 
     index.add_documents(docs, None).unwrap();
 
-    let snapshot = store.snapshot();
+    let snapshot = store.snapshot().unwrap();
     assert_eq!(snapshot.len(), 1);
     // Should have 2 vectors (one from each embedder)
     let vecs = snapshot.values().next().unwrap();
@@ -287,6 +287,6 @@ fn test_string_primary_key_with_vectors() {
 
     index.add_documents(docs, None).unwrap();
 
-    let snapshot = store.snapshot();
+    let snapshot = store.snapshot().unwrap();
     assert_eq!(snapshot.len(), 2, "string PKs should work for vector sync");
 }

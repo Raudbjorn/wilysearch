@@ -46,15 +46,12 @@ pub struct Engine {
     /// corrupt the output archive. Wire into `create_dump`/`create_snapshot`
     /// once those methods perform real I/O.
     dump_lock: std::sync::Mutex<()>,
-    /// Holds the RAG/preprocessing configuration loaded at startup.
+    /// RAG/preprocessing configuration loaded at startup.
     ///
-    /// Currently unused because three pieces of wiring are still missing:
-    ///   1. Apply search defaults (limit, matching strategy) in `convert_search_request`.
-    ///   2. Initialize the preprocessing pipeline (SymSpell / synonyms) from this config.
-    ///   3. Build the RAG pipeline (embedder + retriever + reranker) on demand
-    ///      when a search request includes retrieval parameters.
-    ///
-    /// Once those are in place, remove the `dead_code` allow.
+    /// Not yet wired into the search path. See TODOs below.
+    // TODO: apply search defaults (limit, matching strategy) from rag_config in convert_search_request
+    // TODO: initialize preprocessing pipeline (SymSpell/synonyms) from rag_config at Engine construction
+    // TODO: build RAG pipeline (embedder + retriever + reranker) on demand for retrieval search requests
     #[allow(dead_code)]
     rag_config: crate::config::RagConfig,
 }
