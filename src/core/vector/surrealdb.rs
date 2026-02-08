@@ -32,7 +32,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Context;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use surrealdb::engine::any::{connect, Any};
@@ -40,6 +40,7 @@ use surrealdb::Surreal;
 use tokio::runtime::Runtime;
 
 use super::VectorStore;
+use crate::core::error::{Error as CoreError, Result as CoreResult};
 
 /// Configuration for a SurrealDB vector store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,7 +147,7 @@ pub struct SurrealDbVectorStore {
 /// Validate that a SurrealDB identifier (table, namespace, database) contains
 /// only alphanumeric characters and underscores. This prevents query injection
 /// via format!-interpolated identifiers in SurrealQL strings.
-fn validate_identifier(name: &str, label: &str) -> Result<()> {
+fn validate_identifier(name: &str, label: &str) -> anyhow::Result<()> {
     if name.is_empty() {
         anyhow::bail!("{label} must not be empty");
     }
@@ -160,14 +161,25 @@ fn validate_identifier(name: &str, label: &str) -> Result<()> {
 }
 
 impl SurrealDbVectorStore {
-    /// Create a new SurrealDB vector store.
+    /// Create a new SurrealDB vector store with an internal runtime.
     ///
     /// This will:
     /// 1. Validate identifier names (table, namespace, database)
     /// 2. Connect to the SurrealDB instance
     /// 3. Select the namespace and database
     /// 4. Create/verify the table schema and HNSW index
-    pub async fn new(config: SurrealDbVectorStoreConfig) -> Result<Self> {
+    ///
+    /// Internally creates a `current_thread` tokio runtime for bridging the
+    /// sync [`VectorStore`] trait methods to async SurrealDB calls. When the
+    /// sync trait methods are called from outside any tokio runtime,
+    /// [`block_on`](Self::block_on) uses this internal runtime directly. When
+    /// called from within an existing **multi-thread** runtime, `block_on`
+    /// uses `block_in_place` together with the internal runtime. Calling from
+    /// a `current_thread` runtime returns an error.
+    ///
+    /// If you already have a multi-thread tokio runtime, prefer
+    /// [`with_runtime`](Self::with_runtime) to share it instead.
+    pub async fn new(config: SurrealDbVectorStoreConfig) -> anyhow::Result<Self> {
         validate_identifier(&config.table, "table")?;
         validate_identifier(&config.namespace, "namespace")?;
         validate_identifier(&config.database, "database")?;
@@ -211,11 +223,18 @@ impl SurrealDbVectorStore {
 
     /// Create a new SurrealDB vector store with a shared runtime.
     ///
-    /// Use this when you already have a tokio runtime and want to share it.
+    /// Use this instead of [`new`](Self::new) when you already have a
+    /// multi-thread tokio runtime and want the sync [`VectorStore`] trait
+    /// methods to reuse it for `block_in_place` calls. This avoids creating
+    /// a redundant internal runtime and keeps all async work on one executor.
+    ///
+    /// The supplied runtime **must** be a multi-thread runtime; passing a
+    /// `current_thread` runtime will cause [`block_on`](Self::block_on) to
+    /// return an error when invoked from within that runtime.
     pub async fn with_runtime(
         config: SurrealDbVectorStoreConfig,
         runtime: Arc<Runtime>,
-    ) -> Result<Self> {
+    ) -> anyhow::Result<Self> {
         validate_identifier(&config.table, "table")?;
         validate_identifier(&config.namespace, "namespace")?;
         validate_identifier(&config.database, "database")?;
@@ -250,7 +269,7 @@ impl SurrealDbVectorStore {
     }
 
     /// Initialize the database schema.
-    async fn init_schema(&self) -> Result<()> {
+    async fn init_schema(&self) -> anyhow::Result<()> {
         let table = &self.config.table;
         let dimensions = self.config.dimensions;
         let hnsw_m = self.config.hnsw_m;
@@ -282,7 +301,7 @@ impl SurrealDbVectorStore {
             .await
             .context("Failed to define schema")?;
 
-        let errors: Vec<_> = response.take_errors().collect();
+        let errors: Vec<_> = response.take_errors().into_iter().collect();
         if !errors.is_empty() {
             let messages: Vec<String> = errors
                 .into_iter()
@@ -294,20 +313,17 @@ impl SurrealDbVectorStore {
         Ok(())
     }
 
-    /// Add documents with their vectors asynchronously.
-    ///
-    /// For each document, this first deletes any existing vector records for that
-    /// `doc_id`, then inserts the new vectors. This prevents stale records when a
-    /// document is re-indexed with fewer vectors than before.
-    /// Add or replace document vectors in the store.
+    /// Shared async implementation for upserting document vectors.
     ///
     /// Uses one SurrealDB transaction per document for fault isolation: if one
     /// document fails, others already committed are preserved. For bulk inserts
     /// this has higher overhead than a single transaction, but avoids all-or-nothing
     /// rollback semantics which would be surprising for partial batch failures.
-    pub async fn add_documents_async(&self, documents: &[(u32, Vec<Vec<f32>>)]) -> Result<()> {
-        let table = &self.config.table;
-
+    async fn upsert_documents_inner(
+        db: &Surreal<Any>,
+        table: &str,
+        documents: &[(u32, Vec<Vec<f32>>)],
+    ) -> anyhow::Result<()> {
         for (doc_id, vectors) in documents {
             let mut transaction_query = String::from("BEGIN TRANSACTION;\n");
 
@@ -329,7 +345,7 @@ impl SurrealDbVectorStore {
 
             transaction_query.push_str("COMMIT TRANSACTION;\n");
 
-            let mut query = self.db.query(&transaction_query).bind(("doc_id", *doc_id));
+            let mut query = db.query(&transaction_query).bind(("doc_id", *doc_id));
             for (vec_idx, vector) in vectors.iter().enumerate() {
                 query = query.bind((format!("embedding_{vec_idx}"), vector.clone()));
             }
@@ -340,8 +356,17 @@ impl SurrealDbVectorStore {
         Ok(())
     }
 
+    /// Add documents with their vectors asynchronously.
+    ///
+    /// For each document, this first deletes any existing vector records for that
+    /// `doc_id`, then inserts the new vectors. This prevents stale records when a
+    /// document is re-indexed with fewer vectors than before.
+    pub async fn add_documents_async(&self, documents: &[(u32, Vec<Vec<f32>>)]) -> anyhow::Result<()> {
+        Self::upsert_documents_inner(&self.db, &self.config.table, documents).await
+    }
+
     /// Remove documents by their IDs asynchronously.
-    pub async fn remove_documents_async(&self, ids: &[u32]) -> Result<()> {
+    pub async fn remove_documents_async(&self, ids: &[u32]) -> anyhow::Result<()> {
         if ids.is_empty() {
             return Ok(());
         }
@@ -370,7 +395,7 @@ impl SurrealDbVectorStore {
         vector: &[f32],
         limit: usize,
         filter: Option<&RoaringBitmap>,
-    ) -> Result<Vec<(u32, f32)>> {
+    ) -> anyhow::Result<Vec<(u32, f32)>> {
         let table = &self.config.table;
 
         // Convert bitmap once, reuse for both query building and binding
@@ -434,7 +459,7 @@ impl SurrealDbVectorStore {
     }
 
     /// Get the configured dimensions.
-    pub fn dimensions_async(&self) -> Result<Option<usize>> {
+    pub fn dimensions_async(&self) -> anyhow::Result<Option<usize>> {
         Ok(Some(self.config.dimensions))
     }
 
@@ -460,7 +485,7 @@ impl SurrealDbVectorStore {
         vector: &[f32],
         limit: usize,
         k_constant: usize,
-    ) -> Result<Vec<(u32, f32)>> {
+    ) -> anyhow::Result<Vec<(u32, f32)>> {
         let table = &self.config.table;
         let k = k_constant;
 
@@ -521,7 +546,7 @@ impl SurrealDbVectorStore {
     /// Add a full-text search index on the text_content field.
     ///
     /// Call this before using hybrid_search if you want full-text capabilities.
-    pub async fn enable_full_text_search(&self) -> Result<()> {
+    pub async fn enable_full_text_search(&self) -> anyhow::Result<()> {
         let table = &self.config.table;
 
         let query = format!(
@@ -544,7 +569,7 @@ impl SurrealDbVectorStore {
     }
 
     /// Update a document's text content for hybrid search.
-    pub async fn set_text_content(&self, doc_id: u32, text: &str) -> Result<()> {
+    pub async fn set_text_content(&self, doc_id: u32, text: &str) -> anyhow::Result<()> {
         let table = &self.config.table;
 
         let query = format!(
@@ -563,25 +588,31 @@ impl SurrealDbVectorStore {
         Ok(())
     }
 
-    /// Run an async block, handling both sync and async calling contexts.
+    /// Run an async future that returns `anyhow::Result<T>`, bridging sync
+    /// and async calling contexts.
     ///
-    /// When called from within a multi-thread tokio runtime, uses `block_in_place`
-    /// to avoid nesting runtimes. When called from outside a runtime, blocks directly.
+    /// When called from within a multi-thread tokio runtime, uses
+    /// `block_in_place` to avoid nesting runtimes. When called from outside
+    /// any runtime, blocks directly on the internal runtime.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if called from within a `current_thread` tokio runtime, because
-    /// `block_in_place` is not supported there. If you need to use `Engine` with
-    /// SurrealDB from async code, use a multi-thread runtime or wrap calls in
-    /// `tokio::task::spawn_blocking`.
-    fn block_on<F: std::future::Future>(&self, f: F) -> F::Output {
+    /// Returns an error if called from within a `current_thread` tokio
+    /// runtime, because `block_in_place` is not supported there. If you need
+    /// to use `Engine` with SurrealDB from async code, use a multi-thread
+    /// runtime or wrap calls in `tokio::task::spawn_blocking`.
+    fn block_on<T>(
+        &self,
+        f: impl std::future::Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                assert!(
-                    handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread,
-                    "SurrealDbVectorStore cannot be called from a current_thread tokio runtime. \
-                     Use a multi_thread runtime or wrap calls in spawn_blocking."
-                );
+                if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+                    return Err(anyhow::anyhow!(
+                        "SurrealDbVectorStore cannot be called from a current_thread tokio \
+                         runtime. Use a multi_thread runtime or wrap calls in spawn_blocking."
+                    ));
+                }
                 tokio::task::block_in_place(|| self.runtime.block_on(f))
             }
             Err(_) => self.runtime.block_on(f),
@@ -589,7 +620,7 @@ impl SurrealDbVectorStore {
     }
 
     /// Remove all vectors from the store.
-    pub async fn clear_async(&self) -> Result<()> {
+    pub async fn clear_async(&self) -> anyhow::Result<()> {
         let table = &self.config.table;
         let query = format!("DELETE FROM {table};");
         self.db
@@ -600,7 +631,7 @@ impl SurrealDbVectorStore {
     }
 
     /// Get statistics about the vector store.
-    pub async fn stats(&self) -> Result<VectorStoreStats> {
+    pub async fn stats(&self) -> anyhow::Result<VectorStoreStats> {
         let table = &self.config.table;
 
         let query = format!(
@@ -645,48 +676,28 @@ pub struct VectorStoreStats {
     pub dimensions: usize,
 }
 
-// Implement the sync VectorStore trait by wrapping async calls
+/// Convert an `anyhow::Error` into a [`CoreError::VectorStore`] at the trait boundary.
+fn to_core_error(e: anyhow::Error) -> CoreError {
+    CoreError::VectorStore(e.to_string())
+}
+
+// Implement the sync VectorStore trait by wrapping async calls.
+//
+// Internal helpers return `anyhow::Result`; trait methods convert at the
+// boundary via `to_core_error`.
 impl VectorStore for SurrealDbVectorStore {
-    fn add_documents(&self, documents: &[(u32, Vec<Vec<f32>>)]) -> Result<()> {
-        // Clone data for the async block
+    fn add_documents(&self, documents: &[(u32, Vec<Vec<f32>>)]) -> CoreResult<()> {
         let documents = documents.to_vec();
         let db = Arc::clone(&self.db);
         let table = self.config.table.clone();
 
         self.block_on(async move {
-            for (doc_id, vectors) in &documents {
-                let mut transaction_query = String::from("BEGIN TRANSACTION;\n");
-
-                transaction_query.push_str(&format!(
-                    "DELETE FROM {table} WHERE doc_id = $doc_id;\n"
-                ));
-
-                for (vec_idx, _vector) in vectors.iter().enumerate() {
-                    let record_id = if vectors.len() == 1 {
-                        format!("{}", doc_id)
-                    } else {
-                        format!("{}_{}", doc_id, vec_idx)
-                    };
-
-                    transaction_query.push_str(&format!(
-                        "CREATE {table}:`{record_id}` CONTENT {{ doc_id: $doc_id, embedding: $embedding_{vec_idx} }};\n"
-                    ));
-                }
-
-                transaction_query.push_str("COMMIT TRANSACTION;\n");
-
-                let mut query = db.query(&transaction_query).bind(("doc_id", *doc_id));
-                for (vec_idx, vector) in vectors.iter().enumerate() {
-                    query = query.bind((format!("embedding_{vec_idx}"), vector.clone()));
-                }
-                query.await
-                    .with_context(|| format!("Failed to upsert vectors for document {}", doc_id))?;
-            }
-            Ok(())
+            Self::upsert_documents_inner(&db, &table, &documents).await
         })
+        .map_err(to_core_error)
     }
 
-    fn remove_documents(&self, ids: &[u32]) -> Result<()> {
+    fn remove_documents(&self, ids: &[u32]) -> CoreResult<()> {
         if ids.is_empty() {
             return Ok(());
         }
@@ -709,6 +720,7 @@ impl VectorStore for SurrealDbVectorStore {
 
             Ok(())
         })
+        .map_err(to_core_error)
     }
 
     fn search(
@@ -716,7 +728,7 @@ impl VectorStore for SurrealDbVectorStore {
         vector: &[f32],
         limit: usize,
         filter: Option<&RoaringBitmap>,
-    ) -> Result<Vec<(u32, f32)>> {
+    ) -> CoreResult<Vec<(u32, f32)>> {
         let vector = vector.to_vec();
         let filter_ids: Option<Vec<u32>> = filter.map(|b| b.iter().collect());
         let db = Arc::clone(&self.db);
@@ -776,13 +788,14 @@ impl VectorStore for SurrealDbVectorStore {
 
             Ok(deduplicated)
         })
+        .map_err(to_core_error)
     }
 
-    fn dimensions(&self) -> Result<Option<usize>> {
+    fn dimensions(&self) -> CoreResult<Option<usize>> {
         Ok(Some(self.config.dimensions))
     }
 
-    fn clear(&self) -> Result<()> {
+    fn clear(&self) -> CoreResult<()> {
         let db = Arc::clone(&self.db);
         let table = self.config.table.clone();
 
@@ -793,6 +806,7 @@ impl VectorStore for SurrealDbVectorStore {
                 .context("Failed to clear vector store")?;
             Ok(())
         })
+        .map_err(to_core_error)
     }
 }
 

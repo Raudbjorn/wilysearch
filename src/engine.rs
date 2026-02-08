@@ -4,6 +4,15 @@
 //! `crate::traits` by delegating directly to the milli search engine.
 //! Operations execute synchronously -- no task queue. Mutation methods
 //! return a synthetic `TaskInfo` with status `Succeeded`.
+//!
+//! # Module size
+//!
+//! This file is intentionally kept as a single module (~1,700 lines) rather
+//! than split into `engine/mod.rs` + `engine/settings.rs` + etc. The settings
+//! trait implementation (~500 lines) is repetitive boilerplate that could be
+//! macro-generated, but the 1:1 correspondence with trait methods makes the
+//! current form easy to navigate and grep. Future work may introduce a macro
+//! to reduce the per-setting boilerplate.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -153,6 +162,10 @@ impl Engine {
 
     fn next_task(&self, task_type: &str, index_uid: Option<&str>) -> TaskInfo {
         let uid = self.task_counter.fetch_add(1, Ordering::Relaxed);
+        // Non-atomic write: a crash mid-write could truncate this file, causing
+        // counter reuse after restart. This is acceptable because task UIDs are
+        // ephemeral in embedded mode (no persistent task queue) and collisions
+        // only affect synthetic TaskInfo.task_uid values.
         if let Err(e) = std::fs::write(&self.task_counter_path, (uid + 1).to_string()) {
             tracing::warn!(error = %e, "failed to persist task counter");
         }
@@ -184,6 +197,20 @@ use crate::core::now_iso8601;
 /// truncating via `as u32`.
 fn saturating_u32(v: usize) -> u32 {
     u32::try_from(v).unwrap_or(u32::MAX)
+}
+
+/// Infallible cast from `usize` to `u64`.
+/// On platforms where `usize` is 64-bit this is a no-op; on 32-bit platforms
+/// the value always fits. Included for consistency with `saturating_u32`.
+fn usize_to_u64(v: usize) -> u64 {
+    u64::try_from(v).unwrap_or(u64::MAX)
+}
+
+/// Saturating cast from `u128` to `u64`.
+/// Returns `u64::MAX` when the value exceeds `u64::MAX` (e.g. processing
+/// times that overflow 64 bits -- astronomically unlikely but handled safely).
+fn saturating_u128_to_u64(v: u128) -> u64 {
+    u64::try_from(v).unwrap_or(u64::MAX)
 }
 
 fn convert_search_request(req: &SearchRequest) -> crate::core::SearchQuery {
@@ -268,6 +295,12 @@ fn convert_search_request(req: &SearchRequest) -> crate::core::SearchQuery {
     if let Some(ref vec) = req.vector {
         q = q.with_vector(vec.iter().map(|&x| x as f32).collect());
     }
+    if req.hybrid.is_some() {
+        tracing::warn!(
+            "SearchRequest.hybrid is set but not yet wired through to the core search engine; \
+             hybrid search requires the RAG pipeline or direct vector API"
+        );
+    }
     q
 }
 
@@ -281,7 +314,7 @@ fn convert_search_result(r: &crate::core::SearchResult) -> Result<SearchResponse
             } => (
                 Some(saturating_u32(*offset)),
                 Some(saturating_u32(*limit)),
-                Some(*estimated_total_hits as u64),
+                Some(usize_to_u64(*estimated_total_hits)),
                 None,
                 None,
                 None,
@@ -296,7 +329,7 @@ fn convert_search_result(r: &crate::core::SearchResult) -> Result<SearchResponse
                 None,
                 None,
                 None,
-                Some(*total_hits as u64),
+                Some(usize_to_u64(*total_hits)),
                 Some(saturating_u32(*total_pages)),
                 Some(saturating_u32(*page)),
                 Some(saturating_u32(*hits_per_page)),
@@ -325,7 +358,7 @@ fn convert_search_result(r: &crate::core::SearchResult) -> Result<SearchResponse
         hits_per_page,
         facet_distribution,
         facet_stats,
-        processing_time_ms: r.processing_time_ms as u64,
+        processing_time_ms: saturating_u128_to_u64(r.processing_time_ms),
         query: r.query.clone(),
     })
 }
@@ -359,7 +392,7 @@ fn convert_federated_result(r: &crate::core::search::FederatedSearchResult) -> R
             } => (
                 Some(saturating_u32(*offset)),
                 Some(saturating_u32(*limit)),
-                Some(*estimated_total_hits as u64),
+                Some(usize_to_u64(*estimated_total_hits)),
                 None,
                 None,
                 None,
@@ -374,7 +407,7 @@ fn convert_federated_result(r: &crate::core::search::FederatedSearchResult) -> R
                 None,
                 None,
                 None,
-                Some(*total_hits as u64),
+                Some(usize_to_u64(*total_hits)),
                 Some(saturating_u32(*total_pages)),
                 Some(saturating_u32(*page)),
                 Some(saturating_u32(*hits_per_page)),
@@ -400,7 +433,7 @@ fn convert_federated_result(r: &crate::core::search::FederatedSearchResult) -> R
 
     Ok(FederatedSearchResponse {
         hits: r.hits.iter().map(convert_hit).collect::<Result<Vec<_>>>()?,
-        processing_time_ms: r.processing_time_ms as u64,
+        processing_time_ms: saturating_u128_to_u64(r.processing_time_ms),
         offset,
         limit,
         estimated_total_hits,
@@ -549,7 +582,14 @@ fn parse_embedder_source(s: &str) -> crate::core::EmbedderSource {
         "userprovided" | "userProvided" => crate::core::EmbedderSource::UserProvided,
         "rest" => crate::core::EmbedderSource::Rest,
         "composite" => crate::core::EmbedderSource::Composite,
-        _ => crate::core::EmbedderSource::default(),
+        _ => {
+            tracing::warn!(
+                source = s,
+                "unknown embedder source '{}', falling back to default",
+                s
+            );
+            crate::core::EmbedderSource::default()
+        }
     }
 }
 
@@ -592,10 +632,10 @@ fn convert_settings_from_lib(s: &crate::core::Settings) -> Settings {
             disable_on_numbers: t.disable_on_numbers,
         }),
         pagination: s.pagination.as_ref().map(|p| Pagination {
-            max_total_hits: p.max_total_hits.map(|v| v as u64),
+            max_total_hits: p.max_total_hits.map(usize_to_u64),
         }),
         faceting: s.faceting.as_ref().map(|f| Faceting {
-            max_values_per_facet: f.max_values_per_facet.map(|v| v as u64),
+            max_values_per_facet: f.max_values_per_facet.map(usize_to_u64),
             sort_facet_values_by: f.sort_facet_values_by.as_ref().map(|m| {
                 m.iter()
                     .map(|(k, v)| {
@@ -833,7 +873,7 @@ impl traits::Search for Engine {
                 .attributes_to_retrieve
                 .as_ref()
                 .map(|a| a.iter().cloned().collect()),
-            retrieve_vectors: false,
+            retrieve_vectors: request.retrieve_vectors.unwrap_or(false),
             show_ranking_score: request.show_ranking_score.unwrap_or(false),
             show_ranking_score_details: request.show_ranking_score_details.unwrap_or(false),
             ranking_score_threshold: request.ranking_score_threshold,
@@ -845,9 +885,9 @@ impl traits::Search for Engine {
                 offset,
                 limit,
                 estimated_total_hits,
-            } => (saturating_u32(*offset), saturating_u32(*limit), *estimated_total_hits as u64),
+            } => (saturating_u32(*offset), saturating_u32(*limit), usize_to_u64(*estimated_total_hits)),
             crate::core::search::HitsInfo::Pagination { total_hits, .. } => {
-                (0, 20, *total_hits as u64)
+                (0, 20, usize_to_u64(*total_hits))
             }
         };
 
@@ -856,7 +896,7 @@ impl traits::Search for Engine {
             offset,
             limit,
             estimated_total_hits: estimated,
-            processing_time_ms: result.processing_time_ms as u64,
+            processing_time_ms: saturating_u128_to_u64(result.processing_time_ms),
             id: Value::String(result.id),
         })
     }
@@ -930,7 +970,7 @@ impl traits::Search for Engine {
                 })
                 .collect(),
             facet_query: result.facet_query,
-            processing_time_ms: result.processing_time_ms as u64,
+            processing_time_ms: saturating_u128_to_u64(result.processing_time_ms),
         })
     }
 }
@@ -955,7 +995,7 @@ impl traits::Indexes for Engine {
             results,
             offset: saturating_u32(offset),
             limit: saturating_u32(limit),
-            total: total as u64,
+            total: usize_to_u64(total),
         })
     }
 
@@ -1252,7 +1292,7 @@ impl traits::SettingsApi for Engine {
         Ok(idx
             .get_pagination()?
             .map(|p| Pagination {
-                max_total_hits: p.max_total_hits.map(|v| v as u64),
+                max_total_hits: p.max_total_hits.map(usize_to_u64),
             })
             .unwrap_or_default())
     }
@@ -1274,7 +1314,7 @@ impl traits::SettingsApi for Engine {
         Ok(idx
             .get_faceting()?
             .map(|f| Faceting {
-                max_values_per_facet: f.max_values_per_facet.map(|v| v as u64),
+                max_values_per_facet: f.max_values_per_facet.map(usize_to_u64),
                 sort_facet_values_by: f.sort_facet_values_by.map(|m| {
                     m.into_iter()
                         .map(|(k, v)| {
@@ -1662,8 +1702,9 @@ impl traits::System for Engine {
             ))
         })?;
 
-        // Reject paths that contain `..` components after canonicalization
-        // (shouldn't happen, but defense-in-depth).
+        // Belt-and-suspenders: canonicalize() resolves symlinks and removes
+        // `..` components, so this check should never trigger. Kept as
+        // defense-in-depth against hypothetical platform edge cases.
         if export_path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
             return Err(crate::core::error::Error::Internal(
                 "Export path must not contain '..' components".to_string(),

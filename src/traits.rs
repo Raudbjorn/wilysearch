@@ -205,6 +205,14 @@ pub trait SettingsApi {
     // Default implementations delegate to get_settings / update_settings /
     // reset_settings so that alternative backends only need to implement
     // the three core methods above.
+    //
+    // **Performance note:** These defaults perform a full settings roundtrip
+    // (serialize all settings, update, deserialize) for each sub-setting
+    // operation. The `Engine` implementation overrides every method with
+    // direct per-setting calls for O(1) performance. Alternative backends
+    // using the defaults will have O(N) overhead proportional to the total
+    // number of settings per operation. Override individual methods if this
+    // becomes a bottleneck.
 
     fn get_ranking_rules(&self, index_uid: &str) -> Result<Vec<String>> {
         Ok(self.get_settings(index_uid)?.ranking_rules.unwrap_or_default())

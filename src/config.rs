@@ -77,8 +77,20 @@ pub struct WilysearchConfig {
     pub preprocessing: PreprocessingConfig,
 
     /// SurrealDB vector store configuration.
-    /// Only used when the `surrealdb` feature is enabled.
-    /// `None` means no vector store is configured.
+    ///
+    /// Only present when the `surrealdb` feature is enabled. `None` means
+    /// no vector store is configured.
+    ///
+    /// # Semver note
+    ///
+    /// This field is `#[cfg]`-gated, so the struct's serialized form differs
+    /// between `default` and `surrealdb` feature sets. TOML/JSON configs
+    /// written with the `surrealdb` feature enabled will contain a
+    /// `vector_store` key that is silently ignored (not rejected) when
+    /// deserialized without the feature, thanks to `#[serde(default)]` on
+    /// the parent struct. However, **Rust code** that names this field will
+    /// fail to compile without the feature. Consumers sharing configs across
+    /// feature boundaries should be aware of this asymmetry.
     #[cfg(feature = "surrealdb")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_store: Option<VectorStoreConfig>,

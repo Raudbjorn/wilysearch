@@ -232,7 +232,9 @@ wilysearch pins against **Meilisearch v1.35.0** for its core crates:
 | **Error Handling** | `thiserror`, `anyhow`, `log`, `tracing` |
 | **Optional** | `surrealdb`, `tokio` (behind `surrealdb` feature) |
 
-> **Note:** `candle-core` is pinned to `=0.9.1` because 0.9.2 pulls in `zip 7.x` -> `typed-path 0.12`, which introduces an ambiguous `AsRef` impl that breaks milli's compilation. This matches upstream's Cargo.lock for Meilisearch v1.35.0.
+> **Note:** `candle-core`, `candle-nn`, and `candle-transformers` are pinned to exact version `=0.9.1` because 0.9.2 pulls in `zip 7.x` -> `typed-path 0.12`, which introduces an ambiguous `AsRef` impl that breaks milli's compilation. This matches upstream's Cargo.lock for Meilisearch v1.35.0.
+>
+> **Important for downstream consumers:** Exact version pins (`=0.9.1`) are viral — any crate in your dependency tree that also depends on candle must use the exact same version, or Cargo will refuse to resolve. If you need a different candle version, you cannot use wilysearch in the same workspace without patching.
 
 ## Testing
 

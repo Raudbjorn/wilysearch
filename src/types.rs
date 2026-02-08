@@ -317,131 +317,157 @@ pub enum FacetValuesSort {
 }
 
 impl SearchRequest {
+    #[must_use]
     pub fn query(mut self, q: impl Into<String>) -> Self {
         self.q = Some(q.into());
         self
     }
 
+    #[must_use]
     pub fn offset(mut self, offset: u32) -> Self {
         self.offset = Some(offset);
         self
     }
 
+    #[must_use]
     pub fn limit(mut self, limit: u32) -> Self {
         self.limit = Some(limit);
         self
     }
 
+    #[must_use]
     pub fn attributes_to_retrieve(mut self, attrs: Vec<String>) -> Self {
         self.attributes_to_retrieve = Some(attrs);
         self
     }
 
+    #[must_use]
     pub fn attributes_to_crop(mut self, attrs: Vec<String>) -> Self {
         self.attributes_to_crop = Some(attrs);
         self
     }
 
+    #[must_use]
     pub fn attributes_to_highlight(mut self, attrs: Vec<String>) -> Self {
         self.attributes_to_highlight = Some(attrs);
         self
     }
 
+    #[must_use]
     pub fn crop_length(mut self, len: u32) -> Self {
         self.crop_length = Some(len);
         self
     }
 
+    #[must_use]
     pub fn crop_marker(mut self, marker: impl Into<String>) -> Self {
         self.crop_marker = Some(marker.into());
         self
     }
 
+    #[must_use]
     pub fn filter(mut self, filter: Value) -> Self {
         self.filter = Some(filter);
         self
     }
 
+    #[must_use]
     pub fn show_matches_position(mut self, show: bool) -> Self {
         self.show_matches_position = Some(show);
         self
     }
 
+    #[must_use]
     pub fn facets(mut self, facets: Vec<String>) -> Self {
         self.facets = Some(facets);
         self
     }
 
+    #[must_use]
     pub fn sort(mut self, sort: Vec<String>) -> Self {
         self.sort = Some(sort);
         self
     }
 
+    #[must_use]
     pub fn highlight_pre_tag(mut self, tag: impl Into<String>) -> Self {
         self.highlight_pre_tag = Some(tag.into());
         self
     }
 
+    #[must_use]
     pub fn highlight_post_tag(mut self, tag: impl Into<String>) -> Self {
         self.highlight_post_tag = Some(tag.into());
         self
     }
 
+    #[must_use]
     pub fn matching_strategy(mut self, strategy: MatchingStrategy) -> Self {
         self.matching_strategy = Some(strategy);
         self
     }
 
+    #[must_use]
     pub fn page(mut self, page: u32) -> Self {
         self.page = Some(page);
         self
     }
 
+    #[must_use]
     pub fn hits_per_page(mut self, hits_per_page: u32) -> Self {
         self.hits_per_page = Some(hits_per_page);
         self
     }
 
+    #[must_use]
     pub fn show_ranking_score(mut self, show: bool) -> Self {
         self.show_ranking_score = Some(show);
         self
     }
 
+    #[must_use]
     pub fn show_ranking_score_details(mut self, show: bool) -> Self {
         self.show_ranking_score_details = Some(show);
         self
     }
 
+    #[must_use]
     pub fn attributes_to_search_on(mut self, attrs: Vec<String>) -> Self {
         self.attributes_to_search_on = Some(attrs);
         self
     }
 
+    #[must_use]
     pub fn retrieve_vectors(mut self, retrieve: bool) -> Self {
         self.retrieve_vectors = Some(retrieve);
         self
     }
 
+    #[must_use]
     pub fn ranking_score_threshold(mut self, threshold: f64) -> Self {
         self.ranking_score_threshold = Some(threshold);
         self
     }
 
+    #[must_use]
     pub fn distinct(mut self, distinct: impl Into<String>) -> Self {
         self.distinct = Some(distinct.into());
         self
     }
 
+    #[must_use]
     pub fn locales(mut self, locales: Vec<String>) -> Self {
         self.locales = Some(locales);
         self
     }
 
+    #[must_use]
     pub fn hybrid(mut self, hybrid: Value) -> Self {
         self.hybrid = Some(hybrid);
         self
     }
 
+    #[must_use]
     pub fn vector(mut self, vector: Vec<f64>) -> Self {
         self.vector = Some(vector);
         self
@@ -496,6 +522,8 @@ pub struct SimilarRequest {
     pub show_ranking_score_details: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ranking_score_threshold: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieve_vectors: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

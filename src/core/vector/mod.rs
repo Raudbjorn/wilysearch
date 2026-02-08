@@ -3,7 +3,7 @@
 //! This module provides a trait-based abstraction for vector storage backends,
 //! enabling pluggable implementations for different vector databases.
 
-use anyhow::{Context, Result};
+use crate::core::error::{Error, Result};
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -141,13 +141,15 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if denom == 0.0 { 0.0 } else { dot / denom }
 }
 
+// VectorStore trait methods propagate lock-poison errors via Error::VectorStore,
+// while the non-trait helper methods (snapshot, len, is_empty) use the recovery
+// pattern (unwrap_or_else + into_inner) since they are infallible accessors.
 impl VectorStore for InMemoryVectorStore {
     fn add_documents(&self, documents: &[(u32, Vec<Vec<f32>>)]) -> Result<()> {
         let mut data = self
             .data
             .write()
-            .map_err(|e| anyhow::anyhow!("vector store write lock poisoned: {e}"))
-            .context("InMemoryVectorStore::add_documents")?;
+            .map_err(|e| Error::VectorStore(format!("write lock poisoned: {e}")))?;
         for (id, vectors) in documents {
             data.insert(*id, vectors.clone());
         }
@@ -158,8 +160,7 @@ impl VectorStore for InMemoryVectorStore {
         let mut data = self
             .data
             .write()
-            .map_err(|e| anyhow::anyhow!("vector store write lock poisoned: {e}"))
-            .context("InMemoryVectorStore::remove_documents")?;
+            .map_err(|e| Error::VectorStore(format!("write lock poisoned: {e}")))?;
         for id in ids {
             data.remove(id);
         }
@@ -175,8 +176,7 @@ impl VectorStore for InMemoryVectorStore {
         let data = self
             .data
             .read()
-            .map_err(|e| anyhow::anyhow!("vector store read lock poisoned: {e}"))
-            .context("InMemoryVectorStore::search")?;
+            .map_err(|e| Error::VectorStore(format!("read lock poisoned: {e}")))?;
         let mut scored: Vec<(u32, f32)> = data
             .iter()
             .filter(|(id, _)| filter.map_or(true, |f| f.contains(**id)))
@@ -203,8 +203,7 @@ impl VectorStore for InMemoryVectorStore {
         let data = self
             .data
             .read()
-            .map_err(|e| anyhow::anyhow!("vector store read lock poisoned: {e}"))
-            .context("InMemoryVectorStore::dimensions")?;
+            .map_err(|e| Error::VectorStore(format!("read lock poisoned: {e}")))?;
         Ok(data
             .values()
             .flat_map(|vecs| vecs.first())
@@ -215,8 +214,7 @@ impl VectorStore for InMemoryVectorStore {
     fn clear(&self) -> Result<()> {
         self.data
             .write()
-            .map_err(|e| anyhow::anyhow!("vector store write lock poisoned: {e}"))
-            .context("InMemoryVectorStore::clear")?
+            .map_err(|e| Error::VectorStore(format!("write lock poisoned: {e}")))?
             .clear();
         Ok(())
     }
