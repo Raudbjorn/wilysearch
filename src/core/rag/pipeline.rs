@@ -558,7 +558,7 @@ impl DocumentLike for serde_json::Value {
 ///
 /// This is a local implementation of the FxHash algorithm (used in rustc)
 /// rather than pulling in a crate dependency for a single 9-line function.
-/// It is NOT cryptographic — it only needs to produce well-distributed u64
+/// It is NOT cryptographic -- it only needs to produce well-distributed u64
 /// values for deduplication keys in the RAG pipeline.
 fn fxhash(s: &str) -> u64 {
     use std::ops::BitXor;

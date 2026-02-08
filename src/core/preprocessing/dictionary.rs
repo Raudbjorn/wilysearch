@@ -402,7 +402,7 @@ impl DictionaryGenerator {
     /// Convenience method that builds both corpus and bigram dictionaries.
     /// The document iterator is cloned three times: once for the corpus
     /// dictionary, once for the bigram dictionary, and once to count total
-    /// words for the returned statistics. This is a deliberate trade-off —
+    /// words for the returned statistics. This is a deliberate trade-off --
     /// each builder has different internal state (word vs. bigram frequencies)
     /// so merging them into a single pass would complicate the code without
     /// meaningful performance gain, since document sets are typically small

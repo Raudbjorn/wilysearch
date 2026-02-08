@@ -4,7 +4,9 @@
 //! - Multi-way synonyms (all terms interchangeable)
 //! - One-way synonyms (source maps to targets, not vice versa)
 //! - Query expansion with configurable limits
-//! - Database-specific query generation (SurrealDB FTS, SQLite FTS5)
+//!
+//! Database-specific FTS query generation lives in the sibling [`fts`](super::fts)
+//! module, and default synonym sets are in [`defaults`](super::defaults).
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -137,131 +139,6 @@ impl ExpandedQuery {
             .filter_map(|g| g.original())
             .collect::<Vec<_>>()
             .join(" ")
-    }
-
-    /// Generate a SurrealDB FTS (full-text search) query.
-    ///
-    /// SurrealDB uses the `@@` operator for FTS matching and supports OR groups.
-    /// Output format: `field @@ 'term1 OR term2' AND field @@ 'term3'`
-    ///
-    /// # Arguments
-    /// * `field` - The field name to search (e.g., "content")
-    /// * `ref_num` - A reference number for query parameterization
-    ///
-    /// # Example
-    /// For query "hp recovery" with "hp" -> ["hit points", "health"]:
-    /// ```text
-    /// content @@ '(hp OR "hit points" OR health)' AND content @@ 'recovery'
-    /// ```
-    pub fn to_surrealdb_fts(&self, field: &str, _ref_num: u32) -> String {
-        let parts: Vec<String> = self
-            .term_groups
-            .iter()
-            .map(|group| {
-                let terms = group.all_terms();
-                if terms.len() == 1 {
-                    format!("{} @@ '{}'", field, escape_fts_term(&terms[0]))
-                } else {
-                    let or_terms: Vec<String> = terms
-                        .iter()
-                        .map(|t| {
-                            if t.contains(' ') {
-                                format!("\"{}\"", escape_fts_term(t))
-                            } else {
-                                escape_fts_term(t)
-                            }
-                        })
-                        .collect();
-                    format!("{} @@ '({})'", field, or_terms.join(" OR "))
-                }
-            })
-            .collect();
-
-        parts.join(" AND ")
-    }
-
-    /// Generate an SQLite FTS5 MATCH expression.
-    ///
-    /// FTS5 uses boolean operators within the MATCH string.
-    /// Output format: `(term1 OR term2) AND term3`
-    ///
-    /// # Example
-    /// For query "hp recovery" with "hp" -> ["hit points", "health"]:
-    /// ```text
-    /// (hp OR "hit points" OR health) AND recovery
-    /// ```
-    pub fn to_fts5_match(&self) -> String {
-        let parts: Vec<String> = self
-            .term_groups
-            .iter()
-            .map(|group| {
-                let terms = group.all_terms();
-                if terms.len() == 1 {
-                    escape_fts5_term(&terms[0])
-                } else {
-                    let or_terms: Vec<String> = terms
-                        .iter()
-                        .map(|t| {
-                            if t.contains(' ') {
-                                format!("\"{}\"", escape_fts5_term(t))
-                            } else {
-                                escape_fts5_term(t)
-                            }
-                        })
-                        .collect();
-                    format!("({})", or_terms.join(" OR "))
-                }
-            })
-            .collect();
-
-        parts.join(" AND ")
-    }
-
-    /// Generate an expanded query string with all alternatives.
-    ///
-    /// This produces a human-readable string showing all expansions.
-    /// Useful for debugging or displaying to users.
-    pub fn to_expanded_string(&self) -> String {
-        self.term_groups
-            .iter()
-            .map(|group| {
-                let terms = group.all_terms();
-                if terms.len() == 1 {
-                    terms[0].to_string()
-                } else {
-                    format!("[{}]", terms.join("|"))
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-}
-
-/// Escape a term for SurrealDB FTS.
-fn escape_fts_term(term: &str) -> String {
-    // Escape single quotes by doubling them
-    term.replace('\'', "''")
-}
-
-/// Escape a term for SQLite FTS5.
-fn escape_fts5_term(term: &str) -> String {
-    // FTS5 special characters: " * ^ - :
-    // FTS5 reserved keywords that would be interpreted as operators if unquoted:
-    // AND, OR, NOT, NEAR (AND/OR are used intentionally in our MATCH expressions,
-    // but NOT and NEAR would corrupt the query if a synonym term is literally
-    // "not" or "near").
-    let upper = term.to_uppercase();
-    let is_reserved_keyword = matches!(upper.as_str(), "NOT" | "NEAR");
-
-    if is_reserved_keyword
-        || term
-            .chars()
-            .any(|c| matches!(c, '"' | '*' | '^' | '-' | ':'))
-    {
-        // Escape double quotes by doubling them, then wrap in quotes
-        format!("\"{}\"", term.replace('"', "\"\""))
-    } else {
-        term.to_string()
     }
 }
 
@@ -730,111 +607,6 @@ struct SynonymSection {
     one_way: Option<HashMap<String, Vec<String>>>,
 }
 
-/// Build a comprehensive TTRPG synonym map with default game terms.
-///
-/// Includes:
-/// - Stat abbreviations (str, dex, con, int, wis, cha, hp, ac, dc, cr, xp)
-/// - Game mechanics (aoo, crit, nat 20, tpk, dm, gm, pc, npc, bbeg)
-/// - Condition terms (prone, grappled, stunned, frightened, poisoned, etc.)
-/// - Book abbreviations (phb, dmg, mm, xge, tce)
-/// - Damage types (fire, cold, lightning, necrotic, radiant, psychic)
-/// - Creature types (undead, dragon, devil, fiend)
-pub fn build_default_ttrpg_synonyms() -> SynonymMap {
-    let mut map = SynonymMap::with_config(SynonymConfig {
-        max_expansions: 5,
-        enabled: true,
-        include_original: true,
-    });
-
-    // === Stat abbreviations (multi-way) ===
-    map.add_multi_way(&["hp", "hit points", "health", "life"]);
-    map.add_multi_way(&["ac", "armor class", "armour class"]);
-    map.add_multi_way(&["str", "strength"]);
-    map.add_multi_way(&["dex", "dexterity"]);
-    map.add_multi_way(&["con", "constitution"]);
-    map.add_multi_way(&["int", "intelligence"]);
-    map.add_multi_way(&["wis", "wisdom"]);
-    map.add_multi_way(&["cha", "charisma"]);
-    map.add_multi_way(&["dc", "difficulty class"]);
-    map.add_multi_way(&["cr", "challenge rating"]);
-    map.add_multi_way(&["xp", "experience points", "exp"]);
-    map.add_multi_way(&["pp", "passive perception"]);
-
-    // === Game mechanics ===
-    map.add_multi_way(&["aoo", "opportunity attack", "attack of opportunity"]);
-    map.add_multi_way(&["tpk", "total party kill"]);
-    map.add_multi_way(&["nat 20", "natural 20", "critical hit", "crit"]);
-    map.add_multi_way(&["nat 1", "natural 1", "critical failure", "fumble"]);
-    map.add_multi_way(&["dm", "dungeon master", "game master", "gm"]);
-    map.add_multi_way(&["pc", "player character"]);
-    map.add_multi_way(&["npc", "non-player character"]);
-    map.add_multi_way(&["bbeg", "big bad evil guy", "main villain"]);
-
-    // === Condition synonyms ===
-    map.add_multi_way(&["prone", "knocked down", "on the ground"]);
-    map.add_multi_way(&["grappled", "grabbed", "held"]);
-    map.add_multi_way(&["stunned", "stun", "dazed"]);
-    map.add_multi_way(&["frightened", "scared", "afraid", "fear"]);
-    map.add_multi_way(&["poisoned", "poison", "toxic"]);
-    map.add_multi_way(&["invisible", "invisibility", "unseen"]);
-    map.add_multi_way(&["blinded", "blind"]);
-    map.add_multi_way(&["deafened", "deaf"]);
-    map.add_multi_way(&["charmed", "charm"]);
-    map.add_multi_way(&["paralyzed", "paralysis"]);
-    map.add_multi_way(&["petrified", "turned to stone"]);
-    map.add_multi_way(&["restrained", "restrain"]);
-    map.add_multi_way(&["incapacitated", "incapacitate"]);
-    map.add_multi_way(&["unconscious", "knocked out", "ko"]);
-    map.add_multi_way(&["exhaustion", "exhausted", "fatigue"]);
-
-    // === Book / source abbreviations ===
-    map.add_multi_way(&["phb", "player's handbook", "players handbook"]);
-    map.add_multi_way(&["dmg", "dungeon master's guide", "dungeon masters guide"]);
-    map.add_multi_way(&["mm", "monster manual"]);
-    map.add_multi_way(&["xge", "xanathar's guide", "xanathars guide to everything"]);
-    map.add_multi_way(&["tce", "tasha's cauldron", "tashas cauldron of everything"]);
-    map.add_multi_way(&["vgm", "volo's guide", "volos guide to monsters"]);
-    map.add_multi_way(&["mtof", "mordenkainen's tome", "mordenkainens tome of foes"]);
-    map.add_multi_way(&["scag", "sword coast adventurers guide"]);
-
-    // === Damage types (one-way - "fire" shouldn't expand to "fire damage") ===
-    map.add_one_way("fire damage", &["flame damage", "burning"]);
-    map.add_one_way("cold damage", &["frost damage", "ice damage", "freezing"]);
-    map.add_one_way("lightning damage", &["electric damage", "shock damage"]);
-    map.add_one_way("thunder damage", &["sonic damage"]);
-    map.add_one_way("necrotic damage", &["death damage", "dark damage"]);
-    map.add_one_way("radiant damage", &["holy damage", "light damage"]);
-    map.add_one_way("psychic damage", &["mental damage", "mind damage"]);
-    map.add_one_way("force damage", &["magical damage"]);
-    map.add_one_way("poison damage", &["toxic damage"]);
-    map.add_one_way("acid damage", &["corrosive damage"]);
-
-    // === Creature types (one-way hierarchies) ===
-    map.add_one_way("dragon", &["wyrm", "drake", "wyvern"]);
-    map.add_one_way("devil", &["fiend", "demon", "daemon"]);
-    map.add_one_way("undead", &["zombie", "skeleton", "vampire", "lich", "ghost", "wraith"]);
-    map.add_one_way("giant", &["ogre", "troll", "cyclops"]);
-    map.add_one_way("goblinoid", &["goblin", "hobgoblin", "bugbear"]);
-
-    // === Action types ===
-    map.add_multi_way(&["bonus action", "ba"]);
-    map.add_multi_way(&["reaction", "rxn"]);
-    map.add_multi_way(&["concentration", "conc"]);
-    map.add_multi_way(&["advantage", "adv"]);
-    map.add_multi_way(&["disadvantage", "disadv", "dis"]);
-
-    // === Spell components ===
-    map.add_multi_way(&["verbal", "v"]);
-    map.add_multi_way(&["somatic", "s"]);
-    map.add_multi_way(&["material", "m"]);
-
-    // === Common misnomers / player slang ===
-    map.add_one_way("healing word", &["cure wounds"]); // players often confuse
-    map.add_one_way("magic missile", &["magic missle"]); // common misspelling as synonym
-
-    map
-}
-
 /// A synonym map that supports campaign-specific overlays.
 ///
 /// Base synonyms apply to all searches, while campaign synonyms
@@ -860,7 +632,7 @@ impl CampaignScopedSynonyms {
 
     /// Create a new campaign-scoped synonym map with default TTRPG synonyms as the base.
     pub fn with_default_ttrpg_base() -> Self {
-        Self::new(build_default_ttrpg_synonyms())
+        Self::new(super::defaults::build_default_ttrpg_synonyms())
     }
 
     /// Add a campaign-specific synonym overlay.
@@ -976,6 +748,7 @@ impl Default for CampaignScopedSynonyms {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::defaults::build_default_ttrpg_synonyms;
 
     #[test]
     fn test_multi_way_synonyms() {

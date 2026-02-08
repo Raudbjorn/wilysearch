@@ -6,16 +6,16 @@
 //! operations involve disk I/O and the optional SurrealDB backend involves
 //! network I/O, a sync API was chosen because:
 //!
-//! 1. **Simplicity** — Embedded use-cases don't benefit from async overhead.
+//! 1. **Simplicity** -- Embedded use-cases don't benefit from async overhead.
 //!    LMDB operations are memory-mapped and effectively in-process.
-//! 2. **Compatibility** — Sync traits compose with any executor (or none).
+//! 2. **Compatibility** -- Sync traits compose with any executor (or none).
 //!    Callers can wrap in `spawn_blocking()` if needed.
-//! 3. **No task queue** — Unlike server Meilisearch, there's no HTTP layer
+//! 3. **No task queue** -- Unlike server Meilisearch, there's no HTTP layer
 //!    or background task system. Operations complete inline.
 //!
 //! # Error Types
 //!
-//! [`Result<T>`] uses [`Error`] — a typed enum with variants for every error
+//! [`Result<T>`] uses [`Error`] -- a typed enum with variants for every error
 //! category (LMDB, I/O, serialization, index-not-found, etc.). Error details
 //! are preserved across the trait boundary; there is no type erasure.
 //!
@@ -25,7 +25,7 @@
 //! `tokio::runtime::Runtime::block_on()`. When using `Engine` from within an
 //! existing multi-thread tokio runtime, the store uses `block_in_place()` to
 //! avoid nesting runtimes. This blocks the current thread. For `current_thread`
-//! runtimes, the store panics with a clear error — use a multi-thread runtime
+//! runtimes, the store panics with a clear error -- use a multi-thread runtime
 //! or wrap calls in `spawn_blocking()` instead.
 
 use serde_json::Value;

@@ -1,12 +1,12 @@
 //! Unified configuration for all wilysearch subsystems.
 //!
-//! This module provides [`WilysearchConfig`] — a single typed struct that covers
+//! This module provides [`WilysearchConfig`] -- a single typed struct that covers
 //! engine settings, preprocessing, RAG pipeline, vector store, experimental
 //! features, and search defaults. Configuration can be loaded from:
 //!
-//! 1. **Programmatic construction** — build the struct directly in Rust code
-//! 2. **TOML file** — `WilysearchConfig::from_file("wilysearch.toml")`
-//! 3. **Environment variables** — `WILYSEARCH__ENGINE__DB_PATH` overrides `[engine].db_path`
+//! 1. **Programmatic construction** -- build the struct directly in Rust code
+//! 2. **TOML file** -- `WilysearchConfig::from_file("wilysearch.toml")`
+//! 3. **Environment variables** -- `WILYSEARCH__ENGINE__DB_PATH` overrides `[engine].db_path`
 //!
 //! Sources are layered with later sources taking precedence:
 //! defaults < TOML file < environment variables < programmatic overrides.
@@ -523,7 +523,7 @@ impl WilysearchConfig {
             });
         }
 
-        // default_search_type is now an enum — invalid values are rejected at deserialization
+        // default_search_type is now an enum -- invalid values are rejected at deserialization
 
         Ok(())
     }

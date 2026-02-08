@@ -54,16 +54,19 @@
 //! ```
 
 pub mod config;
+pub mod defaults;
 pub mod dictionary;
 pub mod error;
+pub mod fts;
 pub mod synonyms;
 pub mod typo;
 
 pub use config::{DictionaryPaths, NormalizationConfig, PreprocessingConfig, PreprocessingConfigBuilder};
+pub use defaults::build_default_ttrpg_synonyms;
 pub use dictionary::{DictionaryConfig, DictionaryGenerator, DictionaryStats};
 pub use error::{PreprocessingError, Result};
 pub use synonyms::{
-    build_default_ttrpg_synonyms, CampaignScopedSynonyms, ExpandedQuery, ExpandedTerm,
+    CampaignScopedSynonyms, ExpandedQuery, ExpandedTerm,
     SynonymConfig, SynonymMap, SynonymType, TermAlternatives,
 };
 pub use typo::{CorrectionRecord, TypoConfig, TypoCorrector};
