@@ -535,7 +535,7 @@ impl HybridSearchQuery {
 #[serde(rename_all = "camelCase")]
 pub struct HybridSearchResult {
     /// The underlying search result (hits, pagination, facets).
-    /// Note: `semantic_hit_count` lives on `SearchResult` — do not duplicate it here.
+    /// Note: `semantic_hit_count` lives on `SearchResult` -- do not duplicate it here.
     #[serde(flatten)]
     pub result: SearchResult,
 }

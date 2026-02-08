@@ -148,6 +148,9 @@ fn save_index_metadata(index_dir: &Path, meta: &IndexMetadata) -> Result<()> {
 /// The underlying `milli::Index` and `heed::Env` handle their own cleanup
 /// (flushing writes, closing environments) safely.
 pub struct Meilisearch {
+    // Fields are `pub(crate)` so that `impl Meilisearch` blocks in sibling
+    // sub-modules (federation.rs, maintenance.rs) can access them. They are
+    // NOT part of the public API -- external crates cannot reach these fields.
     pub(crate) options: MeilisearchOptions,
     /// In-memory cache of opened index handles, keyed by index UID.
     ///

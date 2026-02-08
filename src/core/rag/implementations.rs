@@ -183,7 +183,7 @@ where
         }
 
         // Use RRF to fuse ranked lists. RRF is rank-based (score = 1/(k + rank)),
-        // so pre-weighting the original scores before RRF is semantically wrong —
+        // so pre-weighting the original scores before RRF is semantically wrong --
         // RRF replaces all scores with rank-derived values regardless of input scores.
         let fused = fuse_retrieval_results(
             vec![keyword_results, semantic_results],

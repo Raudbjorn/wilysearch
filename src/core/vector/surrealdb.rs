@@ -694,7 +694,7 @@ pub struct VectorStoreStats {
 //
 // Fix: clone the `Arc<Runtime>` to bump the refcount, then move the clone to a
 // background thread. When the struct's fields drop, the Arc decrements to 1
-// (held by the thread) — the Runtime is NOT freed. The thread then drops its
+// (held by the thread) -- the Runtime is NOT freed. The thread then drops its
 // reference outside the async context, freeing the Runtime safely.
 impl Drop for SurrealDbVectorStore {
     fn drop(&mut self) {

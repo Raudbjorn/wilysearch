@@ -101,6 +101,10 @@ impl ExpandedQuery {
                         .iter()
                         .map(|t| {
                             let escaped = escape_fts5_term(t);
+                            // Multi-word terms need quoting for FTS5 phrase matching.
+                            // Skip wrapping if escape_fts5_term already returned a
+                            // quoted string (e.g. a reserved keyword like "NOT" that
+                            // also happens to contain a space -- unlikely but handled).
                             if t.contains(' ')
                                 && !(escaped.starts_with('"') && escaped.ends_with('"'))
                             {
