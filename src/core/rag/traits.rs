@@ -196,6 +196,7 @@ pub trait Generator: Send + Sync {
 /// This is a simplified representation; in practice you'd likely use
 /// a proper async stream type.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum GenerationStream {
     /// The complete response (for non-streaming generators).
     Complete(String),

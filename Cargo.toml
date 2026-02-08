@@ -2,13 +2,15 @@
 name = "wilysearch"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"  # edition 2024 requires 1.85+; floor_char_boundary stable since 1.82
 
 [features]
 default = []
 surrealdb = ["dep:surrealdb", "dep:tokio"]
 
 [dependencies]
-# Meilisearch core crates (v1.35.0)
+# Meilisearch core crates — pinned to tag v1.35.0
+# rev a1e3c2cb corresponds to the v1.35.0 release tag.
 meilisearch-types = { git = "https://github.com/meilisearch/meilisearch", rev = "a1e3c2cb8f99dd6ec9182b9d26927477eef3ef14" }
 milli = { git = "https://github.com/meilisearch/meilisearch", rev = "a1e3c2cb8f99dd6ec9182b9d26927477eef3ef14" }
 file-store = { git = "https://github.com/meilisearch/meilisearch", rev = "a1e3c2cb8f99dd6ec9182b9d26927477eef3ef14" }
@@ -24,6 +26,8 @@ toml = "0.8"
 figment = { version = "0.10", features = ["toml", "env"] }
 
 # Error handling / logging
+# thiserror: structured error enums in core/error.rs (public API)
+# anyhow: ad-hoc errors in internal plumbing (config loading, test helpers)
 thiserror = "2.0"
 anyhow = "1.0"
 log = "0.4"
@@ -66,3 +70,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync"], optional = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tempfile = "3.15"
 figment = { version = "0.10", features = ["toml", "env", "test"] }
+
+[lints.rust]
+# unsafe blocks have SAFETY comments; warn to keep them visible in diffs.
+unsafe_code = "allow"
+
+[lints.clippy]
+pedantic = { level = "allow", priority = -1 }
+# These fire on RoaringBitmap::len() as usize and similar; documented inline.
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"

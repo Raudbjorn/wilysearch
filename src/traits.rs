@@ -1,15 +1,32 @@
 //! Synchronous trait definitions for the Meilisearch API surface.
 //!
-//! All trait methods are synchronous by design. This keeps the public API
-//! simple for the common embedded use-case where callers operate on a single
-//! thread or use their own async wrappers.
+//! # Design Decision: Synchronous API
 //!
-//! **Thread-blocking note:** The optional SurrealDB vector store backend
-//! bridges async SurrealDB calls via `tokio::runtime::Runtime::block_on()`.
-//! When using `Engine` from within an existing tokio runtime, the SurrealDB
-//! store uses `tokio::task::block_in_place()` to avoid panics, but this
-//! still blocks the current thread. For high-concurrency async applications,
-//! consider wrapping `Engine` method calls in `spawn_blocking()`.
+//! All trait methods are synchronous by design. Although the underlying LMDB
+//! operations involve disk I/O and the optional SurrealDB backend involves
+//! network I/O, a sync API was chosen because:
+//!
+//! 1. **Simplicity** — Embedded use-cases don't benefit from async overhead.
+//!    LMDB operations are memory-mapped and effectively in-process.
+//! 2. **Compatibility** — Sync traits compose with any executor (or none).
+//!    Callers can wrap in `spawn_blocking()` if needed.
+//! 3. **No task queue** — Unlike server Meilisearch, there's no HTTP layer
+//!    or background task system. Operations complete inline.
+//!
+//! # Error Types
+//!
+//! [`Result<T>`] uses [`Error`] — a typed enum with variants for every error
+//! category (LMDB, I/O, serialization, index-not-found, etc.). Error details
+//! are preserved across the trait boundary; there is no type erasure.
+//!
+//! # Thread-Blocking Note
+//!
+//! The optional SurrealDB vector store backend bridges async calls via
+//! `tokio::runtime::Runtime::block_on()`. When using `Engine` from within an
+//! existing multi-thread tokio runtime, the store uses `block_in_place()` to
+//! avoid nesting runtimes. This blocks the current thread. For `current_thread`
+//! runtimes, the store panics with a clear error — use a multi-thread runtime
+//! or wrap calls in `spawn_blocking()` instead.
 
 use serde_json::Value;
 
@@ -162,6 +179,13 @@ pub trait Batches {
 
 // ─── Settings ────────────────────────────────────────────────────────────────
 
+/// Per-index settings management.
+///
+/// This trait is intentionally wide (18 setting types x 3 operations = 54
+/// methods) because it mirrors the Meilisearch REST API 1:1. Each setting
+/// type has get/update/reset methods that map directly to their HTTP
+/// counterparts. Splitting into sub-traits would break the 1:1 API mapping
+/// and complicate the `Engine` implementation without reducing total code.
 pub trait SettingsApi {
     /// GET /indexes/{indexUid}/settings
     fn get_settings(&self, index_uid: &str) -> Result<Settings>;

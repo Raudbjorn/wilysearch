@@ -338,15 +338,21 @@ where
             let mut total_chars = 0;
             for r in &results {
                 let s = r.document.to_context_string();
-                total_chars += s.len();
-                if total_chars > self.config.max_context_chars {
-                    let overflow = total_chars - self.config.max_context_chars;
-                    if s.len() > overflow {
-                        let end = s.floor_char_boundary(s.len() - overflow);
-                        context.push(s[..end].to_string());
+                if total_chars + s.len() > self.config.max_context_chars {
+                    // Truncate the last chunk to fit within the budget rather
+                    // than dropping it entirely.
+                    let remaining = self.config.max_context_chars.saturating_sub(total_chars);
+                    if remaining > 0 {
+                        // floor_char_boundary (stable since Rust 1.82) ensures we
+                        // don't split in the middle of a multi-byte UTF-8 character.
+                        let end = s.floor_char_boundary(remaining);
+                        if end > 0 {
+                            context.push(s[..end].to_string());
+                        }
                     }
                     break;
                 }
+                total_chars += s.len();
                 context.push(s);
             }
             let context_refs: Vec<&str> = context.iter().map(|s| s.as_str()).collect();
@@ -548,7 +554,12 @@ impl DocumentLike for serde_json::Value {
     }
 }
 
-// Simple FxHash for generating pseudo-IDs
+/// Lightweight FxHash for generating pseudo-IDs from document content.
+///
+/// This is a local implementation of the FxHash algorithm (used in rustc)
+/// rather than pulling in a crate dependency for a single 9-line function.
+/// It is NOT cryptographic — it only needs to produce well-distributed u64
+/// values for deduplication keys in the RAG pipeline.
 fn fxhash(s: &str) -> u64 {
     use std::ops::BitXor;
     const K: u64 = 0x517cc1b727220a95;

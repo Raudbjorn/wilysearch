@@ -132,15 +132,16 @@ fn test_search_with_highlighting() {
     assert!(!result.hits.is_empty(), "expected at least one hit");
     // The formatted/highlighted content should be in the hit as _formatted
     let first_hit = &result.hits[0];
-    if let Some(formatted) = first_hit.get("_formatted") {
-        let formatted_title = formatted["title"]
-            .as_str()
-            .expect("formatted title should be string");
-        assert!(
-            formatted_title.contains("<em>") && formatted_title.contains("</em>"),
-            "expected highlight tags in formatted title, got: {formatted_title}"
-        );
-    }
+    let formatted = first_hit
+        .get("_formatted")
+        .expect("expected _formatted key in hit");
+    let formatted_title = formatted["title"]
+        .as_str()
+        .expect("formatted title should be string");
+    assert!(
+        formatted_title.contains("<em>") && formatted_title.contains("</em>"),
+        "expected highlight tags in formatted title, got: {formatted_title}"
+    );
 }
 
 #[test]
@@ -380,16 +381,17 @@ fn test_search_crop() {
         .expect("search failed");
 
     assert!(!result.hits.is_empty());
-    if let Some(formatted) = result.hits[0].get("_formatted") {
-        let cropped = formatted["description"]
-            .as_str()
-            .expect("cropped description should be a string");
-        assert!(
-            cropped.len() < 120,
-            "expected cropped text to be shorter, got {} chars: {cropped}",
-            cropped.len()
-        );
-    }
+    let formatted = result.hits[0]
+        .get("_formatted")
+        .expect("expected _formatted key in hit");
+    let cropped = formatted["description"]
+        .as_str()
+        .expect("cropped description should be a string");
+    assert!(
+        cropped.len() < 120,
+        "expected cropped text to be shorter, got {} chars: {cropped}",
+        cropped.len()
+    );
 }
 
 // ─── Federated multi-search ─────────────────────────────────────────────────

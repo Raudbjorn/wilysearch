@@ -156,6 +156,15 @@ pub struct Meilisearch {
     /// Uses an `RwLock<Arc<HashMap>>` (COW pattern) to optimize for read-heavy workloads.
     /// Readers acquire a read lock, clone the Arc (cheap), and release the lock immediately.
     /// Writers acquire a write lock and clone the HashMap (expensive) to update it.
+    ///
+    /// # Lock Poisoning Strategy
+    ///
+    /// All `RwLock` fields use `unwrap_or_else(|e| e.into_inner())` to recover
+    /// from poisoned locks. This is a deliberate choice: if a thread panics while
+    /// holding a lock, we prefer degraded service (potentially stale cache) over
+    /// cascading panics across all threads. The underlying LMDB data remains
+    /// consistent regardless of in-memory cache state because LMDB uses its own
+    /// transactional isolation.
     indexes: RwLock<Arc<HashMap<String, Arc<Index>>>>,
     index_metadata: RwLock<HashMap<String, IndexMetadata>>,
     vector_store: Option<Arc<dyn VectorStore>>,
@@ -694,6 +703,10 @@ impl Meilisearch {
                     let mut options = milli::heed::EnvOpenOptions::new().read_txn_without_tls();
                     options.map_size(self.options.max_index_size);
 
+                    // SAFETY: The LMDB environment is opened read-only on an existing
+                    // database directory. The path comes from our own `indexes/` dir
+                    // (validated by `read_dir`), and the env is short-lived — used only
+                    // for `copy_to_file` and dropped before the next iteration.
                     let env = unsafe {
                         options.open(entry.path()).map_err(Error::Heed)?
                     };
@@ -753,12 +766,18 @@ impl Meilisearch {
 
             std::fs::rename(&index_path_a, &tmp_path)?;
             if let Err(e) = std::fs::rename(&index_path_b, &index_path_a) {
-                let _ = std::fs::rename(&tmp_path, &index_path_a);
+                if let Err(re) = std::fs::rename(&tmp_path, &index_path_a) {
+                    log::error!("Swap recovery failed: could not restore {a} from tmp: {re}");
+                }
                 return Err(e.into());
             }
             if let Err(e) = std::fs::rename(&tmp_path, &index_path_b) {
-                let _ = std::fs::rename(&index_path_a, &index_path_b);
-                let _ = std::fs::rename(&tmp_path, &index_path_a);
+                if let Err(re) = std::fs::rename(&index_path_a, &index_path_b) {
+                    log::error!("Swap recovery failed: could not restore {b}: {re}");
+                }
+                if let Err(re) = std::fs::rename(&tmp_path, &index_path_a) {
+                    log::error!("Swap recovery failed: could not restore {a} from tmp: {re}");
+                }
                 return Err(e.into());
             }
 
@@ -848,6 +867,10 @@ impl Meilisearch {
             let mut options = milli::heed::EnvOpenOptions::new().read_txn_without_tls();
             options.map_size(self.options.max_index_size);
 
+            // SAFETY: The LMDB environment is opened on an existing index directory
+            // solely for copy-compact. The path is constructed from our own `db_path`
+            // + validated index UID. The env is scoped to this block and dropped
+            // before we replace the data file.
             let env = unsafe { options.open(&index_path).map_err(Error::Heed)? };
             let compact_path = tmp_path.join("data.mdb");
             let mut file = std::fs::File::create(&compact_path)?;
@@ -1103,7 +1126,7 @@ impl Meilisearch {
 }
 
 fn is_valid_uid(uid: &str) -> bool {
-    uid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    !uid.is_empty() && uid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 fn dir_size(path: &std::path::Path) -> std::io::Result<u64> {

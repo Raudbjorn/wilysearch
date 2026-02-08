@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use super::Error;
 use milli::update::Setting;
 use milli::vector::settings::EmbeddingSettings as MilliEmbeddingSettings;
 use milli::FilterableAttributesRule;
@@ -552,7 +553,7 @@ pub(crate) struct SettingsApplier<'a, 't, 'i> {
 
 impl<'a, 't, 'i> SettingsApplier<'a, 't, 'i> {
     /// Apply our Settings to the milli Settings builder
-    pub fn apply(mut self, settings: &Settings) -> milli::update::Settings<'a, 't, 'i> {
+    pub fn apply(mut self, settings: &Settings) -> super::Result<milli::update::Settings<'a, 't, 'i>> {
         if let Some(ref attrs) = settings.displayed_attributes {
             self.builder.set_displayed_fields(attrs.clone());
         }
@@ -578,7 +579,11 @@ impl<'a, 't, 'i> SettingsApplier<'a, 't, 'i> {
             for r in rules {
                 match r.parse() {
                     Ok(c) => criteria.push(c),
-                    Err(e) => log::warn!("Skipping invalid ranking rule '{r}': {e}"),
+                    Err(e) => {
+                        return Err(Error::Internal(format!(
+                            "Invalid ranking rule '{r}': {e}"
+                        )));
+                    }
                 }
             }
             self.builder.set_criteria(criteria);
@@ -702,14 +707,15 @@ impl<'a, 't, 'i> SettingsApplier<'a, 't, 'i> {
                 "disabled" => {
                     self.builder.set_prefix_search(milli::index::PrefixSearch::Disabled);
                 }
-                _ => {
-                    // Unknown mode, default to indexingTime
-                    self.builder.set_prefix_search(milli::index::PrefixSearch::IndexingTime);
+                other => {
+                    return Err(Error::Internal(format!(
+                        "Unknown prefix search mode '{other}'; valid values are \"indexingTime\" and \"disabled\""
+                    )));
                 }
             }
         }
 
-        self.builder
+        Ok(self.builder)
     }
 }
 

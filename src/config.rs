@@ -208,11 +208,27 @@ impl Default for VectorStoreConfig {
 }
 
 /// Authentication credentials for SurrealDB.
+///
+/// `Serialize` is intentionally NOT derived to prevent accidental credential
+/// leakage in logs, debug output, or config round-tripping. Deserialization
+/// is still supported for loading from TOML/env.
 #[cfg(feature = "surrealdb")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct VectorStoreAuth {
     pub username: String,
+    #[doc(hidden)]
     pub password: String,
+}
+
+#[cfg(feature = "surrealdb")]
+impl Serialize for VectorStoreAuth {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("VectorStoreAuth", 2)?;
+        s.serialize_field("username", &self.username)?;
+        s.serialize_field("password", "********")?;
+        s.end()
+    }
 }
 
 #[cfg(feature = "surrealdb")]
@@ -457,6 +473,38 @@ impl WilysearchConfig {
                     message: "must be greater than 0".to_string(),
                 });
             }
+        }
+
+        if self.rag.retrieval_limit == 0 {
+            return Err(ConfigError::Validation {
+                field: "rag.retrieval_limit".to_string(),
+                value: "0".to_string(),
+                message: "must be greater than 0".to_string(),
+            });
+        }
+
+        if self.rag.rerank_limit == 0 {
+            return Err(ConfigError::Validation {
+                field: "rag.rerank_limit".to_string(),
+                value: "0".to_string(),
+                message: "must be greater than 0".to_string(),
+            });
+        }
+
+        if self.rag.max_context_chars == 0 {
+            return Err(ConfigError::Validation {
+                field: "rag.max_context_chars".to_string(),
+                value: "0".to_string(),
+                message: "must be greater than 0".to_string(),
+            });
+        }
+
+        if self.search_defaults.limit == 0 {
+            return Err(ConfigError::Validation {
+                field: "search_defaults.limit".to_string(),
+                value: "0".to_string(),
+                message: "must be greater than 0".to_string(),
+            });
         }
 
         if !(0.0..=1.0).contains(&self.rag.semantic_ratio) {

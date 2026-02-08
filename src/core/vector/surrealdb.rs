@@ -299,6 +299,12 @@ impl SurrealDbVectorStore {
     /// For each document, this first deletes any existing vector records for that
     /// `doc_id`, then inserts the new vectors. This prevents stale records when a
     /// document is re-indexed with fewer vectors than before.
+    /// Add or replace document vectors in the store.
+    ///
+    /// Uses one SurrealDB transaction per document for fault isolation: if one
+    /// document fails, others already committed are preserved. For bulk inserts
+    /// this has higher overhead than a single transaction, but avoids all-or-nothing
+    /// rollback semantics which would be surprising for partial batch failures.
     pub async fn add_documents_async(&self, documents: &[(u32, Vec<Vec<f32>>)]) -> Result<()> {
         let table = &self.config.table;
 
@@ -558,13 +564,27 @@ impl SurrealDbVectorStore {
     }
 
     /// Run an async block, handling both sync and async calling contexts.
-    /// When called from within a tokio runtime, uses `block_in_place` to
-    /// avoid panicking. When called from outside a runtime, blocks directly.
+    ///
+    /// When called from within a multi-thread tokio runtime, uses `block_in_place`
+    /// to avoid nesting runtimes. When called from outside a runtime, blocks directly.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called from within a `current_thread` tokio runtime, because
+    /// `block_in_place` is not supported there. If you need to use `Engine` with
+    /// SurrealDB from async code, use a multi-thread runtime or wrap calls in
+    /// `tokio::task::spawn_blocking`.
     fn block_on<F: std::future::Future>(&self, f: F) -> F::Output {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| self.runtime.block_on(f))
-        } else {
-            self.runtime.block_on(f)
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                assert!(
+                    handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread,
+                    "SurrealDbVectorStore cannot be called from a current_thread tokio runtime. \
+                     Use a multi_thread runtime or wrap calls in spawn_blocking."
+                );
+                tokio::task::block_in_place(|| self.runtime.block_on(f))
+            }
+            Err(_) => self.runtime.block_on(f),
         }
     }
 

@@ -198,13 +198,17 @@ impl Index {
         Ok(pending)
     }
 
-    /// Resolve pending external IDs to internal IDs via the uncommitted write txn,
-    /// then call `store.add_documents()`.
+    /// Sync pending vectors to the external VectorStore AFTER the LMDB write
+    /// transaction has been committed.
+    ///
+    /// Opens a fresh read transaction to resolve external IDs to internal IDs.
+    /// This ensures LMDB is the source of truth: documents are persisted first,
+    /// and vector sync is a best-effort follow-up. If vector sync fails, the
+    /// documents are still safely stored and vectors can be re-synced later.
     ///
     /// No-op if no vector store is configured or the pending list is empty.
-    fn sync_pending_vectors(
+    fn sync_pending_vectors_post_commit(
         &self,
-        wtxn: &milli::heed::RwTxn<'_>,
         pending: Vec<(String, Vec<Vec<f32>>)>,
     ) -> Result<()> {
         if pending.is_empty() {
@@ -215,11 +219,12 @@ impl Index {
             None => return Ok(()),
         };
 
+        let rtxn = self.inner.read_txn().map_err(|e| Error::Heed(e))?;
         let external_ids = self.inner.external_documents_ids();
         let mut pairs: Vec<(u32, Vec<Vec<f32>>)> = Vec::with_capacity(pending.len());
 
         for (ext_id, vectors) in pending {
-            if let Some(internal_id) = external_ids.get(wtxn, &ext_id).map_err(Error::Heed)? {
+            if let Some(internal_id) = external_ids.get(&rtxn, &ext_id).map_err(Error::Heed)? {
                 pairs.push((internal_id, vectors));
             }
         }
@@ -322,10 +327,12 @@ impl Index {
         // Execute
         builder.execute().map_err(Error::Milli)?;
 
-        // Sync extracted vectors to the external VectorStore
-        self.sync_pending_vectors(&wtxn, pending_vectors)?;
-
         wtxn.commit().map_err(|e| Error::Heed(e))?;
+
+        // Sync extracted vectors to the external VectorStore AFTER LMDB commit
+        // so that LMDB remains the source of truth. If vector sync fails the
+        // documents are still safely persisted and vectors can be re-synced.
+        self.sync_pending_vectors_post_commit(pending_vectors)?;
 
         Ok(())
     }
@@ -405,10 +412,10 @@ impl Index {
         // Execute
         builder.execute().map_err(Error::Milli)?;
 
-        // Sync extracted vectors to the external VectorStore
-        self.sync_pending_vectors(&wtxn, pending_vectors)?;
-
         wtxn.commit().map_err(|e| Error::Heed(e))?;
+
+        // Sync extracted vectors AFTER LMDB commit (see add_documents)
+        self.sync_pending_vectors_post_commit(pending_vectors)?;
 
         Ok(())
     }
@@ -688,13 +695,16 @@ impl Index {
                     if let Value::String(text) = value {
                         let should_highlight = highlight_fields.contains("*")
                             || highlight_fields.contains(field_name);
+                        // Cap crop length at 10_000 words to prevent degenerate
+                        // allocations from absurd user-supplied values.
+                        const MAX_CROP_LENGTH: usize = 10_000;
                         let crop_len = crop_fields.iter().find_map(|c| {
                             let parts: Vec<&str> = c.splitn(2, ':').collect();
                             if parts[0] == "*" || parts[0] == field_name {
                                 if parts.len() > 1 {
-                                    parts[1].parse::<usize>().ok()
+                                    parts[1].parse::<usize>().ok().map(|v| v.min(MAX_CROP_LENGTH))
                                 } else {
-                                    Some(query.crop_length)
+                                    Some(query.crop_length.min(MAX_CROP_LENGTH))
                                 }
                             } else {
                                 None
@@ -755,6 +765,8 @@ impl Index {
         }
 
         let processing_time_ms = start_time.elapsed().as_millis();
+        // RoaringBitmap::len() returns u64; on 64-bit targets this is lossless.
+        // On 32-bit targets this would truncate, but wilysearch targets x86_64.
         let total_hits = result.candidates.len() as usize;
         let query_string = query.q.clone().unwrap_or_default();
 
@@ -1962,7 +1974,7 @@ impl Index {
             milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
 
         let applier = SettingsApplier { builder: milli_settings };
-        let milli_settings = applier.apply(settings);
+        let milli_settings = applier.apply(settings)?;
 
         // Execute the settings update
         let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();

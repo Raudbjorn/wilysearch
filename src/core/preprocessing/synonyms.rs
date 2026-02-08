@@ -246,9 +246,19 @@ fn escape_fts_term(term: &str) -> String {
 /// Escape a term for SQLite FTS5.
 fn escape_fts5_term(term: &str) -> String {
     // FTS5 special characters: " * ^ - :
-    // For simplicity, wrap terms with special chars in quotes
-    if term.chars().any(|c| matches!(c, '"' | '*' | '^' | '-' | ':')) {
-        // Escape double quotes by doubling them
+    // FTS5 reserved keywords that would be interpreted as operators if unquoted:
+    // AND, OR, NOT, NEAR (AND/OR are used intentionally in our MATCH expressions,
+    // but NOT and NEAR would corrupt the query if a synonym term is literally
+    // "not" or "near").
+    let upper = term.to_uppercase();
+    let is_reserved_keyword = matches!(upper.as_str(), "NOT" | "NEAR");
+
+    if is_reserved_keyword
+        || term
+            .chars()
+            .any(|c| matches!(c, '"' | '*' | '^' | '-' | ':'))
+    {
+        // Escape double quotes by doubling them, then wrap in quotes
         format!("\"{}\"", term.replace('"', "\"\""))
     } else {
         term.to_string()
@@ -416,6 +426,8 @@ impl SynonymMap {
 
                 for &other_id in affected_group_ids[1..].iter().rev() {
                     let other = std::mem::take(&mut self.multi_way_groups[other_id]);
+                    // Note: std::mem::take leaves an empty HashSet at other_id.
+                    // We clean these up below.
                     merged.extend(other);
                 }
 
@@ -423,6 +435,16 @@ impl SynonymMap {
                     self.multi_way_index.insert(term.clone(), target_id);
                 }
                 self.multi_way_groups[target_id] = merged;
+
+                // Remove empty groups left behind by std::mem::take and
+                // re-index so group IDs remain contiguous.
+                self.multi_way_groups.retain(|g| !g.is_empty());
+                self.multi_way_index.clear();
+                for (idx, group) in self.multi_way_groups.iter().enumerate() {
+                    for term in group {
+                        self.multi_way_index.insert(term.clone(), idx);
+                    }
+                }
             }
         }
     }
@@ -474,8 +496,12 @@ impl SynonymMap {
         }
 
         // Check multi-way synonyms
+        // Sort to ensure deterministic selection under max_expansions limit,
+        // since HashSet iteration order is not guaranteed.
         if let Some(&group_id) = self.multi_way_index.get(&term_lower) {
-            for synonym in &self.multi_way_groups[group_id] {
+            let mut sorted: Vec<&String> = self.multi_way_groups[group_id].iter().collect();
+            sorted.sort();
+            for synonym in sorted {
                 if expansions.len() >= self.config.max_expansions {
                     break;
                 }
@@ -499,6 +525,14 @@ impl SynonymMap {
     }
 
     /// Expand a full query, returning an `ExpandedQuery` with alternatives at each position.
+    ///
+    /// # Limitations
+    ///
+    /// The query is split on whitespace, so multi-word synonym keys (e.g.
+    /// "hit points") are matched against individual tokens. A multi-word
+    /// synonym like `"hit points" -> "hp"` will only fire if the entire phrase
+    /// appears as a single whitespace-delimited token, which in practice means
+    /// multi-word synonyms only match via the multi-way group index.
     ///
     /// # Example
     /// ```ignore
@@ -885,22 +919,23 @@ impl CampaignScopedSynonyms {
     /// If the campaign has an overlay, returns a merged map where campaign
     /// synonyms take precedence.
     pub fn for_campaign(&self, campaign_id: Option<&str>) -> SynonymMap {
+        // Fast path: no campaign overlay, return a clone of base without merging.
+        let overlay = campaign_id.and_then(|id| self.campaign_overlays.get(id));
+        let Some(overlay) = overlay else {
+            return self.base.clone();
+        };
+
         let mut merged = self.base.clone();
 
-        if let Some(id) = campaign_id {
-            if let Some(overlay) = self.campaign_overlays.get(id) {
-                // Merge campaign overlay into base
-                // Multi-way groups from overlay
-                for group in &overlay.multi_way_groups {
-                    let terms: Vec<&str> = group.iter().map(|s| s.as_str()).collect();
-                    merged.add_multi_way(terms);
-                }
+        // Multi-way groups from overlay
+        for group in &overlay.multi_way_groups {
+            let terms: Vec<&str> = group.iter().map(|s| s.as_str()).collect();
+            merged.add_multi_way(terms);
+        }
 
-                // One-way mappings from overlay
-                for (source, targets) in &overlay.one_way_mappings {
-                    merged.add_one_way(source, targets.iter().map(|s| s.as_str()));
-                }
-            }
+        // One-way mappings from overlay
+        for (source, targets) in &overlay.one_way_mappings {
+            merged.add_one_way(source, targets.iter().map(|s| s.as_str()));
         }
 
         merged

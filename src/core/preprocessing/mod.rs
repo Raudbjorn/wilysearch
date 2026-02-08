@@ -540,17 +540,23 @@ impl QueryPipeline {
     }
 
     /// Normalize a query string according to pipeline configuration.
+    ///
+    /// Applies transformations in order: trim, lowercase, unicode NFKC,
+    /// whitespace collapse. Each enabled step reuses the same `String`
+    /// buffer where possible to avoid extra allocations.
     fn normalize(&self, query: &str) -> String {
         let norm = self.config.effective_normalization();
-        let mut result = query.to_string();
 
-        if norm.trim {
-            result = result.trim().to_string();
-        }
+        // Start with a Cow to avoid allocating when no transforms are needed.
+        let trimmed = if norm.trim { query.trim() } else { query };
 
-        if norm.lowercase {
-            result = result.to_lowercase();
-        }
+        // Lowercase always produces a new String (may change byte length for
+        // non-ASCII), so we build from here when enabled.
+        let mut result = if norm.lowercase {
+            trimmed.to_lowercase()
+        } else {
+            trimmed.to_string()
+        };
 
         if norm.unicode_normalize {
             result = unicode_normalization_nfkc(&result);

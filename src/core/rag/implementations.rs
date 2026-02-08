@@ -140,7 +140,7 @@ where
     type Document = D;
 
     async fn retrieve(&self, query: &RetrievalQuery) -> Result<Vec<RetrievalResult<D>>> {
-        let semantic_ratio = query.search_type.semantic_ratio().unwrap_or(0.5);
+        let _semantic_ratio = query.search_type.semantic_ratio().unwrap_or(0.5);
 
         // Determine what to retrieve based on search type
         let (keyword_results, semantic_results) = match query.search_type {
@@ -163,7 +163,11 @@ where
                     ..query.clone()
                 };
 
-                // In a real async runtime, these would run concurrently
+                // NOTE: These run sequentially. Using tokio::join! for concurrent
+                // execution would require &self to be shared across futures, which
+                // conflicts with the borrow checker without Arc wrapping. For most
+                // use-cases the retrieval latency is dominated by I/O rather than
+                // parallelism opportunity.
                 let kw = self.keyword_retriever.retrieve(&kw_query).await?;
                 let sem = self.semantic_retriever.retrieve(&sem_query).await?;
                 (kw, sem)
@@ -178,20 +182,11 @@ where
             return Ok(keyword_results);
         }
 
-        let keyword_weight = 1.0 - semantic_ratio;
-        let semantic_weight = semantic_ratio;
-
-        let weighted_keyword: Vec<RetrievalResult<D>> = keyword_results
-            .into_iter()
-            .map(|mut r| { r.score *= keyword_weight; r })
-            .collect();
-        let weighted_semantic: Vec<RetrievalResult<D>> = semantic_results
-            .into_iter()
-            .map(|mut r| { r.score *= semantic_weight; r })
-            .collect();
-
+        // Use RRF to fuse ranked lists. RRF is rank-based (score = 1/(k + rank)),
+        // so pre-weighting the original scores before RRF is semantically wrong —
+        // RRF replaces all scores with rank-derived values regardless of input scores.
         let fused = fuse_retrieval_results(
-            vec![weighted_keyword, weighted_semantic],
+            vec![keyword_results, semantic_results],
             self.k_constant,
             query.limit,
             |doc| doc.id(),

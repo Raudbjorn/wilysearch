@@ -34,6 +34,14 @@ pub const DEFAULT_RRF_K: usize = 60;
 ///
 /// Documents are then sorted by their RRF scores in descending order.
 ///
+/// # Precision Note
+///
+/// Scores are computed as `f32`. For typical result sets (< 10,000 items per list),
+/// f32 provides sufficient precision — the smallest RRF contribution at rank 10,000
+/// with k=60 is `1/10060 ≈ 9.94e-5`, well within f32's ~7-digit precision.
+/// For very deep rankings (> 100k items), f32 precision loss could cause rank
+/// instability in the tail, but this is unlikely in practice.
+///
 /// # Arguments
 ///
 /// * `ranked_lists` - Multiple ranked lists of items to fuse
@@ -170,6 +178,11 @@ where
 /// Instead of RRF, this combines results by normalizing and weighting
 /// the original scores from each source.
 ///
+/// Documents appearing in only one source receive a score of `0.0` from the
+/// missing source. This is by design: a document that only appears in keyword
+/// results gets `kw_score * keyword_weight + 0.0 * semantic_weight`, which
+/// naturally down-ranks it relative to documents found by both sources.
+///
 /// # Arguments
 ///
 /// * `keyword_results` - Results from keyword search
@@ -240,6 +253,12 @@ where
 }
 
 /// Normalize scores in a result list to the range [0, 1].
+///
+/// Uses min-max normalization: `(score - min) / (max - min)`. This correctly
+/// handles negative input scores — they are mapped linearly to [0, 1] just
+/// like positive scores. For example, scores [-2, 0, 2] become [0, 0.5, 1].
+///
+/// When all scores are identical (range = 0), all results are normalized to 1.0.
 fn normalize_scores<D>(mut results: Vec<RetrievalResult<D>>) -> Vec<RetrievalResult<D>> {
     if results.is_empty() {
         return results;

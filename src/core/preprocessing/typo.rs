@@ -379,8 +379,14 @@ impl TypoCorrector {
 
         // SymSpell expects: term frequency (space-separated)
         // The term_index is 0 (first column), count_index is 1 (second column)
+        let path_str = path.to_str().ok_or_else(|| {
+            PreprocessingError::DictionaryLoad(format!(
+                "Dictionary path contains non-UTF-8 characters: {}",
+                path.display()
+            ))
+        })?;
         let loaded = self.symspell
-            .load_dictionary(path.to_str().unwrap_or_default(), 0, 1, " ");
+            .load_dictionary(path_str, 0, 1, " ");
 
         if !loaded {
             return Err(PreprocessingError::DictionaryNotFound(
@@ -406,8 +412,14 @@ impl TypoCorrector {
         }
 
         // Load bigram dictionary: term1 term2 frequency
+        let path_str = path.to_str().ok_or_else(|| {
+            PreprocessingError::DictionaryLoad(format!(
+                "Bigram dictionary path contains non-UTF-8 characters: {}",
+                path.display()
+            ))
+        })?;
         let loaded = self.symspell
-            .load_bigram_dictionary(path.to_str().unwrap_or_default(), 0, 2, " ");
+            .load_bigram_dictionary(path_str, 0, 2, " ");
 
         if !loaded {
             return Err(PreprocessingError::DictionaryNotFound(

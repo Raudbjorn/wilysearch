@@ -264,6 +264,9 @@ fn convert_search_request(req: &SearchRequest) -> crate::core::SearchQuery {
     if let Some(ref locales) = req.locales {
         q = q.with_locales(locales.clone());
     }
+    if let Some(ref vec) = req.vector {
+        q = q.with_vector(vec.iter().map(|&x| x as f32).collect());
+    }
     q
 }
 
@@ -1635,7 +1638,25 @@ impl traits::System for Engine {
     }
 
     fn export(&self, request: &ExportRequest) -> Result<TaskInfo> {
-        let export_path = std::path::Path::new(&request.url);
+        let raw_path = std::path::Path::new(&request.url);
+
+        // Canonicalize the export path to prevent directory traversal.
+        // Create the directory first so canonicalize has a real path to resolve.
+        std::fs::create_dir_all(raw_path)?;
+        let export_path = raw_path.canonicalize().map_err(|e| {
+            crate::core::error::Error::Internal(format!(
+                "Failed to canonicalize export path '{}': {e}",
+                request.url
+            ))
+        })?;
+
+        // Reject paths that contain `..` components after canonicalization
+        // (shouldn't happen, but defense-in-depth).
+        if export_path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            return Err(crate::core::error::Error::Internal(
+                "Export path must not contain '..' components".to_string(),
+            ).into());
+        }
 
         let index_settings: Option<HashMap<String, bool>> = request.indexes.as_ref().map(|m| {
             m.iter()
@@ -1643,7 +1664,7 @@ impl traits::System for Engine {
                 .collect()
         });
 
-        self.inner.export(export_path, index_settings.as_ref())?;
+        self.inner.export(&export_path, index_settings.as_ref())?;
         Ok(self.next_task("export", None))
     }
 }

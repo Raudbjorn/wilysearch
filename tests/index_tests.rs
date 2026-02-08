@@ -150,11 +150,12 @@ fn test_index_stats() {
     let ctx = TestContext::new();
     common::create_test_index(&ctx, "movies");
 
+    let expected_count = common::sample_movies().len() as u64;
     let stats = ctx
         .engine
         .index_stats("movies")
         .expect("failed to get stats");
-    assert_eq!(stats.number_of_documents, 10);
+    assert_eq!(stats.number_of_documents, expected_count);
     assert!(stats.field_distribution.contains_key("title"));
 }
 
@@ -204,8 +205,10 @@ fn test_updated_at_changes_on_document_add() {
     let created_at_before = before.created_at.clone();
     let updated_at_before = before.updated_at.clone();
 
-    // Small sleep to ensure timestamp advances
-    std::thread::sleep(std::time::Duration::from_millis(10));
+    // Sleep to ensure timestamp advances. RFC3339 format includes sub-second
+    // precision, but 10ms can be unreliable on loaded systems due to OS timer
+    // granularity. 100ms provides a comfortable margin.
+    std::thread::sleep(std::time::Duration::from_millis(100));
 
     ctx.engine
         .add_or_replace_documents(
