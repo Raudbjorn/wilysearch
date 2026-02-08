@@ -1,0 +1,77 @@
+# Query Preprocessing Configuration
+# =================================
+#
+# This configuration file controls how user queries are preprocessed
+# before being sent to the search engine. Preprocessing includes:
+# - Typo correction using SymSpell algorithm
+# - Synonym expansion for broader search coverage
+# - Text normalization for consistent matching
+#
+# NOTE: The [typo] and [synonyms] sections use camelCase field names
+# to match the Rust serde configuration.
+
+[typo]
+# Minimum word length for single-typo tolerance (default: 5)
+# Words shorter than this will have no typo tolerance applied.
+minWordSizeOneTypo = 5
+
+# Minimum word length for two-typo tolerance (default: 9)
+# Words with 5-8 characters get 1-typo tolerance.
+# Words with 9+ characters get 2-typo tolerance.
+minWordSizeTwoTypos = 9
+
+# Maximum edit distance for corrections (default: 2)
+# This should align with Meilisearch's max typo setting.
+maxEditDistance = 2
+
+# Enable/disable typo correction globally
+enabled = true
+
+# Words that should never be corrected
+# Useful for domain-specific terms, abbreviations, and technical jargon.
+disabledOnWords = ["dnd", "5e", "phb", "dmg", "mm", "api", "sql", "json"]
+
+[synonyms]
+# Maximum number of synonyms to expand per term (default: 10)
+# Prevents query explosion with heavily synonymized terms.
+maxExpansions = 5
+
+# Enable/disable synonym expansion globally
+enabled = true
+
+# Include the original term when expanding (default: true)
+# When true: "hp" -> ["hp", "hit points", "health"]
+# When false: "hp" -> ["hit points", "health"]
+includeOriginal = true
+
+[paths]
+# Paths to dictionary files for typo correction.
+# All paths are optional; if not specified, dictionaries must be loaded programmatically.
+
+# Path to English frequency dictionary
+# Format: word frequency (space-separated, one per line)
+# english_dict = "data/frequency_dictionary_en_82_765.txt"
+
+# Path to corpus frequency dictionary (generated from your content)
+# corpus_dict = "data/ttrpg_corpus.txt"
+
+# Path to bigram dictionary for compound word correction
+# Format: word1 word2 frequency (space-separated, one per line)
+# bigram_dict = "data/ttrpg_bigrams.txt"
+
+# Path to synonyms TOML file
+# synonyms_file = "config/synonyms.toml"
+
+[normalization]
+# Convert queries to lowercase before processing
+lowercase = true
+
+# Trim leading/trailing whitespace
+trim = true
+
+# Collapse multiple whitespace characters into a single space
+collapse_whitespace = true
+
+# Apply Unicode normalization (NFKC)
+# Useful for handling full-width characters and ligatures.
+unicode_normalize = false

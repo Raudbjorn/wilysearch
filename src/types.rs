@@ -292,6 +292,188 @@ pub enum MatchingStrategy {
     Frequency,
 }
 
+/// Precision level for the proximity ranking rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProximityPrecision {
+    ByWord,
+    ByAttribute,
+}
+
+/// Whether prefix search is performed at indexing time or disabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PrefixSearch {
+    IndexingTime,
+    Disabled,
+}
+
+/// Sort order for facet values in search results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FacetValuesSort {
+    Alpha,
+    Count,
+}
+
+impl SearchRequest {
+    #[must_use]
+    pub fn query(mut self, q: impl Into<String>) -> Self {
+        self.q = Some(q.into());
+        self
+    }
+
+    #[must_use]
+    pub fn offset(mut self, offset: u32) -> Self {
+        self.offset = Some(offset);
+        self
+    }
+
+    #[must_use]
+    pub fn limit(mut self, limit: u32) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    #[must_use]
+    pub fn attributes_to_retrieve(mut self, attrs: Vec<String>) -> Self {
+        self.attributes_to_retrieve = Some(attrs);
+        self
+    }
+
+    #[must_use]
+    pub fn attributes_to_crop(mut self, attrs: Vec<String>) -> Self {
+        self.attributes_to_crop = Some(attrs);
+        self
+    }
+
+    #[must_use]
+    pub fn attributes_to_highlight(mut self, attrs: Vec<String>) -> Self {
+        self.attributes_to_highlight = Some(attrs);
+        self
+    }
+
+    #[must_use]
+    pub fn crop_length(mut self, len: u32) -> Self {
+        self.crop_length = Some(len);
+        self
+    }
+
+    #[must_use]
+    pub fn crop_marker(mut self, marker: impl Into<String>) -> Self {
+        self.crop_marker = Some(marker.into());
+        self
+    }
+
+    #[must_use]
+    pub fn filter(mut self, filter: Value) -> Self {
+        self.filter = Some(filter);
+        self
+    }
+
+    #[must_use]
+    pub fn show_matches_position(mut self, show: bool) -> Self {
+        self.show_matches_position = Some(show);
+        self
+    }
+
+    #[must_use]
+    pub fn facets(mut self, facets: Vec<String>) -> Self {
+        self.facets = Some(facets);
+        self
+    }
+
+    #[must_use]
+    pub fn sort(mut self, sort: Vec<String>) -> Self {
+        self.sort = Some(sort);
+        self
+    }
+
+    #[must_use]
+    pub fn highlight_pre_tag(mut self, tag: impl Into<String>) -> Self {
+        self.highlight_pre_tag = Some(tag.into());
+        self
+    }
+
+    #[must_use]
+    pub fn highlight_post_tag(mut self, tag: impl Into<String>) -> Self {
+        self.highlight_post_tag = Some(tag.into());
+        self
+    }
+
+    #[must_use]
+    pub fn matching_strategy(mut self, strategy: MatchingStrategy) -> Self {
+        self.matching_strategy = Some(strategy);
+        self
+    }
+
+    #[must_use]
+    pub fn page(mut self, page: u32) -> Self {
+        self.page = Some(page);
+        self
+    }
+
+    #[must_use]
+    pub fn hits_per_page(mut self, hits_per_page: u32) -> Self {
+        self.hits_per_page = Some(hits_per_page);
+        self
+    }
+
+    #[must_use]
+    pub fn show_ranking_score(mut self, show: bool) -> Self {
+        self.show_ranking_score = Some(show);
+        self
+    }
+
+    #[must_use]
+    pub fn show_ranking_score_details(mut self, show: bool) -> Self {
+        self.show_ranking_score_details = Some(show);
+        self
+    }
+
+    #[must_use]
+    pub fn attributes_to_search_on(mut self, attrs: Vec<String>) -> Self {
+        self.attributes_to_search_on = Some(attrs);
+        self
+    }
+
+    #[must_use]
+    pub fn retrieve_vectors(mut self, retrieve: bool) -> Self {
+        self.retrieve_vectors = Some(retrieve);
+        self
+    }
+
+    #[must_use]
+    pub fn ranking_score_threshold(mut self, threshold: f64) -> Self {
+        self.ranking_score_threshold = Some(threshold);
+        self
+    }
+
+    #[must_use]
+    pub fn distinct(mut self, distinct: impl Into<String>) -> Self {
+        self.distinct = Some(distinct.into());
+        self
+    }
+
+    #[must_use]
+    pub fn locales(mut self, locales: Vec<String>) -> Self {
+        self.locales = Some(locales);
+        self
+    }
+
+    #[must_use]
+    pub fn hybrid(mut self, hybrid: Value) -> Self {
+        self.hybrid = Some(hybrid);
+        self
+    }
+
+    #[must_use]
+    pub fn vector(mut self, vector: Vec<f64>) -> Self {
+        self.vector = Some(vector);
+        self
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchResponse {
@@ -340,6 +522,8 @@ pub struct SimilarRequest {
     pub show_ranking_score_details: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ranking_score_threshold: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieve_vectors: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -361,6 +545,8 @@ pub struct MultiSearchQuery {
     pub index_uid: String,
     #[serde(flatten)]
     pub search: SearchRequest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub federation_options: Option<FederationQueryOptions>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,13 +554,89 @@ pub struct MultiSearchQuery {
 pub struct MultiSearchRequest {
     pub queries: Vec<MultiSearchQuery>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub federation: Option<Value>,
+    pub federation: Option<FederationSettings>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MultiSearchResponse {
     pub results: Vec<SearchResponse>,
+}
+
+/// Result of a multi-search -- either per-index or federated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MultiSearchResult {
+    /// Standard per-index results (when no federation).
+    PerIndex(MultiSearchResponse),
+    /// Federated merged results (when federation is set).
+    Federated(FederatedSearchResponse),
+}
+
+/// Federation configuration for merged multi-search.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FederationSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hits_per_page: Option<u32>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub facets_by_index: HashMap<String, Option<Vec<String>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_facets: Option<MergeFacetsSettings>,
+}
+
+/// Merge facets configuration.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeFacetsSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_values_per_facet: Option<u32>,
+}
+
+/// Per-query options for federated ranking.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FederationQueryOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_position: Option<u32>,
+}
+
+/// Response from federated multi-search (flat merged hits).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FederatedSearchResponse {
+    pub hits: Vec<Value>,
+    pub processing_time_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_total_hits: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_hits: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_pages: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hits_per_page: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facet_distribution: Option<HashMap<String, HashMap<String, u64>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facet_stats: Option<Value>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub facets_by_index: HashMap<String, Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_hit_count: Option<u32>,
 }
 
 // ─── Facet search ────────────────────────────────────────────────────────────
@@ -444,11 +706,11 @@ pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub non_separator_tokens: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub proximity_precision: Option<String>,
+    pub proximity_precision: Option<ProximityPrecision>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub facet_search: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefix_search: Option<String>,
+    pub prefix_search: Option<PrefixSearch>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search_cutoff_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -494,7 +756,7 @@ pub struct Faceting {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_values_per_facet: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sort_facet_values_by: Option<HashMap<String, String>>,
+    pub sort_facet_values_by: Option<HashMap<String, FacetValuesSort>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -591,7 +853,7 @@ pub struct UpdateWebhookRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub header: Option<HashMap<String, Value>>,
+    pub headers: Option<HashMap<String, Value>>,
 }
 
 // ─── Stats ───────────────────────────────────────────────────────────────────
