@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 use wilysearch::config::{EngineConfig, WilysearchConfig};
 use wilysearch::engine::Engine;
@@ -46,7 +46,7 @@ enum Cmd {
     Dump,
     /// Create a database snapshot
     Snapshot,
-    /// Export data to a remote Meilisearch instance
+    /// Export data to a path or remote Meilisearch instance
     Export(ExportArgs),
 }
 
@@ -160,9 +160,9 @@ struct SearchArgs {
     /// Include ranking scores in results
     #[arg(long)]
     show_ranking_score: bool,
-    /// Matching strategy: last, all, or frequency
-    #[arg(long)]
-    matching_strategy: Option<String>,
+    /// Matching strategy
+    #[arg(long, value_enum)]
+    matching_strategy: Option<CliMatchingStrategy>,
 }
 
 // ─── Facet search args ───────────────────────────────────────────────────────
@@ -213,14 +213,33 @@ struct StatsArgs {
 
 #[derive(Parser)]
 struct ExportArgs {
-    /// Target Meilisearch URL
-    url: String,
-    /// API key for the target instance
+    /// Export target (filesystem path or remote Meilisearch URL)
+    target: String,
+    /// API key for a remote target instance
     #[arg(long)]
     api_key: Option<String>,
     /// Comma-separated index UIDs to export (all if omitted)
     #[arg(long)]
     indexes: Option<String>,
+}
+
+// ─── Matching strategy ───────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CliMatchingStrategy {
+    Last,
+    All,
+    Frequency,
+}
+
+impl From<CliMatchingStrategy> for MatchingStrategy {
+    fn from(s: CliMatchingStrategy) -> Self {
+        match s {
+            CliMatchingStrategy::Last => MatchingStrategy::Last,
+            CliMatchingStrategy::All => MatchingStrategy::All,
+            CliMatchingStrategy::Frequency => MatchingStrategy::Frequency,
+        }
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -254,15 +273,6 @@ fn json_out(value: &impl serde::Serialize) {
 
 fn csv_to_vec(s: &str) -> Vec<String> {
     s.split(',').map(|s| s.trim().to_string()).collect()
-}
-
-fn parse_matching_strategy(s: &str) -> Option<MatchingStrategy> {
-    match s.to_lowercase().as_str() {
-        "last" => Some(MatchingStrategy::Last),
-        "all" => Some(MatchingStrategy::All),
-        "frequency" => Some(MatchingStrategy::Frequency),
-        _ => None,
-    }
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -383,8 +393,8 @@ fn run(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
             if args.show_ranking_score {
                 req.show_ranking_score = Some(true);
             }
-            if let Some(ref ms) = args.matching_strategy {
-                req.matching_strategy = parse_matching_strategy(ms);
+            if let Some(ms) = args.matching_strategy {
+                req.matching_strategy = Some(ms.into());
             }
             json_out(&e.search(&args.index, &req)?);
         }
@@ -442,7 +452,7 @@ fn run(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
                     .collect()
             });
             let req = ExportRequest {
-                url: args.url,
+                url: args.target,
                 api_key: args.api_key,
                 indexes,
             };
