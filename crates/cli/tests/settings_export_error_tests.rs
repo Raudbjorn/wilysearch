@@ -1,56 +1,8 @@
-use assert_cmd::cargo::cargo_bin_cmd;
-use assert_cmd::Command;
+mod common;
+
+use common::{add_sample_docs, create_index, fresh_db, parse_json, wily};
 use predicates::prelude::*;
-use serde_json::Value;
 use tempfile::TempDir;
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-fn wily() -> Command {
-    cargo_bin_cmd!("wily")
-}
-
-/// Create a fresh LMDB database directory and return the `TempDir` handle.
-fn fresh_db() -> TempDir {
-    TempDir::new().expect("failed to create temp db dir")
-}
-
-/// Run `wily --db <db> index create <uid>` and assert success.
-fn create_index(db: &std::path::Path, uid: &str) {
-    wily()
-        .args(["--db", db.to_str().unwrap(), "index", "create", uid])
-        .assert()
-        .success();
-}
-
-/// Write sample movie documents to a temp JSON file, add them to an index, and
-/// return the directory handle so the file lives long enough.
-fn add_sample_docs(db: &std::path::Path, uid: &str) -> TempDir {
-    let doc_dir = TempDir::new().expect("failed to create doc dir");
-    let doc_path = doc_dir.path().join("docs.json");
-
-    let docs = serde_json::json!([
-        {"id": 1, "title": "The Matrix", "year": 1999, "genres": ["sci-fi", "action"]},
-        {"id": 2, "title": "Inception", "year": 2010, "genres": ["sci-fi", "thriller"]},
-        {"id": 3, "title": "Interstellar", "year": 2014, "genres": ["sci-fi", "drama"]}
-    ]);
-    std::fs::write(&doc_path, serde_json::to_string_pretty(&docs).unwrap())
-        .expect("failed to write doc file");
-
-    wily()
-        .args([
-            "--db",
-            db.to_str().unwrap(),
-            "doc",
-            "add",
-            uid,
-            doc_path.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
-
-    doc_dir
-}
 
 // ─── Settings commands ───────────────────────────────────────────────────────
 
@@ -60,14 +12,16 @@ fn test_settings_get() {
     create_index(db.path(), "movies");
 
     let output = wily()
-        .args(["--db", db.path().to_str().unwrap(), "settings", "get", "movies"])
+        .arg("--db")
+        .arg(db.path())
+        .args(["settings", "get", "movies"])
         .assert()
         .success()
         .get_output()
         .stdout
         .clone();
 
-    let settings: Value = serde_json::from_slice(&output).expect("stdout should be valid JSON");
+    let settings = parse_json(&output);
 
     assert!(
         settings.get("rankingRules").is_some(),
@@ -108,27 +62,25 @@ fn test_settings_update() {
 
     // Update settings
     wily()
-        .args([
-            "--db",
-            db.path().to_str().unwrap(),
-            "settings",
-            "update",
-            "movies",
-            settings_path.to_str().unwrap(),
-        ])
+        .arg("--db")
+        .arg(db.path())
+        .args(["settings", "update", "movies"])
+        .arg(&settings_path)
         .assert()
         .success();
 
     // Verify settings were applied
     let output = wily()
-        .args(["--db", db.path().to_str().unwrap(), "settings", "get", "movies"])
+        .arg("--db")
+        .arg(db.path())
+        .args(["settings", "get", "movies"])
         .assert()
         .success()
         .get_output()
         .stdout
         .clone();
 
-    let settings: Value = serde_json::from_slice(&output).expect("stdout should be valid JSON");
+    let settings = parse_json(&output);
 
     let filterable = settings["filterableAttributes"]
         .as_array()
@@ -160,33 +112,33 @@ fn test_settings_reset() {
         .expect("failed to write settings file");
 
     wily()
-        .args([
-            "--db",
-            db.path().to_str().unwrap(),
-            "settings",
-            "update",
-            "movies",
-            settings_path.to_str().unwrap(),
-        ])
+        .arg("--db")
+        .arg(db.path())
+        .args(["settings", "update", "movies"])
+        .arg(&settings_path)
         .assert()
         .success();
 
     // Reset settings
     wily()
-        .args(["--db", db.path().to_str().unwrap(), "settings", "reset", "movies"])
+        .arg("--db")
+        .arg(db.path())
+        .args(["settings", "reset", "movies"])
         .assert()
         .success();
 
     // Verify settings are back to defaults
     let output = wily()
-        .args(["--db", db.path().to_str().unwrap(), "settings", "get", "movies"])
+        .arg("--db")
+        .arg(db.path())
+        .args(["settings", "get", "movies"])
         .assert()
         .success()
         .get_output()
         .stdout
         .clone();
 
-    let settings: Value = serde_json::from_slice(&output).expect("stdout should be valid JSON");
+    let settings = parse_json(&output);
 
     let filterable = settings["filterableAttributes"]
         .as_array()
@@ -207,14 +159,10 @@ fn test_settings_update_invalid_json() {
     std::fs::write(&settings_path, "{ this is not valid json !!!").unwrap();
 
     wily()
-        .args([
-            "--db",
-            db.path().to_str().unwrap(),
-            "settings",
-            "update",
-            "movies",
-            settings_path.to_str().unwrap(),
-        ])
+        .arg("--db")
+        .arg(db.path())
+        .args(["settings", "update", "movies"])
+        .arg(&settings_path)
         .assert()
         .failure()
         .code(1)
@@ -227,9 +175,9 @@ fn test_settings_update_missing_file() {
     create_index(db.path(), "movies");
 
     wily()
+        .arg("--db")
+        .arg(db.path())
         .args([
-            "--db",
-            db.path().to_str().unwrap(),
             "settings",
             "update",
             "movies",
@@ -246,7 +194,9 @@ fn test_settings_get_nonexistent_index() {
     let db = fresh_db();
 
     wily()
-        .args(["--db", db.path().to_str().unwrap(), "settings", "get", "nonexistent"])
+        .arg("--db")
+        .arg(db.path())
+        .args(["settings", "get", "nonexistent"])
         .assert()
         .failure()
         .code(1);
@@ -264,19 +214,17 @@ fn test_export_basic() {
     let export_path = export_dir.path().join("export_out");
 
     let output = wily()
-        .args([
-            "--db",
-            db.path().to_str().unwrap(),
-            "export",
-            export_path.to_str().unwrap(),
-        ])
+        .arg("--db")
+        .arg(db.path())
+        .arg("export")
+        .arg(&export_path)
         .assert()
         .success()
         .get_output()
         .stdout
         .clone();
 
-    let task: Value = serde_json::from_slice(&output).expect("stdout should be valid JSON");
+    let task = parse_json(&output);
     assert_eq!(
         task["type"].as_str().unwrap(),
         "export",
@@ -316,14 +264,10 @@ fn test_export_with_index_filter() {
     ]);
     std::fs::write(&books_path, serde_json::to_string_pretty(&books).unwrap()).unwrap();
     wily()
-        .args([
-            "--db",
-            db.path().to_str().unwrap(),
-            "doc",
-            "add",
-            "books",
-            books_path.to_str().unwrap(),
-        ])
+        .arg("--db")
+        .arg(db.path())
+        .args(["doc", "add", "books"])
+        .arg(&books_path)
         .assert()
         .success();
 
@@ -331,14 +275,11 @@ fn test_export_with_index_filter() {
     let export_path = export_dir.path().join("filtered_export");
 
     wily()
-        .args([
-            "--db",
-            db.path().to_str().unwrap(),
-            "export",
-            export_path.to_str().unwrap(),
-            "--indexes",
-            "movies",
-        ])
+        .arg("--db")
+        .arg(db.path())
+        .arg("export")
+        .arg(&export_path)
+        .args(["--indexes", "movies"])
         .assert()
         .success();
 
@@ -354,24 +295,20 @@ fn test_export_with_index_filter() {
 }
 
 #[test]
-fn test_export_with_api_key() {
+fn test_export_no_api_key_arg() {
     let db = fresh_db();
     create_index(db.path(), "movies");
     let _docs = add_sample_docs(db.path(), "movies");
 
     let export_dir = TempDir::new().expect("failed to create export dir");
-    let export_path = export_dir.path().join("export_apikey");
+    let export_path = export_dir.path().join("export_nokey");
 
-    // The api key is accepted but not used for local filesystem export
+    // Export should succeed without any api key argument
     wily()
-        .args([
-            "--db",
-            db.path().to_str().unwrap(),
-            "export",
-            export_path.to_str().unwrap(),
-            "--api-key",
-            "test123",
-        ])
+        .arg("--db")
+        .arg(db.path())
+        .arg("export")
+        .arg(&export_path)
         .assert()
         .success();
 }
@@ -391,7 +328,9 @@ fn test_error_unknown_subcommand() {
     let db = fresh_db();
 
     wily()
-        .args(["--db", db.path().to_str().unwrap(), "foobar"])
+        .arg("--db")
+        .arg(db.path())
+        .arg("foobar")
         .assert()
         .failure()
         .code(2);
@@ -402,7 +341,9 @@ fn test_error_index_get_nonexistent() {
     let db = fresh_db();
 
     wily()
-        .args(["--db", db.path().to_str().unwrap(), "index", "get", "nope"])
+        .arg("--db")
+        .arg(db.path())
+        .args(["index", "get", "nope"])
         .assert()
         .failure()
         .code(1)
@@ -414,7 +355,9 @@ fn test_error_doc_get_nonexistent_index() {
     let db = fresh_db();
 
     wily()
-        .args(["--db", db.path().to_str().unwrap(), "doc", "get", "nonexistent", "1"])
+        .arg("--db")
+        .arg(db.path())
+        .args(["doc", "get", "nonexistent", "1"])
         .assert()
         .failure()
         .code(1);
@@ -425,7 +368,9 @@ fn test_error_doc_list_nonexistent_index() {
     let db = fresh_db();
 
     wily()
-        .args(["--db", db.path().to_str().unwrap(), "doc", "list", "nonexistent"])
+        .arg("--db")
+        .arg(db.path())
+        .args(["doc", "list", "nonexistent"])
         .assert()
         .failure()
         .code(1);
@@ -436,7 +381,9 @@ fn test_error_search_nonexistent_index() {
     let db = fresh_db();
 
     wily()
-        .args(["--db", db.path().to_str().unwrap(), "search", "nonexistent", "query"])
+        .arg("--db")
+        .arg(db.path())
+        .args(["search", "nonexistent", "query"])
         .assert()
         .failure()
         .code(1);
@@ -447,7 +394,9 @@ fn test_error_settings_get_nonexistent_index_again() {
     let db = fresh_db();
 
     wily()
-        .args(["--db", db.path().to_str().unwrap(), "settings", "get", "nonexistent"])
+        .arg("--db")
+        .arg(db.path())
+        .args(["settings", "get", "nonexistent"])
         .assert()
         .failure()
         .code(1);
@@ -458,7 +407,9 @@ fn test_error_index_create_missing_uid() {
     let db = fresh_db();
 
     wily()
-        .args(["--db", db.path().to_str().unwrap(), "index", "create"])
+        .arg("--db")
+        .arg(db.path())
+        .args(["index", "create"])
         .assert()
         .failure()
         .code(2);
@@ -469,7 +420,9 @@ fn test_error_index_update_missing_pk() {
     let db = fresh_db();
 
     wily()
-        .args(["--db", db.path().to_str().unwrap(), "index", "update", "movies"])
+        .arg("--db")
+        .arg(db.path())
+        .args(["index", "update", "movies"])
         .assert()
         .failure()
         .code(2);
@@ -480,7 +433,9 @@ fn test_error_doc_add_missing_file_arg() {
     let db = fresh_db();
 
     wily()
-        .args(["--db", db.path().to_str().unwrap(), "doc", "add", "movies"])
+        .arg("--db")
+        .arg(db.path())
+        .args(["doc", "add", "movies"])
         .assert()
         .failure()
         .code(2);
@@ -491,7 +446,9 @@ fn test_error_doc_delete_batch_missing_ids() {
     let db = fresh_db();
 
     wily()
-        .args(["--db", db.path().to_str().unwrap(), "doc", "delete-batch", "movies"])
+        .arg("--db")
+        .arg(db.path())
+        .args(["doc", "delete-batch", "movies"])
         .assert()
         .failure()
         .code(2);
@@ -502,7 +459,9 @@ fn test_error_doc_delete_filter_missing_filter() {
     let db = fresh_db();
 
     wily()
-        .args(["--db", db.path().to_str().unwrap(), "doc", "delete-filter", "movies"])
+        .arg("--db")
+        .arg(db.path())
+        .args(["doc", "delete-filter", "movies"])
         .assert()
         .failure()
         .code(2);
@@ -513,7 +472,9 @@ fn test_error_facet_search_missing_facet_name() {
     let db = fresh_db();
 
     wily()
-        .args(["--db", db.path().to_str().unwrap(), "facet-search", "movies"])
+        .arg("--db")
+        .arg(db.path())
+        .args(["facet-search", "movies"])
         .assert()
         .failure()
         .code(2);
@@ -526,20 +487,24 @@ fn test_db_flag_custom_path() {
 
     // Create an index at a custom db path
     wily()
-        .args(["--db", custom_db.to_str().unwrap(), "index", "create", "testidx"])
+        .arg("--db")
+        .arg(&custom_db)
+        .args(["index", "create", "testidx"])
         .assert()
         .success();
 
     // Verify we can retrieve it from the same custom path
     let output = wily()
-        .args(["--db", custom_db.to_str().unwrap(), "index", "get", "testidx"])
+        .arg("--db")
+        .arg(&custom_db)
+        .args(["index", "get", "testidx"])
         .assert()
         .success()
         .get_output()
         .stdout
         .clone();
 
-    let idx: Value = serde_json::from_slice(&output).expect("stdout should be valid JSON");
+    let idx = parse_json(&output);
     assert_eq!(idx["uid"].as_str().unwrap(), "testidx");
 }
 

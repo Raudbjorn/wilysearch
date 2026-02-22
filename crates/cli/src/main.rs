@@ -1,3 +1,4 @@
+use std::io::BufReader;
 use std::path::PathBuf;
 use std::process;
 
@@ -5,6 +6,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 use wilysearch::config::{EngineConfig, WilysearchConfig};
 use wilysearch::engine::Engine;
+use wilysearch::error::Error;
 use wilysearch::traits::*;
 use wilysearch::types::*;
 
@@ -46,7 +48,7 @@ enum Cmd {
     Dump,
     /// Create a database snapshot
     Snapshot,
-    /// Export data to a path or remote Meilisearch instance
+    /// Export data to a filesystem path
     Export(ExportArgs),
 }
 
@@ -213,11 +215,8 @@ struct StatsArgs {
 
 #[derive(Parser)]
 struct ExportArgs {
-    /// Export target (filesystem path or remote Meilisearch URL)
-    target: String,
-    /// API key for a remote target instance
-    #[arg(long)]
-    api_key: Option<String>,
+    /// Filesystem path to export data to
+    target: PathBuf,
     /// Comma-separated index UIDs to export (all if omitted)
     #[arg(long)]
     indexes: Option<String>,
@@ -244,7 +243,7 @@ impl From<CliMatchingStrategy> for MatchingStrategy {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn engine(db: PathBuf) -> Engine {
+fn engine(db: PathBuf) -> Result<Engine> {
     let config = WilysearchConfig {
         engine: EngineConfig {
             db_path: db,
@@ -252,27 +251,28 @@ fn engine(db: PathBuf) -> Engine {
         },
         ..Default::default()
     };
-    match Engine::with_config(config) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("error: failed to open database: {e}");
-            process::exit(1);
-        }
-    }
+    Engine::with_config(config)
+        .map_err(|e| Error::Internal(format!("failed to open database: {e}")))
 }
 
-fn json_out(value: &impl serde::Serialize) {
-    match serde_json::to_string_pretty(value) {
-        Ok(s) => println!("{s}"),
-        Err(e) => {
-            eprintln!("error: failed to serialize output: {e}");
-            process::exit(1);
-        }
-    }
+fn json_out(value: &impl serde::Serialize) -> Result<()> {
+    let s = serde_json::to_string_pretty(value)?;
+    println!("{s}");
+    Ok(())
 }
 
 fn csv_to_vec(s: &str) -> Vec<String> {
-    s.split(',').map(|s| s.trim().to_string()).collect()
+    s.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn read_json_file<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T> {
+    let file = std::fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    let value = serde_json::from_reader(reader)?;
+    Ok(value)
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -286,35 +286,35 @@ fn main() {
     }
 }
 
-fn run(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let e = engine(cli.db);
+fn run(cli: Cli) -> Result<()> {
+    let e = engine(cli.db)?;
 
     match cli.command {
         // ── Indexes ──────────────────────────────────────────────────────
         Cmd::Index(cmd) => match cmd {
             IndexCmd::List { offset, limit } => {
                 let q = PaginationQuery { offset, limit };
-                json_out(&e.list_indexes(&q)?);
+                json_out(&e.list_indexes(&q)?)?;
             }
             IndexCmd::Get { uid } => {
-                json_out(&e.get_index(&uid)?);
+                json_out(&e.get_index(&uid)?)?;
             }
             IndexCmd::Create { uid, primary_key } => {
                 let req = CreateIndexRequest { uid, primary_key };
-                json_out(&e.create_index(&req)?);
+                json_out(&e.create_index(&req)?)?;
             }
             IndexCmd::Update { uid, primary_key } => {
                 let req = UpdateIndexRequest { primary_key };
-                json_out(&e.update_index(&uid, &req)?);
+                json_out(&e.update_index(&uid, &req)?)?;
             }
             IndexCmd::Delete { uid } => {
-                json_out(&e.delete_index(&uid)?);
+                json_out(&e.delete_index(&uid)?)?;
             }
             IndexCmd::Swap { uid1, uid2 } => {
                 let swap = SwapIndexesRequest {
                     indexes: [uid1, uid2],
                 };
-                json_out(&e.swap_indexes(&[swap])?);
+                json_out(&e.swap_indexes(&[swap])?)?;
             }
         },
 
@@ -322,7 +322,7 @@ fn run(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
         Cmd::Doc(cmd) => match cmd {
             DocCmd::Get { index, id, fields } => {
                 let q = DocumentQuery { fields };
-                json_out(&e.get_document(&index, &id, &q)?);
+                json_out(&e.get_document(&index, &id, &q)?)?;
             }
             DocCmd::List {
                 index,
@@ -338,37 +338,36 @@ fn run(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
                     filter,
                     ..Default::default()
                 };
-                json_out(&e.get_documents(&index, &q)?);
+                json_out(&e.get_documents(&index, &q)?)?;
             }
             DocCmd::Add {
                 index,
                 file,
                 primary_key,
             } => {
-                let content = std::fs::read_to_string(&file)?;
-                let docs: Vec<Value> = serde_json::from_str(&content)?;
+                let docs: Vec<Value> = read_json_file(&file)?;
                 let q = AddDocumentsQuery {
                     primary_key,
                     ..Default::default()
                 };
-                json_out(&e.add_or_replace_documents(&index, &docs, &q)?);
+                json_out(&e.add_or_replace_documents(&index, &docs, &q)?)?;
             }
             DocCmd::Delete { index, id } => {
-                json_out(&e.delete_document(&index, &id)?);
+                json_out(&e.delete_document(&index, &id)?)?;
             }
             DocCmd::DeleteBatch { index, ids } => {
                 let id_values: Vec<Value> = csv_to_vec(&ids)
                     .into_iter()
                     .map(Value::String)
                     .collect();
-                json_out(&e.delete_documents_by_batch(&index, &id_values)?);
+                json_out(&e.delete_documents_by_batch(&index, &id_values)?)?;
             }
             DocCmd::DeleteFilter { index, filter } => {
                 let req = DeleteDocumentsByFilterRequest { filter };
-                json_out(&e.delete_documents_by_filter(&index, &req)?);
+                json_out(&e.delete_documents_by_filter(&index, &req)?)?;
             }
             DocCmd::DeleteAll { index } => {
-                json_out(&e.delete_all_documents(&index)?);
+                json_out(&e.delete_all_documents(&index)?)?;
             }
         },
 
@@ -396,7 +395,7 @@ fn run(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
             if let Some(ms) = args.matching_strategy {
                 req.matching_strategy = Some(ms.into());
             }
-            json_out(&e.search(&args.index, &req)?);
+            json_out(&e.search(&args.index, &req)?)?;
         }
 
         // ── Facet search ─────────────────────────────────────────────────
@@ -409,40 +408,39 @@ fn run(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
                 matching_strategy: None,
                 attributes_to_search_on: None,
             };
-            json_out(&e.facet_search(&args.index, &req)?);
+            json_out(&e.facet_search(&args.index, &req)?)?;
         }
 
         // ── Settings ─────────────────────────────────────────────────────
         Cmd::Settings(cmd) => match cmd {
             SettingsCmd::Get { index } => {
-                json_out(&e.get_settings(&index)?);
+                json_out(&e.get_settings(&index)?)?;
             }
             SettingsCmd::Update { index, file } => {
-                let content = std::fs::read_to_string(&file)?;
-                let settings: Settings = serde_json::from_str(&content)?;
-                json_out(&e.update_settings(&index, &settings)?);
+                let settings: Settings = read_json_file(&file)?;
+                json_out(&e.update_settings(&index, &settings)?)?;
             }
             SettingsCmd::Reset { index } => {
-                json_out(&e.reset_settings(&index)?);
+                json_out(&e.reset_settings(&index)?)?;
             }
         },
 
         // ── System ───────────────────────────────────────────────────────
         Cmd::Health => {
-            json_out(&e.health()?);
+            json_out(&e.health()?)?;
         }
         Cmd::Version => {
-            json_out(&e.version()?);
+            json_out(&e.version()?)?;
         }
         Cmd::Stats(args) => match args.index {
-            Some(idx) => json_out(&e.index_stats(&idx)?),
-            None => json_out(&e.global_stats()?),
+            Some(idx) => json_out(&e.index_stats(&idx)?)?,
+            None => json_out(&e.global_stats()?)?,
         },
         Cmd::Dump => {
-            json_out(&e.create_dump()?);
+            json_out(&e.create_dump()?)?;
         }
         Cmd::Snapshot => {
-            json_out(&e.create_snapshot()?);
+            json_out(&e.create_snapshot()?)?;
         }
         Cmd::Export(args) => {
             let indexes = args.indexes.map(|idx_str| {
@@ -452,11 +450,11 @@ fn run(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
                     .collect()
             });
             let req = ExportRequest {
-                url: args.target,
-                api_key: args.api_key,
+                url: args.target.display().to_string(),
+                api_key: None,
                 indexes,
             };
-            json_out(&e.export(&req)?);
+            json_out(&e.export(&req)?)?;
         }
     }
 

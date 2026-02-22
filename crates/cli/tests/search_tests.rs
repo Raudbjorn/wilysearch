@@ -1,13 +1,8 @@
-use assert_cmd::cargo::cargo_bin_cmd;
-use assert_cmd::Command;
+mod common;
+
+use common::wily;
 use serde_json::Value;
 use tempfile::TempDir;
-
-// ---- Helpers ----------------------------------------------------------------
-
-fn wily() -> Command {
-    cargo_bin_cmd!("wily")
-}
 
 /// Create a movies index with filterable/sortable attributes and sample docs.
 fn setup_searchable_movies(tmp: &TempDir) -> &std::path::Path {
