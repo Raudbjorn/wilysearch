@@ -38,8 +38,8 @@ use figment::providers::{Env, Format, Serialized, Toml};
 use figment::{Figment, Provider};
 use serde::{Deserialize, Serialize};
 
-use crate::core::preprocessing::config::PreprocessingConfig;
 use crate::core::MeilisearchOptions;
+use crate::core::preprocessing::config::PreprocessingConfig;
 
 // ─── Error type ──────────────────────────────────────────────────────────────
 
@@ -70,6 +70,8 @@ pub enum ConfigError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WilysearchConfig {
+    #[cfg(feature = "ai")]
+    pub personalization: Option<crate::ai::CohereConfig>,
     /// LMDB engine settings (database path, mmap sizes).
     pub engine: EngineConfig,
 
@@ -108,6 +110,8 @@ pub struct WilysearchConfig {
 impl Default for WilysearchConfig {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "ai")]
+            personalization: None,
             engine: EngineConfig::default(),
             preprocessing: PreprocessingConfig::default(),
             #[cfg(feature = "surrealdb")]
@@ -127,6 +131,8 @@ impl Default for WilysearchConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EngineConfig {
+    /// Allow local provider endpoints (Ollama, vLLM, or local HTTP services).
+    pub allow_local_provider_urls: bool,
     /// Directory where the LMDB database files are stored.
     /// Default: `"data.ms"`
     pub db_path: PathBuf,
@@ -144,6 +150,7 @@ impl Default for EngineConfig {
     fn default() -> Self {
         let opts = MeilisearchOptions::default();
         Self {
+            allow_local_provider_urls: opts.allow_local_provider_urls,
             db_path: opts.db_path,
             max_index_size: opts.max_index_size,
             max_task_db_size: opts.max_task_db_size,
@@ -154,6 +161,7 @@ impl Default for EngineConfig {
 impl From<EngineConfig> for MeilisearchOptions {
     fn from(c: EngineConfig) -> Self {
         Self {
+            allow_local_provider_urls: c.allow_local_provider_urls,
             db_path: c.db_path,
             max_index_size: c.max_index_size,
             max_task_db_size: c.max_task_db_size,
@@ -230,7 +238,10 @@ pub struct VectorStoreAuth {
 
 #[cfg(feature = "surrealdb")]
 impl Serialize for VectorStoreAuth {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         let mut s = serializer.serialize_struct("VectorStoreAuth", 2)?;
         s.serialize_field("username", &self.username)?;
@@ -250,12 +261,12 @@ impl From<VectorStoreConfig> for crate::core::vector::surrealdb::SurrealDbVector
             dimensions: c.dimensions,
             hnsw_m: c.hnsw_m,
             hnsw_ef: c.hnsw_ef,
-            auth: c.auth.map(|a| {
-                crate::core::vector::surrealdb::SurrealDbAuth {
+            auth: c
+                .auth
+                .map(|a| crate::core::vector::surrealdb::SurrealDbAuth {
                     username: a.username,
                     password: a.password,
-                }
-            }),
+                }),
         }
     }
 }
@@ -344,11 +355,15 @@ impl TryFrom<RagConfig> for crate::core::rag::PipelineConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExperimentalConfig {
-    /// Enable Prometheus metrics endpoint.
+    pub foreign_keys: bool,
+    pub dynamic_search_rules: bool,
+    pub render_templates: bool,
+    pub chat_completions: bool,
+    /// Retained for configuration compatibility; embedded mode has no metrics endpoint.
     pub metrics: bool,
-    /// Enable the logs route for real-time log streaming.
+    /// Retained for configuration compatibility; embedded mode has no logs route.
     pub logs_route: bool,
-    /// Enable editing documents by function (JavaScript runtime).
+    /// Enable editing documents with native Rhai functions.
     pub edit_documents_by_function: bool,
     /// Enable the `CONTAINS` filter operator.
     pub contains_filter: bool,
@@ -363,6 +378,10 @@ pub struct ExperimentalConfig {
 impl From<ExperimentalConfig> for crate::core::ExperimentalFeatures {
     fn from(c: ExperimentalConfig) -> Self {
         Self {
+            foreign_keys: c.foreign_keys,
+            dynamic_search_rules: c.dynamic_search_rules,
+            render_templates: c.render_templates,
+            chat_completions: c.chat_completions,
             metrics: c.metrics,
             logs_route: c.logs_route,
             edit_documents_by_function: c.edit_documents_by_function,
@@ -712,12 +731,16 @@ mod tests {
         let figment = Figment::from(Serialized::defaults(WilysearchConfig::default()))
             .merge(Toml::string(toml));
         let result: std::result::Result<WilysearchConfig, _> = figment.extract();
-        assert!(result.is_err(), "invalid search type should fail at deserialization");
+        assert!(
+            result.is_err(),
+            "invalid search type should fail at deserialization"
+        );
     }
 
     #[test]
     fn test_engine_config_to_meilisearch_options() {
         let ec = EngineConfig {
+            allow_local_provider_urls: false,
             db_path: "/tmp/test".into(),
             max_index_size: 42,
             max_task_db_size: 7,

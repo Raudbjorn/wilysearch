@@ -34,8 +34,8 @@ use std::sync::Arc;
 use anyhow::Context;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
-use surrealdb::engine::any::{connect, Any};
 use surrealdb::Surreal;
+use surrealdb::engine::any::{Any, connect};
 use tokio::runtime::Runtime;
 
 use super::VectorStore;
@@ -125,7 +125,7 @@ struct HybridSearchResult {
 pub struct SurrealDbVectorStore {
     db: Arc<Surreal<Any>>,
     config: SurrealDbVectorStoreConfig,
-    runtime: Arc<Runtime>,
+    runtime: Option<Arc<Runtime>>,
 }
 
 /// Validate that a SurrealDB identifier (table, namespace, database) contains
@@ -191,12 +191,12 @@ impl SurrealDbVectorStore {
         let store = Self {
             db: Arc::new(db),
             config,
-            runtime: Arc::new(
+            runtime: Some(Arc::new(
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .context("Failed to create tokio runtime")?,
-            ),
+            )),
         };
 
         // Initialize schema
@@ -244,7 +244,7 @@ impl SurrealDbVectorStore {
         let store = Self {
             db: Arc::new(db),
             config,
-            runtime,
+            runtime: Some(runtime),
         };
 
         store.init_schema().await?;
@@ -343,11 +343,10 @@ impl SurrealDbVectorStore {
             for (key, value) in bindings {
                 query = query.bind((key, value));
             }
-            query.await
-                .with_context(|| {
-                    let doc_ids: Vec<u32> = batch.iter().map(|(id, _)| *id).collect();
-                    format!("Failed to upsert vectors for document batch {:?}", doc_ids)
-                })?;
+            query.await.with_context(|| {
+                let doc_ids: Vec<u32> = batch.iter().map(|(id, _)| *id).collect();
+                format!("Failed to upsert vectors for document batch {:?}", doc_ids)
+            })?;
         }
 
         Ok(())
@@ -358,7 +357,10 @@ impl SurrealDbVectorStore {
     /// For each document, this first deletes any existing vector records for that
     /// `doc_id`, then inserts the new vectors. This prevents stale records when a
     /// document is re-indexed with fewer vectors than before.
-    pub async fn add_documents_async(&self, documents: &[(u32, Vec<Vec<f32>>)]) -> anyhow::Result<()> {
+    pub async fn add_documents_async(
+        &self,
+        documents: &[(u32, Vec<Vec<f32>>)],
+    ) -> anyhow::Result<()> {
         Self::upsert_documents_inner(&self.db, &self.config.table, documents).await
     }
 
@@ -447,7 +449,9 @@ impl SurrealDbVectorStore {
                 .context("Failed to execute vector search")?
         };
 
-        let results: Vec<SearchResult> = response.take(0usize).context("Failed to parse search results")?;
+        let results: Vec<SearchResult> = response
+            .take(0usize)
+            .context("Failed to parse search results")?;
 
         // Deduplicate by doc_id (in case multiple vectors per document),
         // converting distance to similarity (1.0 - distance)
@@ -608,6 +612,10 @@ impl SurrealDbVectorStore {
         &self,
         f: impl std::future::Future<Output = anyhow::Result<T>>,
     ) -> anyhow::Result<T> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .context("Vector store is shutting down")?;
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
@@ -616,9 +624,9 @@ impl SurrealDbVectorStore {
                          runtime. Use a multi_thread runtime or wrap calls in spawn_blocking."
                     ));
                 }
-                tokio::task::block_in_place(|| self.runtime.block_on(f))
+                tokio::task::block_in_place(|| runtime.block_on(f))
             }
-            Err(_) => self.runtime.block_on(f),
+            Err(_) => runtime.block_on(f),
         }
     }
 
@@ -687,20 +695,14 @@ pub struct VectorStoreStats {
     pub dimensions: usize,
 }
 
-// Dropping a tokio `Runtime` inside an async context panics with "Cannot drop a
-// runtime in a context where blocking is not allowed". This happens when tests
-// (or production code) use `#[tokio::test]` and the `SurrealDbVectorStore` is
-// dropped at the end of the async function.
-//
-// Fix: clone the `Arc<Runtime>` to bump the refcount, then move the clone to a
-// background thread. When the struct's fields drop, the Arc decrements to 1
-// (held by the thread) -- the Runtime is NOT freed. The thread then drops its
-// reference outside the async context, freeing the Runtime safely.
 impl Drop for SurrealDbVectorStore {
     fn drop(&mut self) {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            let rt = self.runtime.clone();
-            std::thread::spawn(move || drop(rt));
+        if tokio::runtime::Handle::try_current().is_ok()
+            && let Some(runtime) = self.runtime.take().and_then(Arc::into_inner)
+        {
+            // Move the last owner out before dropping fields; cloning to another
+            // thread races with that thread releasing its clone first.
+            runtime.shutdown_background();
         }
     }
 }
@@ -720,10 +722,8 @@ impl VectorStore for SurrealDbVectorStore {
         let db = Arc::clone(&self.db);
         let table = self.config.table.clone();
 
-        self.block_on(async move {
-            Self::upsert_documents_inner(&db, &table, &documents).await
-        })
-        .map_err(to_core_error)
+        self.block_on(async move { Self::upsert_documents_inner(&db, &table, &documents).await })
+            .map_err(to_core_error)
     }
 
     fn remove_documents(&self, ids: &[u32]) -> CoreResult<()> {
@@ -806,8 +806,9 @@ impl VectorStore for SurrealDbVectorStore {
                     .context("Failed to execute vector search")?
             };
 
-            let results: Vec<SearchResult> =
-                response.take(0usize).context("Failed to parse search results")?;
+            let results: Vec<SearchResult> = response
+                .take(0usize)
+                .context("Failed to parse search results")?;
 
             // Deduplicate by doc_id, converting distance to similarity
             let mut seen = std::collections::HashSet::new();
@@ -979,11 +980,14 @@ mod tests {
         let store = SurrealDbVectorStore::new(config).await.unwrap();
 
         // Insert a document with 3 vectors
-        let docs = vec![(1, vec![
-            vec![1.0, 0.0, 0.0, 0.0],
-            vec![0.0, 1.0, 0.0, 0.0],
-            vec![0.0, 0.0, 1.0, 0.0],
-        ])];
+        let docs = vec![(
+            1,
+            vec![
+                vec![1.0, 0.0, 0.0, 0.0],
+                vec![0.0, 1.0, 0.0, 0.0],
+                vec![0.0, 0.0, 1.0, 0.0],
+            ],
+        )];
 
         store.add_documents_async(&docs).await.unwrap();
 
@@ -1015,11 +1019,14 @@ mod tests {
 
         // Insert doc 1 with 3 vectors
         store
-            .add_documents_async(&[(1, vec![
-                vec![1.0, 0.0, 0.0, 0.0],
-                vec![0.0, 1.0, 0.0, 0.0],
-                vec![0.0, 0.0, 1.0, 0.0],
-            ])])
+            .add_documents_async(&[(
+                1,
+                vec![
+                    vec![1.0, 0.0, 0.0, 0.0],
+                    vec![0.0, 1.0, 0.0, 0.0],
+                    vec![0.0, 0.0, 1.0, 0.0],
+                ],
+            )])
             .await
             .unwrap();
 
@@ -1033,7 +1040,10 @@ mod tests {
             .unwrap();
 
         let stats = store.stats().await.unwrap();
-        assert_eq!(stats.total_vectors, 1, "stale vector rows should be removed after replacement");
+        assert_eq!(
+            stats.total_vectors, 1,
+            "stale vector rows should be removed after replacement"
+        );
         assert_eq!(stats.unique_documents, 1);
 
         // Search should only find the new vector
@@ -1051,6 +1061,9 @@ mod tests {
             .unwrap();
         // Should still return doc 1 (it's the only doc) but with low similarity
         assert_eq!(results.len(), 1);
-        assert!(results[0].1 < 0.5, "old vector direction should have low similarity");
+        assert!(
+            results[0].1 < 0.5,
+            "old vector direction should have low similarity"
+        );
     }
 }

@@ -470,3 +470,15 @@ fn test_search_combined_options() {
         );
     }
 }
+
+#[test]
+fn test_complete_search_request_file() {
+    let tmp=TempDir::new().unwrap();
+    let db=setup_searchable_movies(&tmp);
+    let path=tmp.path().join("request.json");
+    std::fs::write(&path,r#"{"filter":["year > 2000"],"sort":["year:desc"],"attributesToRetrieve":["title"],"limit":1}"#).unwrap();
+    let output=wily().arg("--db").arg(db).args(["search","movies","--request"]).arg(&path).assert().success().get_output().stdout.clone();
+    let result:Value=serde_json::from_slice(&output).unwrap();
+    assert_eq!(result["hits"][0]["title"],"Interstellar");
+    assert!(result["hits"][0].get("year").is_none());
+}

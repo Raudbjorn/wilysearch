@@ -141,6 +141,9 @@ enum DocCmd {
 struct SearchArgs {
     /// Index to search
     index: String,
+    /// Read a complete search request from a JSON file
+    #[arg(long, conflicts_with_all = ["query", "limit", "offset", "filter", "sort", "facets", "fields", "show_ranking_score", "matching_strategy"])]
+    request: Option<PathBuf>,
     /// Search query (optional; empty returns all documents)
     query: Option<String>,
     #[arg(long)]
@@ -321,7 +324,10 @@ fn run(cli: Cli) -> Result<()> {
         // ── Documents ────────────────────────────────────────────────────
         Cmd::Doc(cmd) => match cmd {
             DocCmd::Get { index, id, fields } => {
-                let q = DocumentQuery { fields };
+                let q = DocumentQuery {
+                    fields: fields.as_deref().map(csv_to_vec),
+                    ..Default::default()
+                };
                 json_out(&e.get_document(&index, &id, &q)?)?;
             }
             DocCmd::List {
@@ -334,8 +340,8 @@ fn run(cli: Cli) -> Result<()> {
                 let q = DocumentsQuery {
                     offset,
                     limit,
-                    fields,
-                    filter,
+                    fields: fields.as_deref().map(csv_to_vec),
+                    filter: filter.map(Value::String),
                     ..Default::default()
                 };
                 json_out(&e.get_documents(&index, &q)?)?;
@@ -356,14 +362,14 @@ fn run(cli: Cli) -> Result<()> {
                 json_out(&e.delete_document(&index, &id)?)?;
             }
             DocCmd::DeleteBatch { index, ids } => {
-                let id_values: Vec<Value> = csv_to_vec(&ids)
-                    .into_iter()
-                    .map(Value::String)
-                    .collect();
+                let id_values: Vec<Value> =
+                    csv_to_vec(&ids).into_iter().map(Value::String).collect();
                 json_out(&e.delete_documents_by_batch(&index, &id_values)?)?;
             }
             DocCmd::DeleteFilter { index, filter } => {
-                let req = DeleteDocumentsByFilterRequest { filter };
+                let req = DeleteDocumentsByFilterRequest {
+                    filter: Value::String(filter),
+                };
                 json_out(&e.delete_documents_by_filter(&index, &req)?)?;
             }
             DocCmd::DeleteAll { index } => {
@@ -373,6 +379,10 @@ fn run(cli: Cli) -> Result<()> {
 
         // ── Search ───────────────────────────────────────────────────────
         Cmd::Search(args) => {
+            if let Some(file) = &args.request {
+                let req: SearchRequest = read_json_file(file)?;
+                return json_out(&e.search(&args.index, &req)?);
+            }
             let mut req = SearchRequest::default();
             req.q = args.query;
             req.limit = args.limit;
@@ -401,6 +411,8 @@ fn run(cli: Cli) -> Result<()> {
         // ── Facet search ─────────────────────────────────────────────────
         Cmd::FacetSearch(args) => {
             let req = FacetSearchRequest {
+                ranking_score_threshold: None,
+                locales: None,
                 facet_name: args.facet_name,
                 facet_query: args.facet_query,
                 q: args.query,

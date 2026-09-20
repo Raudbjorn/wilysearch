@@ -16,6 +16,8 @@ defaults < TOML file < environment variables < programmatic overrides
 
 Every field has a documented default. A completely empty TOML file (or no file at all) produces a valid, working configuration.
 
+For the 0.2 storage rebuild and supported embedded capabilities, see [the compatibility guide](parity-0.2.md).
+
 ---
 
 ## Quick Start
@@ -153,12 +155,14 @@ LMDB engine settings controlling database location and memory-map sizes.
 | `db_path` | PathBuf | `"data.ms"` | Directory for LMDB database files |
 | `max_index_size` | usize (bytes) | 107,374,182,400 (100 GiB) | Maximum mmap size per index |
 | `max_task_db_size` | usize (bytes) | 10,737,418,240 (10 GiB) | Maximum mmap size for the task database |
+| `allow_local_provider_urls` | bool | `false` | Allow native embedders, chat and Cohere to contact local/private provider URLs |
 
 ```toml
 [engine]
 db_path = "/var/lib/wilysearch"
 max_index_size = 107_374_182_400
 max_task_db_size = 10_737_418_240
+allow_local_provider_urls = false
 ```
 
 ---
@@ -298,9 +302,13 @@ Experimental feature flags. All default to `false`. These correspond to experime
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `metrics` | bool | `false` | Enable Prometheus metrics |
-| `logs_route` | bool | `false` | Enable real-time log streaming |
-| `edit_documents_by_function` | bool | `false` | Enable JS-based document editing |
+| `foreign_keys` | bool | `false` | Enable foreign-key settings, hydration and filters |
+| `dynamic_search_rules` | bool | `false` | Enable persistent pin/scale search rules |
+| `render_templates` | bool | `false` | Enable template preview |
+| `chat_completions` | bool | `false` | Enable chat settings and workspace retrieval; provider calls also require the `ai` Cargo feature |
+| `metrics` | bool | `false` | Compatibility flag; embedded mode has no metrics endpoint |
+| `logs_route` | bool | `false` | Compatibility flag; embedded mode has no logs route |
+| `edit_documents_by_function` | bool | `false` | Enable native Rhai document editing |
 | `contains_filter` | bool | `false` | Enable the `CONTAINS` filter operator |
 | `composite_embedders` | bool | `false` | Enable multi-source embedders |
 | `multimodal` | bool | `false` | Enable multimodal embeddings |
@@ -308,6 +316,10 @@ Experimental feature flags. All default to `false`. These correspond to experime
 
 ```toml
 [experimental]
+foreign_keys = false
+dynamic_search_rules = false
+render_templates = false
+chat_completions = false
 metrics = false
 logs_route = false
 edit_documents_by_function = false
@@ -390,6 +402,21 @@ password = "secret"
 
 ---
 
+### `[personalization]` (requires `ai`)
+
+Optional Cohere configuration for synchronous search personalization and the async RAG reranker. This section uses **camelCase** fields. Omitting it leaves personalization unconfigured; requests with `personalize` then return an error. It can also be set at runtime with `Engine::set_personalization`.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `apiKey` | String | empty | Required provider credential |
+| `url` | String | `https://api.cohere.ai/v1/rerank` | Reranking endpoint |
+| `model` | String | `rerank-english-v3.0` | Provider model |
+| `timeoutMs` | u64 | 30,000 | Per-request timeout, bounded by the remaining search deadline |
+
+Chat provider settings are stored separately through `Engine::set_chat_workspace`. See [provider configuration](parity-0.2.md#provider-configuration) for workspace storage and credential handling.
+
+---
+
 ## Environment Variables
 
 All configuration fields can be overridden via environment variables using the naming convention:
@@ -407,6 +434,7 @@ Double-underscore (`__`) separates nesting levels. Field names are uppercased an
 | `engine.db_path` | `WILYSEARCH__ENGINE__DB_PATH` |
 | `engine.max_index_size` | `WILYSEARCH__ENGINE__MAX_INDEX_SIZE` |
 | `engine.max_task_db_size` | `WILYSEARCH__ENGINE__MAX_TASK_DB_SIZE` |
+| `engine.allow_local_provider_urls` | `WILYSEARCH__ENGINE__ALLOW_LOCAL_PROVIDER_URLS` |
 | `preprocessing.typo.enabled` | `WILYSEARCH__PREPROCESSING__TYPO__ENABLED` |
 | `preprocessing.typo.max_edit_distance` | `WILYSEARCH__PREPROCESSING__TYPO__MAX_EDIT_DISTANCE` |
 | `preprocessing.synonyms.enabled` | `WILYSEARCH__PREPROCESSING__SYNONYMS__ENABLED` |
@@ -422,6 +450,10 @@ Double-underscore (`__`) separates nesting levels. Field names are uppercased an
 | `rag.default_search_type` | `WILYSEARCH__RAG__DEFAULT_SEARCH_TYPE` |
 | `rag.semantic_ratio` | `WILYSEARCH__RAG__SEMANTIC_RATIO` |
 | `experimental.metrics` | `WILYSEARCH__EXPERIMENTAL__METRICS` |
+| `experimental.foreign_keys` | `WILYSEARCH__EXPERIMENTAL__FOREIGN_KEYS` |
+| `experimental.dynamic_search_rules` | `WILYSEARCH__EXPERIMENTAL__DYNAMIC_SEARCH_RULES` |
+| `experimental.render_templates` | `WILYSEARCH__EXPERIMENTAL__RENDER_TEMPLATES` |
+| `experimental.chat_completions` | `WILYSEARCH__EXPERIMENTAL__CHAT_COMPLETIONS` |
 | `experimental.logs_route` | `WILYSEARCH__EXPERIMENTAL__LOGS_ROUTE` |
 | `experimental.edit_documents_by_function` | `WILYSEARCH__EXPERIMENTAL__EDIT_DOCUMENTS_BY_FUNCTION` |
 | `experimental.contains_filter` | `WILYSEARCH__EXPERIMENTAL__CONTAINS_FILTER` |
@@ -540,6 +572,7 @@ A full configuration file with all sections and their defaults:
 db_path = "data.ms"
 max_index_size = 107_374_182_400   # 100 GiB
 max_task_db_size = 10_737_418_240  # 10 GiB
+allow_local_provider_urls = false
 
 [preprocessing.typo]
 enabled = true
@@ -574,6 +607,10 @@ default_search_type = "hybrid"
 semantic_ratio = 0.5
 
 [experimental]
+foreign_keys = false
+dynamic_search_rules = false
+render_templates = false
+chat_completions = false
 metrics = false
 logs_route = false
 edit_documents_by_function = false

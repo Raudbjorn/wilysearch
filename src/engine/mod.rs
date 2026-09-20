@@ -8,6 +8,8 @@
 mod conversion;
 mod documents;
 mod indexes;
+mod local;
+mod render;
 mod search;
 mod settings;
 mod stubs;
@@ -31,7 +33,11 @@ use crate::types::*;
 /// closes the LMDB environment in its own `Drop` implementation. No explicit
 /// `Drop` impl is needed on `Engine` itself.
 pub struct Engine {
-    inner: crate::core::Meilisearch,
+    pub(crate) inner: crate::core::Meilisearch,
+    #[cfg(feature = "ai")]
+    pub(crate) workspace_lock: std::sync::Mutex<()>,
+    #[cfg(feature = "ai")]
+    pub(crate) personalization: std::sync::RwLock<Option<crate::ai::CohereReranker>>,
     /// In-memory task counter; resets to 0 on restart. Task UIDs are not
     /// persisted and may collide across engine restarts. Consumers that need
     /// stable task references should use their own persistent counter.
@@ -72,6 +78,10 @@ impl Engine {
         let inner = crate::core::Meilisearch::new(options)?;
         Ok(Self {
             inner,
+            #[cfg(feature = "ai")]
+            workspace_lock: std::sync::Mutex::new(()),
+            #[cfg(feature = "ai")]
+            personalization: std::sync::RwLock::new(None),
             task_counter: AtomicU64::new(start_uid),
             task_counter_path,
             dump_dir,
@@ -122,7 +132,7 @@ impl Engine {
                     tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
-                        .map_err(|e| crate::core::error::Error::Internal(e.to_string()))?
+                        .map_err(|e| crate::core::error::Error::Internal(e.to_string()))?,
                 );
                 let store = rt
                     .block_on(
@@ -141,6 +151,17 @@ impl Engine {
         inner.update_experimental_features(exp_features);
 
         Ok(Self {
+            #[cfg(feature = "ai")]
+            workspace_lock: std::sync::Mutex::new(()),
+            #[cfg(feature = "ai")]
+            personalization: std::sync::RwLock::new(
+                config
+                    .personalization
+                    .map(|c| {
+                        crate::ai::CohereReranker::new(c, inner.options.allow_local_provider_urls)
+                    })
+                    .transpose()?,
+            ),
             inner,
             task_counter: AtomicU64::new(start_uid),
             task_counter_path,
@@ -156,9 +177,8 @@ impl Engine {
     /// Loads the file with [`WilysearchConfig::from_file`](crate::config::WilysearchConfig::from_file),
     /// applying environment variable overrides, then delegates to [`Engine::with_config`].
     pub fn from_config_file(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let config = crate::config::WilysearchConfig::from_file(path).map_err(|e| {
-            crate::core::error::Error::Internal(e.to_string())
-        })?;
+        let config = crate::config::WilysearchConfig::from_file(path)
+            .map_err(|e| crate::core::error::Error::Internal(e.to_string()))?;
         Self::with_config(config)
     }
 
@@ -218,5 +238,7 @@ const _: () = {
     #[allow(dead_code)]
     fn assert_send_sync<T: Send + Sync>() {}
     #[allow(dead_code)]
-    fn assert_engine() { assert_send_sync::<Engine>(); }
+    fn assert_engine() {
+        assert_send_sync::<Engine>();
+    }
 };

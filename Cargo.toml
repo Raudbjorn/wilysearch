@@ -3,25 +3,33 @@ members = [".", "crates/cli"]
 
 [package]
 name = "wilysearch"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"  # edition 2024 requires 1.85+; floor_char_boundary stable since 1.82
+rust-version = "1.98.1"
 
 [features]
 default = []
+ai = ["dep:async-openai", "dep:tokio", "dep:futures", "dep:tokio-stream"]
 surrealdb = ["dep:surrealdb", "dep:tokio"]
 
 [dependencies]
-# Meilisearch core crates — pinned to tag v1.35.0
-# rev a1e3c2cb corresponds to the v1.35.0 release tag.
-meilisearch-types = { git = "https://github.com/meilisearch/meilisearch", rev = "a1e3c2cb8f99dd6ec9182b9d26927477eef3ef14" }
-milli = { git = "https://github.com/meilisearch/meilisearch", rev = "a1e3c2cb8f99dd6ec9182b9d26927477eef3ef14" }
-file-store = { git = "https://github.com/meilisearch/meilisearch", rev = "a1e3c2cb8f99dd6ec9182b9d26927477eef3ef14" }
-http-client = { git = "https://github.com/meilisearch/meilisearch", rev = "a1e3c2cb8f99dd6ec9182b9d26927477eef3ef14" }
+# Meilisearch 1.54 development snapshot (2026-09-19).
+meilisearch-types = { git = "https://github.com/meilisearch/meilisearch", rev = "1380adaacebad8a019d88549a06bae2dd90de249" }
+milli = { git = "https://github.com/meilisearch/meilisearch", rev = "1380adaacebad8a019d88549a06bae2dd90de249" }
+permissive-json-pointer = { git = "https://github.com/meilisearch/meilisearch", rev = "1380adaacebad8a019d88549a06bae2dd90de249" }
+file-store = { git = "https://github.com/meilisearch/meilisearch", rev = "1380adaacebad8a019d88549a06bae2dd90de249" }
+http-client = { git = "https://github.com/meilisearch/meilisearch", rev = "1380adaacebad8a019d88549a06bae2dd90de249" }
+
+# Optional chat provider client: same upstream fork and network policy as milli.
+async-openai = { git = "https://github.com/meilisearch/meilisearch", rev = "1380adaacebad8a019d88549a06bae2dd90de249", optional = true }
+futures = { version = "0.3", optional = true }
+tokio-stream = { version = "0.1", optional = true }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# milli's Rhai document updater requires this transitive serialization feature.
+smartstring = { version = "1", features = ["serde"] }
 indexmap = { version = "2", features = ["serde"] }
 toml = "0.8"
 
@@ -39,10 +47,11 @@ tracing = "0.1"
 # Data structures / concurrency
 uuid = { version = "1.11", features = ["v4"] }
 time = { version = "0.3", features = ["serde-well-known"] }
-roaring = "0.10"
+roaring = "0.11"
 crossbeam-channel = "0.5"
 rayon = "1.10"
 bumpalo = "3.16"
+bumparaw-collections = "0.2"
 fst = "0.4"
 
 # Query preprocessing
@@ -50,28 +59,9 @@ symspell = "0.4"
 strsim = "0.11"
 unicode-normalization = "0.1"
 
-# ┌──────────────────────────────────────────────────────────────────────────┐
-# │ CRITICAL PIN: candle-core/nn/transformers MUST stay at =0.9.1           │
-# │                                                                          │
-# │ candle 0.9.2 pulls in zip 7.x -> typed-path 0.12, which introduces an  │
-# │ ambiguous AsRef impl that breaks milli compilation. This matches the    │
-# │ Meilisearch v1.35.0 upstream Cargo.lock. Exact version pins in a        │
-# │ library crate are viral -- any downstream crate that needs a different   │
-# │ candle version will get a dependency conflict. If upgrading milli,       │
-# │ verify candle compatibility first.                                       │
-# │                                                                          │
-# │ These pins constrain milli's transitive candle resolution and            │
-# │ cannot be made optional: milli (a required dep) pulls candle             │
-# │ transitively, so removing these pins would allow the resolver to         │
-# │ pick an incompatible version.                                            │
-# └──────────────────────────────────────────────────────────────────────────┘
-candle-core = "=0.9.1"
-candle-nn = "=0.9.1"
-candle-transformers = "=0.9.1"
-
 # Optional SurrealDB support
 surrealdb = { version = "2.6", features = ["kv-mem", "kv-rocksdb"], optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "sync"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"], optional = true }
 paste = "1.0.15"
 
 [dev-dependencies]

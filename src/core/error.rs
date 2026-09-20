@@ -6,6 +6,10 @@ use thiserror::Error;
 /// automatically from underlying crate errors via `#[from]`.
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error(
+        "Incompatible database format: {0}. Rebuild with Wilysearch 0.2 in a new directory; the existing data has not been migrated"
+    )]
+    IncompatibleDatabase(String),
     /// An error propagated from the milli search engine.
     #[error("Milli error: {0}")]
     Milli(#[from] milli::Error),

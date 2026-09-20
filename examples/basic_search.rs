@@ -7,8 +7,8 @@
 //! 4. Performing keyword searches with various options
 //! 5. Using offset/limit pagination to browse results
 
-use wilysearch::core::{Meilisearch, MeilisearchOptions, SearchQuery, Settings};
 use serde_json::json;
+use wilysearch::core::{Meilisearch, MeilisearchOptions, SearchQuery, Settings};
 
 fn main() -> wilysearch::core::Result<()> {
     // -- Setup: create an embedded Meilisearch instance in a temp directory --
@@ -25,14 +25,11 @@ fn main() -> wilysearch::core::Result<()> {
     println!("Index 'movies' created.");
 
     // -- Configure filterable and sortable attributes --
-    let settings = Settings::new()
-        .with_searchable_attributes(vec![
-            "title".into(),
-            "overview".into(),
-            "genres".into(),
-        ])
-        .with_filterable_attributes(vec!["year".into(), "genres".into()])
-        .with_sortable_attributes(["year".into()].into_iter().collect());
+    let settings: Settings = serde_json::from_value(json!({
+        "searchableAttributes": ["title", "overview", "genres"],
+        "filterableAttributes": ["year", "genres"],
+        "sortableAttributes": ["year"]
+    }))?;
     index.update_settings(&settings)?;
     println!("Settings configured (searchable, filterable, sortable).");
 
@@ -115,10 +112,7 @@ fn main() -> wilysearch::core::Result<()> {
     let result = index.search(&query)?;
     println!("Hits after filtering:");
     for hit in &result.hits {
-        println!(
-            "  - {} ({})",
-            hit.document["title"], hit.document["year"]
-        );
+        println!("  - {} ({})", hit.document["title"], hit.document["year"]);
     }
 
     // -- Pagination: offset/limit --
@@ -145,10 +139,7 @@ fn main() -> wilysearch::core::Result<()> {
         .with_limit(6);
     let result = index.search(&query)?;
     for hit in &result.hits {
-        println!(
-            "  - {} ({})",
-            hit.document["title"], hit.document["year"]
-        );
+        println!("  - {} ({})", hit.document["title"], hit.document["year"]);
     }
 
     // -- Cleanup happens automatically when tmp_dir goes out of scope --
