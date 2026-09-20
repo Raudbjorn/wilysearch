@@ -308,7 +308,7 @@ fn validate_request(request: &SearchRequest) -> Result<()> {
     if request.vector.as_ref().is_some_and(|v| {
         v.is_empty() || v.iter().any(|&f| !f.is_finite() || !(f as f32).is_finite())
     }) {
-        return Err(crate::core::Error::Internal(
+        return Err(crate::core::Error::InvalidSearchRequest(
             "Vector must contain finite f32 components".into(),
         ));
     }

@@ -430,13 +430,24 @@ impl Default for SearchDefaultsConfig {
 // ─── Loading methods ─────────────────────────────────────────────────────────
 
 impl WilysearchConfig {
+    fn env() -> Env {
+        Env::prefixed("WILYSEARCH__")
+            .split("__")
+            .map(|key| match key.as_str().to_ascii_lowercase().as_str() {
+                "personalization.apikey" => "personalization.apiKey".into(),
+                "personalization.timeoutms" => "personalization.timeoutMs".into(),
+                key => key.to_owned().into(),
+            })
+            .lowercase(false)
+    }
+
     /// Build the standard figment: defaults -> `wilysearch.toml` -> env vars.
     ///
     /// Consumers can extend this with additional sources before extracting.
     pub fn figment() -> Figment {
         Figment::from(Serialized::defaults(WilysearchConfig::default()))
             .merge(Toml::file("wilysearch.toml"))
-            .merge(Env::prefixed("WILYSEARCH__").split("__"))
+            .merge(Self::env())
     }
 
     /// Load from the standard figment (defaults + `wilysearch.toml` + env vars).
@@ -450,7 +461,7 @@ impl WilysearchConfig {
     pub fn from_file(path: impl AsRef<Path>) -> std::result::Result<Self, ConfigError> {
         let figment = Figment::from(Serialized::defaults(WilysearchConfig::default()))
             .merge(Toml::file(path.as_ref()))
-            .merge(Env::prefixed("WILYSEARCH__").split("__"));
+            .merge(Self::env());
         Self::from_figment(figment)
     }
 
@@ -806,6 +817,31 @@ mod tests {
             assert_eq!(config.engine.db_path, PathBuf::from("/env/path"));
             assert_eq!(config.rag.retrieval_limit, 42);
             assert_eq!(config.search_defaults.limit, 100);
+            Ok(())
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "ai")]
+    fn test_personalization_env_mapping() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "wilysearch.toml",
+                "[personalization]\napiKey = \"file-key\"\ntimeoutMs = 9999\n",
+            )?;
+            jail.set_env("WILYSEARCH__PERSONALIZATION__APIKEY", "mock-key");
+            jail.set_env(
+                "WILYSEARCH__PERSONALIZATION__URL",
+                "https://provider.example/rerank",
+            );
+            jail.set_env("WILYSEARCH__PERSONALIZATION__MODEL", "mock-model");
+            jail.set_env("WILYSEARCH__PERSONALIZATION__TIMEOUTMS", "1500");
+            let config: WilysearchConfig = WilysearchConfig::figment().extract()?;
+            let config = config.personalization.unwrap();
+            assert_eq!(config.api_key, "mock-key");
+            assert_eq!(config.url, "https://provider.example/rerank");
+            assert_eq!(config.model, "mock-model");
+            assert_eq!(config.timeout_ms, 1500);
             Ok(())
         });
     }

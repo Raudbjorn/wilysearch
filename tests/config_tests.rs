@@ -386,17 +386,20 @@ fn test_engine_config_converts_to_meilisearch_options() {
     use wilysearch::core::MeilisearchOptions;
 
     let temp = TempDir::new().unwrap();
-    let ec = EngineConfig {
-        allow_local_provider_urls: false,
-        db_path: temp.path().to_path_buf(),
-        max_index_size: 200 * 1024 * 1024,
-        max_task_db_size: 20 * 1024 * 1024,
-    };
-
-    let opts: MeilisearchOptions = ec.into();
-    assert_eq!(opts.db_path, temp.path().to_path_buf());
-    assert_eq!(opts.max_index_size, 200 * 1024 * 1024);
-    assert_eq!(opts.max_task_db_size, 20 * 1024 * 1024);
+    assert!(!EngineConfig::default().allow_local_provider_urls);
+    for allow_local_provider_urls in [false, true] {
+        let ec = EngineConfig {
+            allow_local_provider_urls,
+            db_path: temp.path().to_path_buf(),
+            max_index_size: 200 * 1024 * 1024,
+            max_task_db_size: 20 * 1024 * 1024,
+        };
+        let opts: MeilisearchOptions = ec.into();
+        assert_eq!(opts.db_path, temp.path().to_path_buf());
+        assert_eq!(opts.max_index_size, 200 * 1024 * 1024);
+        assert_eq!(opts.max_task_db_size, 20 * 1024 * 1024);
+        assert_eq!(opts.allow_local_provider_urls, allow_local_provider_urls);
+    }
 }
 
 /// Verify that a config built programmatically can be used as a figment

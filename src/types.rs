@@ -237,6 +237,37 @@ pub struct DeleteDocumentsByFilterRequest {
 
 // ─── Search ──────────────────────────────────────────────────────────────────
 
+/// Hybrid search configuration. An omitted embedder selects `default`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct HybridQuery {
+    /// Balance between keyword (0.0) and semantic (1.0) search. Default: 0.5.
+    pub semantic_ratio: f32,
+    /// Name of the embedder. Default: `default`.
+    pub embedder: String,
+}
+
+impl Default for HybridQuery {
+    fn default() -> Self {
+        Self::new("default")
+    }
+}
+
+impl HybridQuery {
+    /// Select an embedder with a default semantic ratio of 0.5.
+    pub fn new(embedder: impl Into<String>) -> Self {
+        Self {
+            semantic_ratio: 0.5,
+            embedder: embedder.into(),
+        }
+    }
+    /// Set the ratio, clamped to 0.0 (keyword) through 1.0 (semantic).
+    pub fn with_semantic_ratio(mut self, ratio: f32) -> Self {
+        self.semantic_ratio = ratio.clamp(0.0, 1.0);
+        self
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchRequest {
@@ -293,7 +324,7 @@ pub struct SearchRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub locales: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub hybrid: Option<crate::core::HybridQuery>,
+    pub hybrid: Option<HybridQuery>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vector: Option<Vec<f64>>,
 }
@@ -476,7 +507,7 @@ impl SearchRequest {
     }
 
     #[must_use]
-    pub fn hybrid(mut self, hybrid: crate::core::HybridQuery) -> Self {
+    pub fn hybrid(mut self, hybrid: HybridQuery) -> Self {
         self.hybrid = Some(hybrid);
         self
     }
@@ -594,10 +625,11 @@ pub enum MultiSearchResult {
 
 /// Federation configuration for merged multi-search.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct FederationSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub personalize: Option<Personalize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub distinct: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
@@ -959,6 +991,7 @@ pub struct FieldsFilter {
 
 /// Field metadata uses the upstream JSON shape, including capability details and locales.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FieldsResponse {
     pub results: Vec<Value>,
     pub offset: usize,
@@ -1030,13 +1063,14 @@ pub enum RenderInput {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RenderSearchInput {
     pub q: Option<String>,
     pub media: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RenderResponse {
     pub template: Value,
     pub rendered: Option<Value>,

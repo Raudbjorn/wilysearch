@@ -16,6 +16,7 @@ struct MergeHybridOptions<'a> {
     limit: usize,
     offset: usize,
     show_ranking_score: bool,
+    retrieve_vectors: bool,
     attributes_to_retrieve: Option<&'a BTreeSet<String>>,
 }
 
@@ -106,6 +107,7 @@ impl Index {
                     limit: query.search.limit,
                     offset: query.search.offset,
                     show_ranking_score: query.search.show_ranking_score,
+                    retrieve_vectors: query.search.retrieve_vectors,
                     attributes_to_retrieve: query.search.attributes_to_retrieve.as_ref(),
                 },
             )?;
@@ -172,6 +174,7 @@ impl Index {
             limit,
             offset,
             show_ranking_score,
+            retrieve_vectors,
             attributes_to_retrieve,
         } = opts;
         let fields_ids_map = self.inner.fields_ids_map(rtxn).map_err(Error::Heed)?;
@@ -297,7 +300,7 @@ impl Index {
                     &fields_ids_map,
                     entry.doc_id,
                     requested.as_deref(),
-                    false,
+                    *retrieve_vectors,
                     true,
                 )?;
 

@@ -43,8 +43,41 @@ fn search(engine: &Engine, uid: &str, request: Value) -> SearchResponse {
 }
 
 #[test]
+fn federation_empty_json_and_rust_defaults() {
+    let core: wilysearch::core::Federation = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(core.limit, 20);
+    assert!(core.distinct.is_none());
+    assert_eq!(
+        serde_json::to_value(&core).unwrap(),
+        serde_json::to_value(wilysearch::core::Federation::default()).unwrap()
+    );
+    let public: FederationSettings = serde_json::from_value(json!({})).unwrap();
+    assert!(public.distinct.is_none());
+    assert!(public.personalize.is_none());
+    for federation in [
+        json!({}),
+        json!({"facetsByIndex":{"docs":["group"]},"mergeFacets":{}}),
+    ] {
+        let request: MultiSearchRequest =
+            serde_json::from_value(json!({"queries":[],"federation":federation})).unwrap();
+        assert!(request.federation.is_some());
+    }
+    let query: wilysearch::core::SearchQuery = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(
+        serde_json::to_value(query).unwrap(),
+        serde_json::to_value(wilysearch::core::SearchQuery::default()).unwrap()
+    );
+    let options: wilysearch::core::FederationOptions = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(options.weight, 1.0);
+    assert_eq!(
+        serde_json::to_value(options).unwrap(),
+        serde_json::to_value(wilysearch::core::FederationOptions::default()).unwrap()
+    );
+}
+
+#[test]
 fn settings_reset_and_nested_documents() {
-    let (engine, _dir) = setup();
+    let (engine, dir) = setup();
     index(
         &engine,
         "docs",
@@ -57,7 +90,14 @@ fn settings_reset_and_nested_documents() {
     );
     let settings = engine.get_settings("docs").unwrap();
     engine.update_settings("docs", &settings).unwrap();
-    let got = serde_json::to_value(settings).unwrap();
+    drop(engine);
+    let engine = Engine::new(MeilisearchOptions {
+        db_path: dir.path().into(),
+        ..Default::default()
+    })
+    .unwrap();
+    let got = serde_json::to_value(engine.get_settings("docs").unwrap()).unwrap();
+    assert_eq!(got, serde_json::to_value(settings).unwrap());
     assert_eq!(got["prefixSearch"], "disabled");
     assert_eq!(got["typoTolerance"]["disableOnNumbers"], true);
     let result = search(
@@ -134,7 +174,7 @@ fn native_vectors_similar_and_federation() {
         &engine,
         "docs",
         json!({"embedders":{"manual":{"source":"userProvided","dimensions":2}},"filterableAttributes":["group"],"faceting":{"sortFacetValuesBy":{"*":"count"}}}),
-        json!([{"id":1,"title":"one","group":"a","_vectors":{"manual":[1.0,0.0]}},{"id":2,"title":"two","group":"a","_vectors":{"manual":[0.9,0.1]}},{"id":3,"title":"three","group":"b","_vectors":{"manual":[0.0,1.0]}}]),
+        json!([{"id":1,"title":"one","group":"z","_vectors":{"manual":[1.0,0.0]}},{"id":2,"title":"two","group":"z","_vectors":{"manual":[0.9,0.1]}},{"id":3,"title":"three","group":"b","_vectors":{"manual":[0.0,1.0]}}]),
     );
     let result = search(
         &engine,
@@ -173,8 +213,8 @@ fn native_vectors_similar_and_federation() {
         2
     );
     let facets = &result.facet_distribution.unwrap()["group"];
-    assert_eq!(facets["a"], 2);
-    assert_eq!(facets.first().unwrap().0, "a");
+    assert_eq!(facets["z"], 2);
+    assert_eq!(facets.first().unwrap().0, "z"); // count order differs from alphabetical order
     engine
         .update_settings(
             "docs",
@@ -197,6 +237,178 @@ fn native_vectors_similar_and_federation() {
     );
     assert!(projected.hits[0].get("_vectors").is_some());
     assert!(projected.hits[0].get("title").is_none());
+}
+
+#[test]
+fn settings_redact_credentials_but_backups_preserve_them() {
+    let (engine, dir) = setup();
+    index(
+        &engine,
+        "docs",
+        json!({"embedders":{"default":{"source":"openAi","model":"text-embedding-3-small","dimensions":2,"url":"http://127.0.0.1:9/embeddings","apiKey":"mock-private-key"}}}),
+        json!([]),
+    );
+    let settings = serde_json::to_value(engine.get_settings("docs").unwrap()).unwrap();
+    assert_ne!(
+        settings["embedders"]["default"]["apiKey"],
+        "mock-private-key"
+    );
+    assert!(!settings.to_string().contains("mock-private-key"));
+    let export = dir.path().join("export");
+    engine
+        .export(&serde_json::from_value(json!({"url":export})).unwrap())
+        .unwrap();
+    let settings: Value =
+        serde_json::from_slice(&std::fs::read(export.join("docs/settings.json")).unwrap()).unwrap();
+    assert_eq!(
+        settings["embedders"]["default"]["apiKey"],
+        "mock-private-key"
+    );
+    engine.create_dump().unwrap();
+    let dump = std::fs::read_dir(dir.path().join("dumps"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let settings: Value =
+        serde_json::from_slice(&std::fs::read(dump.join("docs/settings.json")).unwrap()).unwrap();
+    assert_eq!(
+        settings["embedders"]["default"]["apiKey"],
+        "mock-private-key"
+    );
+}
+
+#[test]
+fn normalized_match_positions_use_original_bytes() {
+    let (engine, _dir) = setup();
+    index(
+        &engine,
+        "docs",
+        json!({}),
+        json!([{"id":1,"title":"Un café"}]),
+    );
+    let result = search(
+        &engine,
+        "docs",
+        json!({"q":"cafe","attributesToHighlight":["title"],"showMatchesPosition":true}),
+    );
+    assert_eq!(result.hits[0]["_formatted"]["title"], "Un <em>café</em>");
+    assert_eq!(result.hits[0]["_matchesPosition"]["title"][0]["start"], 3);
+    assert_eq!(
+        result.hits[0]["_matchesPosition"]["title"][0]["length"],
+        "café".len()
+    );
+}
+
+#[test]
+fn keyword_only_hybrid_needs_no_embedder_and_default_embedder_is_public() {
+    let (engine, _dir) = setup();
+    index(&engine, "docs", json!({}), json!([{"id":1,"title":"Rust"}]));
+    for hybrid in [
+        json!({"semanticRatio":0}),
+        json!({"semanticRatio":0,"embedder":"missing"}),
+    ] {
+        let result = search(&engine, "docs", json!({"q":"Rust","hybrid":hybrid}));
+        assert_eq!(result.hits[0]["id"], 1);
+        assert_eq!(result.semantic_hit_count, None);
+    }
+    let request: SearchRequest =
+        serde_json::from_value(json!({"hybrid":{"semanticRatio":0.5}})).unwrap();
+    let hybrid: HybridQuery = request.hybrid.unwrap();
+    assert_eq!(hybrid.embedder, "default");
+    assert_eq!(hybrid.semantic_ratio, 0.5);
+    index(
+        &engine,
+        "vectors",
+        json!({"embedders":{"default":{"source":"userProvided","dimensions":2}}}),
+        json!([{"id":1,"_vectors":{"default":[1,0]}}]),
+    );
+    assert_eq!(
+        search(
+            &engine,
+            "vectors",
+            json!({"hybrid":{"semanticRatio":1},"vector":[1,0]})
+        )
+        .hits[0]["id"],
+        1
+    );
+    for request in [
+        json!({"hybrid":{"semanticRatio":-0.1}}),
+        json!({"hybrid":{"semanticRatio":1.1}}),
+        json!({"rankingScoreThreshold":2}),
+        json!({"vector":[1,0]}),
+    ] {
+        assert!(matches!(
+            engine.search("docs", &serde_json::from_value(request).unwrap()),
+            Err(Error::InvalidSearchRequest(_))
+        ));
+    }
+}
+
+#[test]
+fn rules_recover_after_environment_creation_and_protect_metadata() {
+    let (engine, dir) = setup();
+    enable(&engine);
+    let reserved: RuleUid =
+        serde_json::from_value(json!(milli::dynamic_search_rules::METADATA_UID)).unwrap();
+    assert!(matches!(
+        engine.update_search_rule(
+            &reserved,
+            serde_json::from_value(json!({"active":true})).unwrap()
+        ),
+        Err(Error::InvalidSearchRuleUid(_))
+    ));
+    assert!(matches!(
+        engine.delete_search_rule(&reserved),
+        Err(Error::InvalidSearchRuleUid(_))
+    ));
+    let path = dir.path().join("internal/rules");
+    assert!(!path.exists());
+    // Simulate failure immediately after opening LMDB, before configuring the rules index.
+    std::fs::create_dir_all(&path).unwrap();
+    let mut options = milli::heed::EnvOpenOptions::new().read_txn_without_tls();
+    options.map_size(100 * 1024 * 1024);
+    drop(milli::Index::new(options, &path, milli::CreateOrOpen::create_without_shards()).unwrap());
+    assert!(path.join("data.mdb").exists());
+    index(
+        &engine,
+        "docs",
+        json!({}),
+        json!([{"id":"local","title":"Batman Returns"},{"id":"remote","title":"Batman"}]),
+    );
+    let uid: RuleUid = serde_json::from_value(json!("pin-batman")).unwrap();
+    engine.update_search_rule(&uid, serde_json::from_value(json!({"active":true,"conditions":{"query":{"words":"returns"}},"actions":{"pin":[{"id":"remote","position":0}]}})).unwrap()).unwrap();
+    assert!(matches!(
+        engine.update_search_rule(
+            &reserved,
+            serde_json::from_value(json!({"active":false})).unwrap()
+        ),
+        Err(Error::InvalidSearchRuleUid(_))
+    ));
+    assert!(matches!(
+        engine.delete_search_rule(&reserved),
+        Err(Error::InvalidSearchRuleUid(_))
+    ));
+    assert!(engine.get_search_rule(&reserved).unwrap().is_none());
+    assert_eq!(engine.list_search_rules(0, 10).unwrap().len(), 1);
+    assert_eq!(
+        search(&engine, "docs", json!({"q":"Batman Returns"})).hits[0]["id"],
+        "remote"
+    );
+    drop(engine);
+    let engine = Engine::new(MeilisearchOptions {
+        db_path: dir.path().into(),
+        ..Default::default()
+    })
+    .unwrap();
+    enable(&engine);
+    assert_eq!(
+        search(&engine, "docs", json!({"q":"Batman Returns"})).hits[0]["id"],
+        "remote"
+    );
+    assert!(engine.delete_search_rule(&uid).unwrap());
+    assert!(engine.list_search_rules(0, 10).unwrap().is_empty());
 }
 
 #[test]

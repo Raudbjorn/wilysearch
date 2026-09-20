@@ -25,6 +25,31 @@ fn setup() -> (Meilisearch, Arc<InMemoryVectorStore>, TempDir) {
 }
 
 #[test]
+fn external_hybrid_respects_retrieve_vectors() {
+    let (meili, _store, _tmp) = setup();
+    let index = meili.create_index("docs", Some("id")).unwrap();
+    index
+        .add_documents(
+            vec![json!({"id":1,"title":"Rust","_vectors":{"default":[1.0,0.0]}})],
+            None,
+        )
+        .unwrap();
+    let mut query = wilysearch::core::HybridSearchQuery::new("Rust").with_vector(vec![1.0, 0.0]);
+    assert!(
+        index.hybrid_search(&query).unwrap().result.hits[0]
+            .document
+            .get("_vectors")
+            .is_none()
+    );
+    query.search.retrieve_vectors = true;
+    let result = index.hybrid_search(&query).unwrap();
+    assert_eq!(
+        result.result.hits[0].document["_vectors"]["default"],
+        json!([1.0, 0.0])
+    );
+}
+
+#[test]
 fn test_add_documents_with_vectors_syncs_to_store() {
     let (meili, store, _tmp) = setup();
     let index = meili.create_index("movies", Some("id")).unwrap();

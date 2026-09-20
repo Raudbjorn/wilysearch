@@ -425,7 +425,7 @@ All configuration fields can be overridden via environment variables using the n
 WILYSEARCH__<SECTION>__<FIELD>
 ```
 
-Double-underscore (`__`) separates nesting levels. Field names are uppercased and use snake_case. figment's `Env::prefixed("WILYSEARCH__").split("__")` handles the mapping automatically.
+Double-underscore (`__`) separates nesting levels. Most sections use uppercased snake_case field names. Personalization uses `APIKEY` and `TIMEOUTMS`; the loader maps these to `apiKey` and `timeoutMs` before merging so environment values override TOML values.
 
 ### Full Mapping Table
 
@@ -449,6 +449,10 @@ Double-underscore (`__`) separates nesting levels. Field names are uppercased an
 | `rag.include_snippets` | `WILYSEARCH__RAG__INCLUDE_SNIPPETS` |
 | `rag.default_search_type` | `WILYSEARCH__RAG__DEFAULT_SEARCH_TYPE` |
 | `rag.semantic_ratio` | `WILYSEARCH__RAG__SEMANTIC_RATIO` |
+| `personalization.apiKey` | `WILYSEARCH__PERSONALIZATION__APIKEY` |
+| `personalization.url` | `WILYSEARCH__PERSONALIZATION__URL` |
+| `personalization.model` | `WILYSEARCH__PERSONALIZATION__MODEL` |
+| `personalization.timeoutMs` | `WILYSEARCH__PERSONALIZATION__TIMEOUTMS` |
 | `experimental.metrics` | `WILYSEARCH__EXPERIMENTAL__METRICS` |
 | `experimental.foreign_keys` | `WILYSEARCH__EXPERIMENTAL__FOREIGN_KEYS` |
 | `experimental.dynamic_search_rules` | `WILYSEARCH__EXPERIMENTAL__DYNAMIC_SEARCH_RULES` |
@@ -640,4 +644,11 @@ crop_marker = "..."
 # [vector_store.auth]
 # username = "admin"
 # password = "secret"
+
+# Requires the `ai` feature flag. Prefer setting APIKEY via the environment.
+# [personalization]
+# apiKey = "your-cohere-key"
+# url = "https://api.cohere.ai/v1/rerank"
+# model = "rerank-english-v3.0"
+# timeoutMs = 30000
 ```

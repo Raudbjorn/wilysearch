@@ -1,16 +1,16 @@
 use super::Index;
 use crate::core::{Result, Settings};
 use crate::types::*;
+use meilisearch_types::settings::SecretPolicy;
 
 impl Index {
     pub fn get_settings(&self) -> Result<Settings> {
+        self.settings_with_policy(SecretPolicy::HideSecrets)
+    }
+
+    pub(crate) fn settings_with_policy(&self, policy: SecretPolicy) -> Result<Settings> {
         let txn = self.inner.read_txn()?;
-        Ok(meilisearch_types::settings::settings(
-            &self.inner,
-            &txn,
-            meilisearch_types::settings::SecretPolicy::RevealSecrets,
-        )?
-        .into_unchecked())
+        Ok(meilisearch_types::settings::settings(&self.inner, &txn, policy)?.into_unchecked())
     }
     pub fn update_settings(&self, settings: &Settings) -> Result<()> {
         let checked = settings.clone().validate()?.check();

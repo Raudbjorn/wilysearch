@@ -3,6 +3,7 @@
 //! Provides query, result, and hit types that match the Meilisearch HTTP API
 //! shape using `serde(rename_all = "camelCase")` for JSON compatibility.
 
+pub use crate::types::HybridQuery;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -147,11 +148,6 @@ impl SearchQuery {
     pub fn new(query: impl Into<String>) -> Self {
         Self {
             q: Some(query.into()),
-            limit: default_limit(),
-            crop_length: default_crop_length(),
-            crop_marker: default_crop_marker(),
-            highlight_pre_tag: default_highlight_pre_tag(),
-            highlight_post_tag: default_highlight_post_tag(),
             ..Default::default()
         }
     }
@@ -310,35 +306,8 @@ pub enum MatchingStrategy {
     Frequency,
 }
 
-/// Hybrid search configuration combining keyword and semantic search.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HybridQuery {
-    /// Balance between keyword (0.0) and semantic (1.0) search. Default: 0.5.
-    #[serde(default = "default_semantic_ratio")]
-    pub semantic_ratio: f32,
-    /// Name of the embedder to use.
-    pub embedder: String,
-}
-
 fn default_semantic_ratio() -> f32 {
     0.5
-}
-
-impl HybridQuery {
-    /// Create a hybrid query for the named embedder with a default 0.5 semantic ratio.
-    pub fn new(embedder: impl Into<String>) -> Self {
-        Self {
-            semantic_ratio: 0.5,
-            embedder: embedder.into(),
-        }
-    }
-
-    /// Set the semantic ratio (clamped to 0.0..=1.0). 0.0 = keyword only, 1.0 = semantic only.
-    pub fn with_semantic_ratio(mut self, ratio: f32) -> Self {
-        self.semantic_ratio = ratio.clamp(0.0, 1.0);
-        self
-    }
 }
 
 // ============================================================================
@@ -726,6 +695,7 @@ pub struct SearchResultWithIndex {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Federation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub distinct: Option<String>,
     /// Maximum number of merged hits to return. Default: 20.
     #[serde(default = "default_limit")]
@@ -963,18 +933,57 @@ pub struct GetDocumentsOptions {
 
 impl Default for SearchQuery {
     fn default() -> Self {
-        serde_json::from_value(serde_json::json!({})).expect("valid query defaults")
+        Self {
+            media: None,
+            q: None,
+            vector: None,
+            hybrid: None,
+            offset: 0,
+            limit: default_limit(),
+            page: None,
+            hits_per_page: None,
+            attributes_to_retrieve: None,
+            retrieve_vectors: false,
+            attributes_to_highlight: None,
+            highlight_pre_tag: default_highlight_pre_tag(),
+            highlight_post_tag: default_highlight_post_tag(),
+            attributes_to_crop: None,
+            crop_length: default_crop_length(),
+            crop_marker: default_crop_marker(),
+            show_ranking_score: false,
+            show_ranking_score_details: false,
+            show_matches_position: false,
+            ranking_score_threshold: None,
+            filter: None,
+            sort: None,
+            distinct: None,
+            facets: None,
+            matching_strategy: MatchingStrategy::default(),
+            attributes_to_search_on: None,
+            locales: None,
+        }
     }
 }
 
 impl Default for Federation {
     fn default() -> Self {
-        serde_json::from_value(serde_json::json!({})).expect("valid query defaults")
+        Self {
+            distinct: None,
+            limit: default_limit(),
+            offset: 0,
+            page: None,
+            hits_per_page: None,
+            facets_by_index: BTreeMap::new(),
+            merge_facets: None,
+        }
     }
 }
 
 impl Default for FederationOptions {
     fn default() -> Self {
-        serde_json::from_value(serde_json::json!({})).expect("valid query defaults")
+        Self {
+            weight: default_federation_weight(),
+            query_position: None,
+        }
     }
 }

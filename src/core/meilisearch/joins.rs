@@ -164,9 +164,14 @@ impl Meilisearch {
                     };
                     if !cache.contains_key(&id) {
                         let doc = match foreign.inner.external_documents_ids().get(&txn, &id)? {
-                            Some(id) => {
-                                foreign.make_document(&txn, &fields, id, None, false, true)?
-                            }
+                            Some(internal_id) => foreign.make_document(
+                                &txn,
+                                &fields,
+                                internal_id,
+                                None,
+                                false,
+                                true,
+                            )?,
                             None => serde_json::json!({}),
                         };
                         cache.insert(id.clone(), doc);
@@ -216,7 +221,7 @@ fn visit_path(
 
 fn validate_threshold(threshold: Option<f64>) -> Result<()> {
     if threshold.is_some_and(|v| !v.is_finite() || !(0.0..=1.0).contains(&v)) {
-        return Err(Error::Internal(
+        return Err(Error::InvalidSearchRequest(
             "rankingScoreThreshold must be between 0 and 1".into(),
         ));
     }

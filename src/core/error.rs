@@ -54,6 +54,13 @@ pub enum Error {
     #[error("Invalid filter expression: {0}")]
     InvalidFilter(String),
 
+    /// Search parameters supplied by the caller are invalid.
+    #[error("Invalid search request: {0}")]
+    InvalidSearchRequest(String),
+
+    #[error("Invalid search rule UID: {0}")]
+    InvalidSearchRuleUid(String),
+
     /// An invalid sort expression was provided.
     #[error("Invalid sort expression: {0}")]
     InvalidSort(String),

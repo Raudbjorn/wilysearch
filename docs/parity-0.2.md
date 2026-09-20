@@ -48,7 +48,7 @@ let settings: Settings = serde_json::from_value(serde_json::json!({
 // Rust callers may use Setting::Set, Setting::Reset, and Setting::NotSet.
 ```
 
-`DocumentQuery.fields` and browsing IDs/filters/sort are now typed collections and JSON values. `SearchRequest.hybrid` is typed. Facet maps preserve native ordering. Bulk settings use the upstream types; old `Settings::new().with_*` builders are replaced by `Default`, `Setting` fields or JSON deserialization. Individual settings helpers remain available. As upstream does, `Engine::get_settings` omits chat and foreign-key settings while their runtime gates are disabled; backups preserve all settings.
+`DocumentQuery.fields` and browsing IDs/filters/sort are now typed collections and JSON values. `SearchRequest.hybrid` uses the public `types::HybridQuery`; Wilysearch defaults an omitted embedder to `"default"`. A semantic ratio of zero performs keyword search without loading an embedder. Facet maps preserve native ordering. Bulk settings use the upstream types; old `Settings::new().with_*` builders are replaced by `Default`, `Setting` fields or JSON deserialization. Individual settings helpers remain available. As upstream does, `Engine::get_settings` masks embedder API keys and omits chat and foreign-key settings while their runtime gates are disabled; backups preserve all settings and credentials. When reapplying settings read from the public API, supply the original API keys or omit those key fields to retain the stored credentials.
 
 The CLI accepts a complete request with `wily search INDEX --request search.json`; it conflicts with individual query flags. There are no dedicated chat or rules CLI commands.
 

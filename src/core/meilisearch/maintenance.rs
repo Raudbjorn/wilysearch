@@ -1,3 +1,4 @@
+use meilisearch_types::settings::SecretPolicy;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::instrument;
@@ -23,7 +24,7 @@ impl Meilisearch {
             std::fs::create_dir_all(&index_dump_dir)?;
 
             // Export settings
-            let settings = index.get_settings()?;
+            let settings = index.settings_with_policy(SecretPolicy::RevealSecrets)?;
             let settings_json = serde_json::to_string_pretty(&settings)?;
             std::fs::write(index_dump_dir.join("settings.json"), settings_json)?;
 
@@ -68,7 +69,7 @@ impl Meilisearch {
             // Write settings if requested (default: true)
             let include_settings = indexes.and_then(|m| m.get(*uid)).copied().unwrap_or(true);
             if include_settings {
-                let settings = index.get_settings()?;
+                let settings = index.settings_with_policy(SecretPolicy::RevealSecrets)?;
                 let settings_json = serde_json::to_string_pretty(&settings)?;
                 std::fs::write(index_dir.join("settings.json"), settings_json)?;
             }

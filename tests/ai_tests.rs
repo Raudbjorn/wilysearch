@@ -79,6 +79,11 @@ fn server(
 fn completion(message: Value) -> Value {
     json!({"id":"test","object":"chat.completion","created":0,"model":"mock","choices":[{"index":0,"message":message,"finish_reason":"stop"}]})
 }
+fn search_tool_completion(arguments: &str) -> Value {
+    completion(
+        json!({"role":"assistant","content":null,"tool_calls":[{"id":"search","type":"function","function":{"name":"_meiliSearchInIndex","arguments":arguments}}]}),
+    )
+}
 fn engine() -> (Arc<Engine>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let engine = Arc::new(
@@ -118,6 +123,15 @@ fn request() -> wilysearch::ai::CreateChatCompletionRequest {
 #[tokio::test]
 async fn chat_tools_workspace_redaction_and_caller_tools() {
     let (url, requests, join) = server(vec![
+        (200, search_tool_completion("{")),
+        (
+            200,
+            search_tool_completion(r#"{"index_uid":"docs","typo":true}"#),
+        ),
+        (
+            200,
+            search_tool_completion(r#"{"index_uid":"docs","filter":"id ="}"#),
+        ),
         (
             200,
             completion(
@@ -176,6 +190,17 @@ async fn chat_tools_workspace_redaction_and_caller_tools() {
     );
     let (_, first) = requests.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!(first["messages"][0]["role"], "system");
+    for _ in 0..3 {
+        let (_, retry) = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        let tool = retry["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(tool["role"], "tool");
+        assert!(
+            tool["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("Search failed:")
+        );
+    }
     let (_, second) = requests.recv_timeout(Duration::from_secs(2)).unwrap();
     assert!(
         second["messages"]
@@ -193,6 +218,83 @@ async fn chat_tools_workspace_redaction_and_caller_tools() {
     })
     .unwrap();
     assert_eq!(restored.list_chat_workspaces().unwrap(), vec!["default"]);
+}
+
+#[tokio::test]
+async fn failed_tools_still_obey_round_limit() {
+    let (url, requests, join) = server(vec![
+        (200, search_tool_completion("{")),
+        (200, search_tool_completion("{")),
+    ]);
+    let (engine, _dir) = engine();
+    engine
+        .set_chat_workspace(
+            "default",
+            serde_json::from_value(json!({"source":"vLlm","baseUrl":url})).unwrap(),
+        )
+        .unwrap();
+    let mut chat = Chat::new(engine, "default");
+    chat.max_tool_rounds = 1;
+    assert!(
+        chat.complete(request())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("round limit")
+    );
+    assert_eq!(requests.try_iter().count(), 2);
+    join.join().unwrap();
+}
+
+#[tokio::test]
+async fn local_providers_are_denied_by_default() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(
+        Engine::new(MeilisearchOptions {
+            db_path: dir.path().into(),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    engine
+        .update_experimental_features(
+            &serde_json::from_value(json!({"chatCompletions":true})).unwrap(),
+        )
+        .unwrap();
+    engine
+        .set_chat_workspace(
+            "default",
+            serde_json::from_value(json!({"source":"vLlm","baseUrl":url})).unwrap(),
+        )
+        .unwrap();
+    let mut chat = Chat::new(engine, "default");
+    chat.timeout = Duration::from_secs(2);
+    let error = chat.complete(request()).await.unwrap_err().to_string();
+    assert!(
+        error.contains("Rejected IP"),
+        "expected policy rejection, got {error}"
+    );
+    assert!(
+        CohereReranker::new(
+            CohereConfig {
+                api_key: "mock-key".into(),
+                url,
+                ..Default::default()
+            },
+            false
+        )
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("IP policy")
+    );
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
 }
 
 #[tokio::test]
@@ -392,24 +494,30 @@ async fn streaming_search_tool_round_trip() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let join = std::thread::spawn(move || {
-        for round in 0..2 {
+        for round in 0..5 {
             let (mut stream, _) = listener.accept().unwrap();
             let (_, request) = read_request(&mut stream);
-            if round == 1 {
-                assert!(
-                    request["messages"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|m| m["role"] == "tool")
-                );
+            if round > 0 {
+                let tool = request["messages"].as_array().unwrap().last().unwrap();
+                assert_eq!(tool["role"], "tool");
+                assert!(tool["content"].as_str().unwrap().contains(if round < 4 {
+                    "Search failed:"
+                } else {
+                    "Title: Rust"
+                }));
             }
-            let delta = if round == 0 {
-                json!({"tool_calls":[{"index":0,"id":"call","type":"function","function":{"name":"_meiliSearchInIndex","arguments":"{\"index_uid\":\"docs\",\"q\":\"Rust\",\"filter\":\"\"}"}}]})
+            let delta = if round < 4 {
+                let arguments = [
+                    "{",
+                    r#"{"index_uid":"docs","typo":true}"#,
+                    r#"{"index_uid":"docs","filter":"id ="}"#,
+                    r#"{"index_uid":"docs","q":"Rust","filter":""}"#,
+                ][round];
+                json!({"tool_calls":[{"index":0,"id":"call","type":"function","function":{"name":"_meiliSearchInIndex","arguments":arguments}}]})
             } else {
                 json!({"content":"Found it"})
             };
-            let chunk = json!({"id":"stream","object":"chat.completion.chunk","created":0,"model":"mock","choices":[{"index":0,"delta":delta,"finish_reason":if round==0 {"tool_calls"}else{"stop"}}]});
+            let chunk = json!({"id":"stream","object":"chat.completion.chunk","created":0,"model":"mock","choices":[{"index":0,"delta":delta,"finish_reason":if round<4 {"tool_calls"}else{"stop"}}]});
             write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {chunk}\n\ndata: [DONE]\n\n").unwrap();
         }
     });
@@ -435,6 +543,6 @@ async fn streaming_search_tool_round_trip() {
             _ => {}
         }
     }
-    assert_eq!((sources, tools, done), (1, 1, true));
+    assert_eq!((sources, tools, done), (1, 4, true));
     join.join().unwrap();
 }

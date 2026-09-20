@@ -5,7 +5,7 @@ use crate::core::{Error, Index, Result};
 pub use meilisearch_types::dynamic_search_rules::{
     DynamicSearchRule, DynamicSearchRuleUpdateRequest, RuleUid,
 };
-use milli::dynamic_search_rules::{DsrFuel, DynamicSearchRules};
+use milli::dynamic_search_rules::{DsrFuel, DynamicSearchRules, METADATA_UID};
 
 pub(crate) fn fuel() -> DsrFuel {
     DsrFuel::new(
@@ -47,8 +47,19 @@ impl Meilisearch {
             },
         )?;
         let index = Arc::new(Index::new(inner, None));
-        if !exists {
-            index.update_primary_key("uid")?;
+        let initialized = {
+            let txn = index.inner.read_txn()?;
+            index
+                .inner
+                .external_documents_ids()
+                .get(&txn, METADATA_UID)?
+                .is_some()
+        };
+        // Metadata is committed last: retry incomplete initialization after an earlier failure.
+        if !initialized {
+            if index.primary_key()?.is_none() {
+                index.update_primary_key("uid")?;
+            }
             index.update_settings(&serde_json::from_value(serde_json::json!({
                 "searchableAttributes": ["conditions.query.words", "description"],
                 "filterableAttributes": ["active", "conditions.time.start", "conditions.time.end", "conditions.query.isEmpty", "conditions.filter.values.*", "conditions.filter.nbConstraints"],
@@ -112,6 +123,7 @@ impl Meilisearch {
         update: DynamicSearchRuleUpdateRequest,
     ) -> Result<DynamicSearchRule> {
         self.require_rules()?;
+        validate_rule_uid(uid)?;
         let _guard = self
             .rules_write
             .lock()
@@ -133,6 +145,7 @@ impl Meilisearch {
 
     pub fn delete_search_rule(&self, uid: &RuleUid) -> Result<bool> {
         self.require_rules()?;
+        validate_rule_uid(uid)?;
         let _guard = self
             .rules_write
             .lock()
@@ -164,4 +177,13 @@ impl Meilisearch {
             })
             .collect()
     }
+}
+
+fn validate_rule_uid(uid: &RuleUid) -> Result<()> {
+    if uid.as_str() == METADATA_UID {
+        return Err(Error::InvalidSearchRuleUid(format!(
+            "{METADATA_UID} is reserved"
+        )));
+    }
+    Ok(())
 }

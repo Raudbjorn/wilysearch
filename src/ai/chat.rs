@@ -100,7 +100,9 @@ impl Chat {
             }
             for call in calls.iter().filter(|c| c.function.name == SEARCH_TOOL) {
                 let (source, content) = self.retrieve(&call.function.arguments, &indexes).await?;
-                sources.push(source);
+                if let Some(source) = source {
+                    sources.push(source);
+                }
                 request.messages.push(tool_message(&call.id, &content)?);
             }
             if !internal || calls.iter().any(|c| c.function.name != SEARCH_TOOL) {
@@ -202,7 +204,9 @@ impl Chat {
                     )
                     .await?;
                 request.messages.push(tool_message(id, &content)?);
-                send(tx, ChatEvent::Sources { source }).await?;
+                if let Some(source) = source {
+                    send(tx, ChatEvent::Sources { source }).await?;
+                }
                 send(
                     tx,
                     ChatEvent::ToolResult {
@@ -288,7 +292,11 @@ impl Chat {
         ))
     }
 
-    async fn retrieve(&self, arguments: &str, indexes: &[String]) -> Result<(ChatSource, String)> {
+    async fn retrieve(
+        &self,
+        arguments: &str,
+        indexes: &[String],
+    ) -> Result<(Option<ChatSource>, String)> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Arguments {
@@ -296,11 +304,12 @@ impl Chat {
             q: Option<String>,
             filter: Option<Value>,
         }
-        let args: Arguments = serde_json::from_str(arguments)?;
+        let args: Arguments = match serde_json::from_str(arguments) {
+            Ok(args) => args,
+            Err(error) => return Ok(tool_error(error)),
+        };
         if !indexes.contains(&args.index_uid) {
-            return Err(Error::Internal(
-                "Search tool selected an unavailable index".into(),
-            ));
+            return Ok(tool_error("Search tool selected an unavailable index"));
         }
         let engine = self.engine.clone();
         tokio::task::spawn_blocking(move || -> Result<_> {
@@ -313,7 +322,10 @@ impl Chat {
             request.filter = args
                 .filter
                 .filter(|f| !f.is_null() && f.as_str() != Some(""));
-            let result = crate::traits::Search::search(&*engine, &args.index_uid, &request)?;
+            let result = match crate::traits::Search::search(&*engine, &args.index_uid, &request) {
+                Ok(result) => result,
+                Err(error) => return Ok(tool_error(error)),
+            };
             let prompt: milli::prompt::Prompt = config.prompt.try_into().map_err(provider_error)?;
             let metadata = RwLock::new(index.inner.fields_ids_map_with_metadata(&txn)?);
             let global = std::cell::RefCell::new(milli::GlobalFieldsIdsMap::new(&metadata));
@@ -329,10 +341,10 @@ impl Chat {
                 text.push(format!("[{}:{}] {rendered}", args.index_uid, position + 1));
             }
             Ok((
-                ChatSource {
+                Some(ChatSource {
                     index_uid: args.index_uid,
                     results: result,
-                },
+                }),
                 text.join("\n"),
             ))
         })
@@ -341,6 +353,13 @@ impl Chat {
     }
 }
 use std::sync::RwLock;
+fn tool_error(error: impl std::fmt::Display) -> (Option<ChatSource>, String) {
+    (
+        None,
+        format!("Search failed: {error}. Correct the tool arguments and retry."),
+    )
+}
+
 fn tool_message(id: &str, content: &str) -> Result<ChatCompletionRequestMessage> {
     Ok(serde_json::from_value(
         json!({"role":"tool","tool_call_id":id,"content":content}),

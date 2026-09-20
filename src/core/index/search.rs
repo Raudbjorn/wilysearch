@@ -101,7 +101,7 @@ impl Index {
             .ranking_score_threshold
             .is_some_and(|v| !v.is_finite() || !(0.0..=1.0).contains(&v))
         {
-            return Err(Error::Internal(
+            return Err(Error::InvalidSearchRequest(
                 "rankingScoreThreshold must be between 0 and 1".into(),
             ));
         }
@@ -191,13 +191,16 @@ impl Index {
         // ------------------------------------------------------------------
         // Execute search
         // ------------------------------------------------------------------
-        let (result, semantic_count) = if let Some(hybrid) = &query.hybrid {
+        if query.hybrid.as_ref().is_some_and(|h| {
+            !h.semantic_ratio.is_finite() || !(0.0..=1.0).contains(&h.semantic_ratio)
+        }) {
+            return Err(Error::InvalidSearchRequest(
+                "semanticRatio must be between 0 and 1".into(),
+            ));
+        }
+        let semantic = query.hybrid.as_ref().filter(|h| h.semantic_ratio > 0.0);
+        let (result, semantic_count) = if let Some(hybrid) = semantic {
             let ratio = hybrid.semantic_ratio;
-            if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
-                return Err(Error::Internal(
-                    "semanticRatio must be between 0 and 1".into(),
-                ));
-            }
             let settings = milli::update::InnerIndexSettings::from_index(
                 &self.inner,
                 &rtxn,
@@ -234,20 +237,18 @@ impl Index {
                 let count = result.documents_ids.len() as u32;
                 (result, Some(count))
             } else {
-                if ratio > 0.0 {
-                    search.semantic(
-                        hybrid.embedder.clone(),
-                        runtime.embedder.clone(),
-                        runtime.is_quantized,
-                        query.vector.clone(),
-                        query.media.clone(),
-                    );
-                }
+                search.semantic(
+                    hybrid.embedder.clone(),
+                    runtime.embedder.clone(),
+                    runtime.is_quantized,
+                    query.vector.clone(),
+                    query.media.clone(),
+                );
                 search.execute_hybrid(ratio)?
             }
         } else {
-            if query.vector.is_some() || query.media.is_some() {
-                return Err(Error::Internal(
+            if query.hybrid.is_none() && (query.vector.is_some() || query.media.is_some()) {
+                return Err(Error::InvalidSearchRequest(
                     "vector and media require a hybrid embedder".into(),
                 ));
             }
@@ -288,6 +289,7 @@ impl Index {
             .map(|s| s.iter().map(String::as_str).collect::<Vec<_>>());
         let matcher_builder_opt: Option<&MatcherBuilder<'_>> = if needs_matcher {
             let mut builder = TokenizerBuilder::default();
+            builder.create_char_map(true);
             if let Some(ref stop_words) = stop_words {
                 builder.stop_words(stop_words);
             }

@@ -125,8 +125,11 @@ struct HybridSearchResult {
 pub struct SurrealDbVectorStore {
     db: Arc<Surreal<Any>>,
     config: SurrealDbVectorStoreConfig,
-    runtime: Option<Arc<Runtime>>,
+    // Rust drops fields in declaration order: release the client before its runtime.
+    runtime: StoreRuntime,
 }
+
+struct StoreRuntime(Option<Arc<Runtime>>);
 
 /// Validate that a SurrealDB identifier (table, namespace, database) contains
 /// only alphanumeric characters and underscores. This prevents query injection
@@ -191,12 +194,12 @@ impl SurrealDbVectorStore {
         let store = Self {
             db: Arc::new(db),
             config,
-            runtime: Some(Arc::new(
+            runtime: StoreRuntime(Some(Arc::new(
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .context("Failed to create tokio runtime")?,
-            )),
+            ))),
         };
 
         // Initialize schema
@@ -244,7 +247,7 @@ impl SurrealDbVectorStore {
         let store = Self {
             db: Arc::new(db),
             config,
-            runtime: Some(runtime),
+            runtime: StoreRuntime(Some(runtime)),
         };
 
         store.init_schema().await?;
@@ -614,6 +617,7 @@ impl SurrealDbVectorStore {
     ) -> anyhow::Result<T> {
         let runtime = self
             .runtime
+            .0
             .as_ref()
             .context("Vector store is shutting down")?;
         match tokio::runtime::Handle::try_current() {
@@ -695,13 +699,12 @@ pub struct VectorStoreStats {
     pub dimensions: usize,
 }
 
-impl Drop for SurrealDbVectorStore {
+impl Drop for StoreRuntime {
     fn drop(&mut self) {
         if tokio::runtime::Handle::try_current().is_ok()
-            && let Some(runtime) = self.runtime.take().and_then(Arc::into_inner)
+            && let Some(runtime) = self.0.take().and_then(Arc::into_inner)
         {
-            // Move the last owner out before dropping fields; cloning to another
-            // thread races with that thread releasing its clone first.
+            // The client has already been dropped. Avoid blocking shutdown in async code.
             runtime.shutdown_background();
         }
     }
@@ -845,6 +848,49 @@ impl VectorStore for SurrealDbVectorStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_drops_before_owned_runtime_shutdown_inside_async_code() {
+        struct CheckClientDrop(std::sync::Weak<Surreal<Any>>, std::sync::mpsc::Sender<bool>);
+        impl Drop for CheckClientDrop {
+            fn drop(&mut self) {
+                self.1.send(self.0.upgrade().is_none()).unwrap();
+            }
+        }
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let store = runtime
+            .block_on(SurrealDbVectorStore::with_runtime(
+                SurrealDbVectorStoreConfig {
+                    connection_string: "memory".into(),
+                    dimensions: 2,
+                    ..Default::default()
+                },
+                runtime.clone(),
+            ))
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let check = CheckClientDrop(Arc::downgrade(&store.db), tx);
+        runtime.spawn(async move {
+            let _check = check;
+            std::future::pending::<()>().await;
+        });
+        runtime.block_on(async { tokio::task::yield_now().await });
+        drop(runtime); // The store now owns the last runtime reference.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move { drop(store) });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
+            "runtime tasks were dropped before the database client"
+        );
+    }
 
     #[tokio::test]
     async fn test_surrealdb_vector_store_basic() {

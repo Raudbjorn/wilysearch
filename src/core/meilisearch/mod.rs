@@ -396,18 +396,18 @@ impl Meilisearch {
             return Err(Error::InvalidIndexUid(uid.into()));
         }
         {
-            let indexes = self
-                .indexes
-                .read()
-                .map_err(|_| Error::Internal("Index lock poisoned".into()))?;
+            let indexes = self.indexes.read().unwrap_or_else(|e| {
+                tracing::warn!(uid, "indexes RwLock poisoned in get_index, recovering");
+                e.into_inner()
+            });
             if let Some(index) = indexes.get(uid) {
                 return Ok(index.clone());
             }
         }
-        let mut indexes = self
-            .indexes
-            .write()
-            .map_err(|_| Error::Internal("Index lock poisoned".into()))?;
+        let mut indexes = self.indexes.write().unwrap_or_else(|e| {
+            tracing::warn!(uid, "indexes RwLock poisoned in get_index, recovering");
+            e.into_inner()
+        });
         if let Some(index) = indexes.get(uid) {
             return Ok(index.clone());
         }
@@ -800,4 +800,58 @@ fn dir_size(path: &std::path::Path) -> std::io::Result<u64> {
         }
     }
     Ok(size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_index_recovers_a_poisoned_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let meili = Meilisearch::new(MeilisearchOptions {
+            db_path: dir.path().into(),
+            ..Default::default()
+        })
+        .unwrap();
+        meili.create_index("docs", Some("id")).unwrap();
+        std::thread::scope(|scope| {
+            assert!(
+                scope
+                    .spawn(|| {
+                        let _guard = meili.indexes.write().unwrap();
+                        panic!("simulate a cache writer panic");
+                    })
+                    .join()
+                    .is_err()
+            );
+        });
+        assert_eq!(
+            meili
+                .get_index("docs")
+                .unwrap()
+                .primary_key()
+                .unwrap()
+                .as_deref(),
+            Some("id")
+        );
+        {
+            let mut cache = meili
+                .indexes
+                .write()
+                .err()
+                .expect("poisoned lock")
+                .into_inner();
+            Arc::make_mut(&mut cache).clear();
+        }
+        assert_eq!(
+            meili
+                .get_index("docs")
+                .unwrap()
+                .primary_key()
+                .unwrap()
+                .as_deref(),
+            Some("id")
+        );
+    }
 }
