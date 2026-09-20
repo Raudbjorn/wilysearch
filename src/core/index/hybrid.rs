@@ -1,5 +1,3 @@
-use milli::Filter;
-use serde_json::Value;
 use std::collections::BTreeSet;
 use std::time::Instant;
 
@@ -8,7 +6,7 @@ use crate::core::search::{
     HybridSearchQuery, HybridSearchResult, SearchHit, SearchQuery, SearchResult,
 };
 
-use super::{Index, parse_filter_to_string};
+use super::Index;
 
 /// Options for merging keyword and vector search results in hybrid search.
 struct MergeHybridOptions<'a> {
@@ -18,6 +16,7 @@ struct MergeHybridOptions<'a> {
     limit: usize,
     offset: usize,
     show_ranking_score: bool,
+    retrieve_vectors: bool,
     attributes_to_retrieve: Option<&'a BTreeSet<String>>,
 }
 
@@ -76,25 +75,24 @@ impl Index {
             // Perform vector search
             let rtxn = self.inner.read_txn().map_err(|e| Error::Heed(e))?;
 
-            // Get filter candidates if filter is specified
-            let filter_string_owned;
-            let filter_bitmap = if let Some(filter_val) = &query.search.filter {
-                if let Some(fs) = parse_filter_to_string(filter_val)? {
-                    filter_string_owned = fs;
-                    if let Some(filter) = Filter::from_str(&filter_string_owned).map_err(Error::Milli)? {
-                        Some(filter.evaluate(&rtxn, &self.inner).map_err(Error::Milli)?)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+            let filter_bitmap = query
+                .search
+                .filter
+                .as_ref()
+                .map(super::parse_local_filter)
+                .transpose()?
+                .flatten()
+                .map(|filter| {
+                    filter.evaluate(&rtxn, &self.inner, &self.inner.fields_ids_map(&rtxn)?)
+                })
+                .transpose()?;
 
             let vector_results = store
-                .search(&vector, query.search.limit + query.search.offset, filter_bitmap.as_ref())
+                .search(
+                    &vector,
+                    query.search.limit + query.search.offset,
+                    filter_bitmap.as_ref(),
+                )
                 .map_err(|e| Error::Internal(e.to_string()))?;
 
             // Merge results based on semantic_ratio. Pass the caller's original
@@ -109,6 +107,7 @@ impl Index {
                     limit: query.search.limit,
                     offset: query.search.offset,
                     show_ranking_score: query.search.show_ranking_score,
+                    retrieve_vectors: query.search.retrieve_vectors,
                     attributes_to_retrieve: query.search.attributes_to_retrieve.as_ref(),
                 },
             )?;
@@ -120,7 +119,10 @@ impl Index {
             let semantic_hit_count = merged.1;
 
             let keyword_estimated = match &keyword_result.hits_info {
-                crate::core::search::HitsInfo::OffsetLimit { estimated_total_hits, .. } => *estimated_total_hits,
+                crate::core::search::HitsInfo::OffsetLimit {
+                    estimated_total_hits,
+                    ..
+                } => *estimated_total_hits,
                 crate::core::search::HitsInfo::Pagination { total_hits, .. } => *total_hits,
             };
 
@@ -172,10 +174,13 @@ impl Index {
             limit,
             offset,
             show_ranking_score,
+            retrieve_vectors,
             attributes_to_retrieve,
         } = opts;
         let fields_ids_map = self.inner.fields_ids_map(rtxn).map_err(Error::Heed)?;
-        let displayed_fields = self.get_displayed_fields(rtxn, &fields_ids_map, *attributes_to_retrieve)?;
+        let requested = attributes_to_retrieve
+            .as_ref()
+            .map(|a| a.iter().cloned().collect::<Vec<_>>());
 
         // Create scored entries for both result sets
         #[derive(Debug)]
@@ -252,8 +257,8 @@ impl Index {
             if let Some(entry) = score_map.get_mut(doc_id) {
                 // Document found in both results
                 entry.vector_score = Some(*similarity);
-                entry.combined_score =
-                    entry.keyword_score.unwrap_or(0.0) * keyword_weight + vector_score * semantic_weight;
+                entry.combined_score = entry.keyword_score.unwrap_or(0.0) * keyword_weight
+                    + vector_score * semantic_weight;
                 entry.source = EntrySource::Both;
             } else {
                 // Document only in vector results
@@ -272,7 +277,11 @@ impl Index {
 
         // Sort by combined score (descending)
         let mut entries: Vec<_> = score_map.into_values().collect();
-        entries.sort_by(|a, b| b.combined_score.partial_cmp(&a.combined_score).unwrap_or(std::cmp::Ordering::Equal));
+        entries.sort_by(|a, b| {
+            b.combined_score
+                .partial_cmp(&a.combined_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Apply offset and limit
         let entries: Vec<_> = entries.into_iter().skip(*offset).take(*limit).collect();
@@ -285,9 +294,15 @@ impl Index {
         let mut doc_map: std::collections::HashMap<u32, _> = documents.into_iter().collect();
 
         for entry in &entries {
-            if let Some(obkv) = doc_map.remove(&entry.doc_id) {
-                let json = milli::obkv_to_json(&displayed_fields, &fields_ids_map, obkv)
-                    .map_err(Error::Milli)?;
+            if doc_map.remove(&entry.doc_id).is_some() {
+                let doc = self.make_document(
+                    rtxn,
+                    &fields_ids_map,
+                    entry.doc_id,
+                    requested.as_deref(),
+                    *retrieve_vectors,
+                    true,
+                )?;
 
                 let ranking_score = if *show_ranking_score {
                     Some(entry.combined_score)
@@ -295,7 +310,7 @@ impl Index {
                     None
                 };
 
-                hits.push(SearchHit::new(Value::Object(json), ranking_score));
+                hits.push(SearchHit::new(doc, ranking_score));
 
                 // Count semantic hits (documents that came from vector search)
                 if matches!(entry.source, EntrySource::Vector | EntrySource::Both) {

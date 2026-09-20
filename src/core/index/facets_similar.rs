@@ -1,7 +1,6 @@
 use milli::score_details::ScoreDetails;
 use milli::update::InnerIndexSettings;
-use milli::{Filter, SearchForFacetValues, Similar, TermsMatchingStrategy};
-use serde_json::Value;
+use milli::{SearchForFacetValues, Similar, TermsMatchingStrategy};
 use std::time::Instant;
 
 use crate::core::error::{Error, Result};
@@ -10,7 +9,7 @@ use crate::core::search::{
     SimilarQuery, SimilarResult,
 };
 
-use super::{parse_filter_to_string, Index};
+use super::Index;
 
 impl Index {
     /// Search within facet values.
@@ -18,12 +17,33 @@ impl Index {
     /// Given a facet name (and optionally a facet query and a search query),
     /// returns matching facet values with their document counts.
     pub fn facet_search(&self, query: &FacetSearchQuery) -> Result<FacetSearchResult> {
+        let filter = query
+            .filter
+            .as_ref()
+            .map(super::parse_local_filter)
+            .transpose()?
+            .flatten();
+        self.facet_search_with_filter(query, filter)
+    }
+
+    pub(crate) fn facet_search_with_filter(
+        &self,
+        query: &FacetSearchQuery,
+        filter: Option<milli::IndexFilter>,
+    ) -> Result<FacetSearchResult> {
         let start_time = Instant::now();
         let rtxn = self.inner.read_txn().map_err(|e| Error::Heed(e))?;
-        let progress = milli::progress::Progress::default();
+        let progress = milli::progress::Progress::quiet();
+        let fields_ids_map = self.inner.fields_ids_map(&rtxn)?;
 
         // Build the inner keyword search to scope facet results
-        let mut inner_search = self.inner.search(&rtxn, &progress);
+        let mut inner_search = self.inner.search(
+            &rtxn,
+            &self.uid,
+            &fields_ids_map,
+            time::OffsetDateTime::now_utc(),
+            &progress,
+        );
 
         if let Some(ref q) = query.q {
             inner_search.query(q);
@@ -37,20 +57,12 @@ impl Index {
         };
         inner_search.terms_matching_strategy(tms);
 
-        // Apply filter (supports string, array-of-strings, and array-of-arrays)
-        let facet_filter_owned;
-        if let Some(ref filter_val) = query.filter {
-            if let Some(fs) = parse_filter_to_string(filter_val)? {
-                facet_filter_owned = fs;
-                if let Some(filter) = Filter::from_str(&facet_filter_owned).map_err(Error::Milli)? {
-                    inner_search.filter(filter);
-                }
-            }
-        }
-
+        inner_search.filter(filter);
+        inner_search.deadline(self.inner.search_deadline(&rtxn)?);
         // Apply ranking score threshold
         if let Some(threshold) = query.ranking_score_threshold {
             inner_search.ranking_score_threshold(threshold);
+            inner_search.scoring_strategy(milli::score_details::ScoringStrategy::Detailed);
         }
 
         // Apply attributes to search on
@@ -61,8 +73,12 @@ impl Index {
         }
 
         // Build facet search
-        let mut facet_search =
-            SearchForFacetValues::new(query.facet_name.clone(), inner_search, false);
+        let mut facet_search = SearchForFacetValues::new(
+            query.facet_name.clone(),
+            &self.inner,
+            &rtxn,
+            &fields_ids_map,
+        );
 
         if let Some(ref fq) = query.facet_query {
             facet_search.query(fq);
@@ -74,7 +90,10 @@ impl Index {
             facet_search.locales(locales);
         }
 
-        let facet_hits = facet_search.execute().map_err(Error::Milli)?;
+        let facet_hits = facet_search
+            .execute(&inner_search.execute_for_candidates(false)?)
+            .map_err(Error::Milli)?
+            .0;
 
         let processing_time_ms = start_time.elapsed().as_millis();
 
@@ -137,12 +156,26 @@ impl Index {
     /// # Ok::<(), wilysearch::core::Error>(())
     /// ```
     pub fn get_similar_documents(&self, query: &SimilarQuery) -> Result<SimilarResult> {
+        let filter = query
+            .filter
+            .as_ref()
+            .map(super::parse_local_filter)
+            .transpose()?
+            .flatten();
+        self.similar_with_filter(query, filter)
+    }
+
+    pub(crate) fn similar_with_filter(
+        &self,
+        query: &SimilarQuery,
+        filter: Option<milli::IndexFilter>,
+    ) -> Result<SimilarResult> {
         let start_time = Instant::now();
 
         let rtxn = self.inner.read_txn().map_err(|e| Error::Heed(e))?;
 
         // Resolve the embedder from index settings
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
+        let ip_policy = self.ip_policy.clone();
         let inner_settings = InnerIndexSettings::from_index(&self.inner, &rtxn, &ip_policy, None)
             .map_err(Error::Milli)?;
 
@@ -165,31 +198,28 @@ impl Index {
             .ok_or_else(|| Error::DocumentNotFound(id_string.clone()))?;
 
         // Build the Similar query
-        let progress = milli::progress::Progress::default();
+        let progress = milli::progress::Progress::quiet();
+        let fields_ids_map = self.inner.fields_ids_map(&rtxn)?;
+        let max_hits = self.inner.pagination_max_total_hits(&rtxn)?.unwrap_or(1000) as usize;
+        let offset = query.offset.min(max_hits);
+        let limit = query.limit.min(max_hits.saturating_sub(offset));
 
         let mut similar = Similar::new(
             internal_id,
-            query.offset,
-            query.limit,
+            offset,
+            limit,
             &self.inner,
             &rtxn,
+            &fields_ids_map,
             query.embedder.clone(),
             embedder,
             quantized,
             &progress,
         );
 
-        // Apply optional filter (supports string, array-of-strings, and array-of-arrays)
-        let similar_filter_owned;
-        if let Some(ref filter_val) = query.filter {
-            if let Some(fs) = parse_filter_to_string(filter_val)? {
-                similar_filter_owned = fs;
-                if let Some(filter) = Filter::from_str(&similar_filter_owned).map_err(Error::Milli)? {
-                    similar.filter(filter);
-                }
-            }
+        if let Some(filter) = filter {
+            similar.filter(filter);
         }
-
         // Apply ranking score threshold
         if let Some(threshold) = query.ranking_score_threshold {
             similar.ranking_score_threshold(threshold);
@@ -203,25 +233,21 @@ impl Index {
             ..
         } = similar.execute().map_err(Error::Milli)?;
 
-        // Fetch documents and build hits
-        let documents = self
-            .inner
-            .documents(&rtxn, documents_ids.clone())
-            .map_err(Error::Milli)?;
-        let fields_ids_map = self.inner.fields_ids_map(&rtxn).map_err(Error::Heed)?;
-
-        let displayed_fields = self.get_displayed_fields(
-            &rtxn,
-            &fields_ids_map,
-            query.attributes_to_retrieve.as_ref(),
-        )?;
-
-        let mut hits = Vec::with_capacity(documents.len());
-        for (idx, (_doc_id, obkv)) in documents.into_iter().enumerate() {
-            let json = milli::obkv_to_json(&displayed_fields, &fields_ids_map, obkv)
-                .map_err(Error::Milli)?;
-            let doc = Value::Object(json);
-
+        let criteria = milli::AttributeState::from_criteria(self.inner.criteria(&rtxn)?);
+        let requested = query
+            .attributes_to_retrieve
+            .as_ref()
+            .map(|a| a.iter().cloned().collect::<Vec<_>>());
+        let mut hits = Vec::with_capacity(documents_ids.len());
+        for (idx, id) in documents_ids.into_iter().enumerate() {
+            let doc = self.make_document(
+                &rtxn,
+                &fields_ids_map,
+                id,
+                requested.as_deref(),
+                query.retrieve_vectors,
+                true,
+            )?;
             let ranking_score = if query.show_ranking_score {
                 document_scores
                     .get(idx)
@@ -233,7 +259,7 @@ impl Index {
             let ranking_score_details = if query.show_ranking_score_details {
                 document_scores
                     .get(idx)
-                    .map(|scores| ScoreDetails::to_json_map(scores.iter()))
+                    .map(|scores| ScoreDetails::to_json_map(criteria, scores.iter()))
             } else {
                 None
             };
@@ -244,7 +270,7 @@ impl Index {
         }
 
         let processing_time_ms = start_time.elapsed().as_millis();
-        let total_hits = candidates.len() as usize;
+        let total_hits = (candidates.len() as usize).min(max_hits);
 
         Ok(SimilarResult {
             hits,

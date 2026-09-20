@@ -3,10 +3,11 @@
 //! Provides query, result, and hit types that match the Meilisearch HTTP API
 //! shape using `serde(rename_all = "camelCase")` for JSON compatibility.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+pub use crate::types::HybridQuery;
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use indexmap::IndexMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 // ============================================================================
 // SearchQuery
@@ -16,9 +17,11 @@ use indexmap::IndexMap;
 ///
 /// Matches the Meilisearch HTTP API search body (minus server-only fields).
 /// All fields use camelCase serialization for API shape parity.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<Value>,
     /// The search query string. If `None`, matches all documents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub q: Option<String>,
@@ -124,22 +127,27 @@ pub struct SearchQuery {
     pub locales: Option<Vec<String>>,
 }
 
-fn default_limit() -> usize { 20 }
-fn default_crop_length() -> usize { 10 }
-fn default_crop_marker() -> String { "...".to_string() }
-fn default_highlight_pre_tag() -> String { "<em>".to_string() }
-fn default_highlight_post_tag() -> String { "</em>".to_string() }
+fn default_limit() -> usize {
+    20
+}
+fn default_crop_length() -> usize {
+    10
+}
+fn default_crop_marker() -> String {
+    "...".to_string()
+}
+fn default_highlight_pre_tag() -> String {
+    "<em>".to_string()
+}
+fn default_highlight_post_tag() -> String {
+    "</em>".to_string()
+}
 
 impl SearchQuery {
     /// Create a new search query with the given query string.
     pub fn new(query: impl Into<String>) -> Self {
         Self {
             q: Some(query.into()),
-            limit: default_limit(),
-            crop_length: default_crop_length(),
-            crop_marker: default_crop_marker(),
-            highlight_pre_tag: default_highlight_pre_tag(),
-            highlight_post_tag: default_highlight_post_tag(),
             ..Default::default()
         }
     }
@@ -150,19 +158,40 @@ impl SearchQuery {
     }
 
     /// Set the maximum number of results to return.
-    pub fn with_limit(mut self, limit: usize) -> Self { self.limit = limit; self }
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
+    }
     /// Set the number of results to skip.
-    pub fn with_offset(mut self, offset: usize) -> Self { self.offset = offset; self }
+    pub fn with_offset(mut self, offset: usize) -> Self {
+        self.offset = offset;
+        self
+    }
     /// Switch to page-based pagination and set the page number (1-indexed).
-    pub fn with_page(mut self, page: usize) -> Self { self.page = Some(page); self }
+    pub fn with_page(mut self, page: usize) -> Self {
+        self.page = Some(page);
+        self
+    }
     /// Set the number of hits per page (enables page-based pagination).
-    pub fn with_hits_per_page(mut self, hpp: usize) -> Self { self.hits_per_page = Some(hpp); self }
+    pub fn with_hits_per_page(mut self, hpp: usize) -> Self {
+        self.hits_per_page = Some(hpp);
+        self
+    }
     /// Set a filter expression (string or JSON array-of-arrays syntax).
-    pub fn with_filter(mut self, filter: impl Into<Value>) -> Self { self.filter = Some(filter.into()); self }
+    pub fn with_filter(mut self, filter: impl Into<Value>) -> Self {
+        self.filter = Some(filter.into());
+        self
+    }
     /// Set sort criteria, e.g. `["price:asc", "rating:desc"]`.
-    pub fn with_sort(mut self, sort: Vec<String>) -> Self { self.sort = Some(sort); self }
+    pub fn with_sort(mut self, sort: Vec<String>) -> Self {
+        self.sort = Some(sort);
+        self
+    }
     /// Request facet distribution for the given attributes.
-    pub fn with_facets(mut self, facets: Vec<String>) -> Self { self.facets = Some(facets); self }
+    pub fn with_facets(mut self, facets: Vec<String>) -> Self {
+        self.facets = Some(facets);
+        self
+    }
     /// Restrict which document attributes are included in the response.
     pub fn with_attributes_to_retrieve(mut self, attrs: impl IntoIterator<Item = String>) -> Self {
         self.attributes_to_retrieve = Some(attrs.into_iter().collect());
@@ -174,37 +203,85 @@ impl SearchQuery {
         self
     }
     /// Set attributes to crop around matching terms.
-    pub fn with_attributes_to_crop(mut self, attrs: Vec<String>) -> Self { self.attributes_to_crop = Some(attrs); self }
+    pub fn with_attributes_to_crop(mut self, attrs: Vec<String>) -> Self {
+        self.attributes_to_crop = Some(attrs);
+        self
+    }
     /// Set the maximum length (in words) for cropped values.
-    pub fn with_crop_length(mut self, len: usize) -> Self { self.crop_length = len; self }
+    pub fn with_crop_length(mut self, len: usize) -> Self {
+        self.crop_length = len;
+        self
+    }
     /// Set the marker string for cropped boundaries (default: `"..."`).
-    pub fn with_crop_marker(mut self, marker: impl Into<String>) -> Self { self.crop_marker = marker.into(); self }
+    pub fn with_crop_marker(mut self, marker: impl Into<String>) -> Self {
+        self.crop_marker = marker.into();
+        self
+    }
     /// Set the tag inserted before highlighted terms (default: `<em>`).
-    pub fn with_highlight_pre_tag(mut self, tag: impl Into<String>) -> Self { self.highlight_pre_tag = tag.into(); self }
+    pub fn with_highlight_pre_tag(mut self, tag: impl Into<String>) -> Self {
+        self.highlight_pre_tag = tag.into();
+        self
+    }
     /// Set the tag inserted after highlighted terms (default: `</em>`).
-    pub fn with_highlight_post_tag(mut self, tag: impl Into<String>) -> Self { self.highlight_post_tag = tag.into(); self }
+    pub fn with_highlight_post_tag(mut self, tag: impl Into<String>) -> Self {
+        self.highlight_post_tag = tag.into();
+        self
+    }
     /// Include `_rankingScore` in each hit.
-    pub fn with_ranking_score(mut self, show: bool) -> Self { self.show_ranking_score = show; self }
+    pub fn with_ranking_score(mut self, show: bool) -> Self {
+        self.show_ranking_score = show;
+        self
+    }
     /// Include `_rankingScoreDetails` breakdown in each hit.
-    pub fn with_ranking_score_details(mut self, show: bool) -> Self { self.show_ranking_score_details = show; self }
+    pub fn with_ranking_score_details(mut self, show: bool) -> Self {
+        self.show_ranking_score_details = show;
+        self
+    }
     /// Include `_matchesPosition` in each hit.
-    pub fn with_matches_position(mut self, show: bool) -> Self { self.show_matches_position = show; self }
+    pub fn with_matches_position(mut self, show: bool) -> Self {
+        self.show_matches_position = show;
+        self
+    }
     /// Set the strategy for matching query terms.
-    pub fn with_matching_strategy(mut self, strategy: MatchingStrategy) -> Self { self.matching_strategy = strategy; self }
+    pub fn with_matching_strategy(mut self, strategy: MatchingStrategy) -> Self {
+        self.matching_strategy = strategy;
+        self
+    }
     /// Set a minimum ranking score threshold; hits below this are excluded.
-    pub fn with_ranking_score_threshold(mut self, threshold: f64) -> Self { self.ranking_score_threshold = Some(threshold); self }
+    pub fn with_ranking_score_threshold(mut self, threshold: f64) -> Self {
+        self.ranking_score_threshold = Some(threshold);
+        self
+    }
     /// Return only documents with distinct values for this attribute.
-    pub fn with_distinct(mut self, attr: impl Into<String>) -> Self { self.distinct = Some(attr.into()); self }
+    pub fn with_distinct(mut self, attr: impl Into<String>) -> Self {
+        self.distinct = Some(attr.into());
+        self
+    }
     /// Set locales for language-specific tokenization.
-    pub fn with_locales(mut self, locales: Vec<String>) -> Self { self.locales = Some(locales); self }
+    pub fn with_locales(mut self, locales: Vec<String>) -> Self {
+        self.locales = Some(locales);
+        self
+    }
     /// Restrict search to specific attributes.
-    pub fn with_attributes_to_search_on(mut self, attrs: Vec<String>) -> Self { self.attributes_to_search_on = Some(attrs); self }
+    pub fn with_attributes_to_search_on(mut self, attrs: Vec<String>) -> Self {
+        self.attributes_to_search_on = Some(attrs);
+        self
+    }
     /// Set a pre-computed query vector for pure vector search.
-    pub fn with_vector(mut self, vector: Vec<f32>) -> Self { self.vector = Some(vector); self }
+    pub fn with_vector(mut self, vector: Vec<f32>) -> Self {
+        self.vector = Some(vector);
+        self
+    }
     /// Enable hybrid (keyword + semantic) search with the given configuration.
-    pub fn with_hybrid(mut self, hybrid: HybridQuery) -> Self { self.hybrid = Some(hybrid); self }
+    pub fn with_hybrid(mut self, hybrid: HybridQuery) -> Self {
+        self.hybrid = Some(hybrid);
+        self
+    }
     /// Include embedding vectors in returned documents.
-    pub fn with_retrieve_vectors(mut self, retrieve: bool) -> Self { self.retrieve_vectors = retrieve; self }
+    pub fn with_retrieve_vectors(mut self, retrieve: bool) -> Self {
+        self.retrieve_vectors = retrieve;
+        self
+    }
 
     /// Helper to get query string (for backward compat).
     pub fn query_str(&self) -> Option<&str> {
@@ -229,33 +306,8 @@ pub enum MatchingStrategy {
     Frequency,
 }
 
-/// Hybrid search configuration combining keyword and semantic search.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HybridQuery {
-    /// Balance between keyword (0.0) and semantic (1.0) search. Default: 0.5.
-    #[serde(default = "default_semantic_ratio")]
-    pub semantic_ratio: f32,
-    /// Name of the embedder to use.
-    pub embedder: String,
-}
-
-fn default_semantic_ratio() -> f32 { 0.5 }
-
-impl HybridQuery {
-    /// Create a hybrid query for the named embedder with a default 0.5 semantic ratio.
-    pub fn new(embedder: impl Into<String>) -> Self {
-        Self {
-            semantic_ratio: 0.5,
-            embedder: embedder.into(),
-        }
-    }
-
-    /// Set the semantic ratio (clamped to 0.0..=1.0). 0.0 = keyword only, 1.0 = semantic only.
-    pub fn with_semantic_ratio(mut self, ratio: f32) -> Self {
-        self.semantic_ratio = ratio.clamp(0.0, 1.0);
-        self
-    }
+fn default_semantic_ratio() -> f32 {
+    0.5
 }
 
 // ============================================================================
@@ -271,23 +323,43 @@ pub struct SearchHit {
     pub document: Value,
 
     /// Highlighted/cropped version of the document.
-    #[serde(default, rename = "_formatted", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "_formatted",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub formatted: Option<Value>,
 
     /// Positions of matching terms in the document.
-    #[serde(default, rename = "_matchesPosition", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "_matchesPosition",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub matches_position: Option<BTreeMap<String, Vec<MatchBounds>>>,
 
     /// Global ranking score (0.0-1.0).
-    #[serde(default, rename = "_rankingScore", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "_rankingScore",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ranking_score: Option<f64>,
 
     /// Detailed ranking score breakdown per ranking rule.
-    #[serde(default, rename = "_rankingScoreDetails", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "_rankingScoreDetails",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ranking_score_details: Option<Map<String, Value>>,
 
     /// Vector similarity score (vector/hybrid search only).
-    #[serde(default, rename = "_semanticScore", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "_semanticScore",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub semantic_score: Option<f32>,
 
     /// Vectors associated with the document.
@@ -310,14 +382,7 @@ impl SearchHit {
     }
 }
 
-/// Bounds of a match within a document field value.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MatchBounds {
-    /// Byte offset where the match begins.
-    pub start: usize,
-    /// Length of the match in bytes.
-    pub length: usize,
-}
+pub use milli::MatchBounds;
 
 // ============================================================================
 // SearchResult
@@ -364,6 +429,14 @@ pub struct FacetStats {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchResult {
+    #[serde(skip)]
+    pub(crate) candidates: roaring::RoaringBitmap,
+    #[serde(default)]
+    pub degraded: bool,
+    #[serde(default)]
+    pub used_negative_operator: bool,
+    #[serde(skip)]
+    pub(crate) scores: Vec<Vec<milli::score_details::ScoreDetails>>,
     /// The matching documents.
     pub hits: Vec<SearchHit>,
 
@@ -408,6 +481,10 @@ impl SearchResult {
         offset: usize,
     ) -> Self {
         Self {
+            degraded: false,
+            used_negative_operator: false,
+            scores: Vec::new(),
+            candidates: Default::default(),
             hits,
             document_ids: Vec::new(),
             query,
@@ -434,6 +511,10 @@ impl SearchResult {
         offset: usize,
     ) -> Self {
         Self {
+            degraded: false,
+            used_negative_operator: false,
+            scores: Vec::new(),
+            candidates: Default::default(),
             hits,
             document_ids,
             query,
@@ -464,6 +545,10 @@ impl SearchResult {
             0
         };
         Self {
+            degraded: false,
+            used_negative_operator: false,
+            scores: Vec::new(),
+            candidates: Default::default(),
             hits,
             document_ids: Vec::new(),
             query,
@@ -515,17 +600,35 @@ impl HybridSearchQuery {
     }
 
     /// Set the query vector for semantic search.
-    pub fn with_vector(mut self, vector: Vec<f32>) -> Self { self.vector = Some(vector); self }
+    pub fn with_vector(mut self, vector: Vec<f32>) -> Self {
+        self.vector = Some(vector);
+        self
+    }
     /// Set the semantic ratio (clamped to 0.0..=1.0).
-    pub fn with_semantic_ratio(mut self, ratio: f32) -> Self { self.semantic_ratio = ratio.clamp(0.0, 1.0); self }
+    pub fn with_semantic_ratio(mut self, ratio: f32) -> Self {
+        self.semantic_ratio = ratio.clamp(0.0, 1.0);
+        self
+    }
     /// Set the maximum number of results to return.
-    pub fn with_limit(mut self, limit: usize) -> Self { self.search = self.search.with_limit(limit); self }
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.search = self.search.with_limit(limit);
+        self
+    }
     /// Set the number of results to skip.
-    pub fn with_offset(mut self, offset: usize) -> Self { self.search = self.search.with_offset(offset); self }
+    pub fn with_offset(mut self, offset: usize) -> Self {
+        self.search = self.search.with_offset(offset);
+        self
+    }
     /// Set a filter expression.
-    pub fn with_filter(mut self, filter: impl Into<Value>) -> Self { self.search = self.search.with_filter(filter); self }
+    pub fn with_filter(mut self, filter: impl Into<Value>) -> Self {
+        self.search = self.search.with_filter(filter);
+        self
+    }
     /// Include `_rankingScore` in each hit.
-    pub fn with_ranking_score(mut self, show: bool) -> Self { self.search = self.search.with_ranking_score(show); self }
+    pub fn with_ranking_score(mut self, show: bool) -> Self {
+        self.search = self.search.with_ranking_score(show);
+        self
+    }
 }
 
 /// Result of a hybrid search operation.
@@ -589,9 +692,11 @@ pub struct SearchResultWithIndex {
 // ============================================================================
 
 /// Configuration for federated (merged) multi-search.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Federation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distinct: Option<String>,
     /// Maximum number of merged hits to return. Default: 20.
     #[serde(default = "default_limit")]
     pub limit: usize,
@@ -622,7 +727,7 @@ pub struct MergeFacets {
 }
 
 /// Per-query options that influence ranking in a federated multi-search.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FederationOptions {
     /// Weight multiplier applied to ranking scores from this query. Default: 1.0.
@@ -633,7 +738,9 @@ pub struct FederationOptions {
     pub query_position: Option<usize>,
 }
 
-fn default_federation_weight() -> f64 { 1.0 }
+fn default_federation_weight() -> f64 {
+    1.0
+}
 
 /// A single query in a federated multi-search request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -653,6 +760,8 @@ pub struct FederatedMultiSearchQuery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FederatedSearchResult {
+    #[serde(skip)]
+    pub(crate) pin_positions: Vec<usize>,
     /// Merged hits from all queried indexes, sorted by ranking score.
     pub hits: Vec<SearchHit>,
     /// Total processing time in milliseconds.
@@ -820,4 +929,61 @@ pub struct GetDocumentsOptions {
     /// Sort expressions, e.g. `["price:asc"]`. Only applies to filtered results.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort: Option<Vec<String>>,
+}
+
+impl Default for SearchQuery {
+    fn default() -> Self {
+        Self {
+            media: None,
+            q: None,
+            vector: None,
+            hybrid: None,
+            offset: 0,
+            limit: default_limit(),
+            page: None,
+            hits_per_page: None,
+            attributes_to_retrieve: None,
+            retrieve_vectors: false,
+            attributes_to_highlight: None,
+            highlight_pre_tag: default_highlight_pre_tag(),
+            highlight_post_tag: default_highlight_post_tag(),
+            attributes_to_crop: None,
+            crop_length: default_crop_length(),
+            crop_marker: default_crop_marker(),
+            show_ranking_score: false,
+            show_ranking_score_details: false,
+            show_matches_position: false,
+            ranking_score_threshold: None,
+            filter: None,
+            sort: None,
+            distinct: None,
+            facets: None,
+            matching_strategy: MatchingStrategy::default(),
+            attributes_to_search_on: None,
+            locales: None,
+        }
+    }
+}
+
+impl Default for Federation {
+    fn default() -> Self {
+        Self {
+            distinct: None,
+            limit: default_limit(),
+            offset: 0,
+            page: None,
+            hits_per_page: None,
+            facets_by_index: BTreeMap::new(),
+            merge_facets: None,
+        }
+    }
+}
+
+impl Default for FederationOptions {
+    fn default() -> Self {
+        Self {
+            weight: default_federation_weight(),
+            query_position: None,
+        }
+    }
 }

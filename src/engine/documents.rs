@@ -15,55 +15,33 @@ impl traits::Documents for Engine {
         query: &DocumentQuery,
     ) -> Result<Value> {
         let idx = self.resolve_index(index_uid)?;
-        let fields: Option<Vec<String>> = query
-            .fields
-            .as_ref()
-            .map(|f| f.split(',').map(|s| s.trim().to_string()).collect());
-        let doc = idx.get_document_with_fields(document_id, fields.as_deref())?;
-        doc.ok_or_else(|| crate::core::error::Error::DocumentNotFound(document_id.to_string()))
+        let options = crate::core::GetDocumentsOptions {
+            ids: Some(vec![document_id.to_owned()]),
+            fields: query.fields.clone(),
+            retrieve_vectors: query.retrieve_vectors,
+            limit: 1,
+            ..Default::default()
+        };
+        idx.get_documents_with_options(&options)?
+            .documents
+            .into_iter()
+            .next()
+            .ok_or_else(|| crate::core::Error::DocumentNotFound(document_id.into()))
     }
 
-    fn get_documents(
-        &self,
-        index_uid: &str,
-        query: &DocumentsQuery,
-    ) -> Result<DocumentsResponse> {
-        let idx = self.resolve_index(index_uid)?;
-        let offset = query.offset.unwrap_or(0) as usize;
-        let limit = query.limit.unwrap_or(20) as usize;
-
-        if query.filter.is_some() || query.ids.is_some() || query.sort.is_some() {
-            let options = crate::core::search::GetDocumentsOptions {
-                offset,
-                limit,
-                fields: query.fields.as_ref().map(|f| {
-                    f.split(',').map(|s| s.trim().to_string()).collect()
-                }),
-                filter: query.filter.as_ref().map(|f| Value::String(f.clone())),
-                ids: query.ids.as_ref().map(|ids_str| {
-                    ids_str.split(',').map(|s| s.trim().to_string()).collect()
-                }),
-                sort: query.sort.as_ref().map(|s| {
-                    s.split(',').map(|s| s.trim().to_string()).collect()
-                }),
-                ..Default::default()
-            };
-            let result = idx.get_documents_with_options(&options)?;
-            return Ok(DocumentsResponse {
-                results: result.documents,
-                offset: u32::try_from(result.offset).unwrap_or(u32::MAX),
-                limit: u32::try_from(result.limit).unwrap_or(u32::MAX),
-                total: result.total,
-            });
-        }
-
-        let result = idx.get_documents(offset, limit)?;
-        Ok(DocumentsResponse {
-            results: result.documents,
-            offset: u32::try_from(result.offset).unwrap_or(u32::MAX),
-            limit: u32::try_from(result.limit).unwrap_or(u32::MAX),
-            total: result.total,
-        })
+    fn get_documents(&self, index_uid: &str, query: &DocumentsQuery) -> Result<DocumentsResponse> {
+        self.fetch_documents(
+            index_uid,
+            &FetchDocumentsRequest {
+                fields: query.fields.clone(),
+                filter: query.filter.clone(),
+                ids: query.ids.clone(),
+                sort: query.sort.clone(),
+                offset: query.offset,
+                limit: query.limit,
+                retrieve_vectors: query.retrieve_vectors,
+            },
+        )
     }
 
     fn fetch_documents(
@@ -71,20 +49,34 @@ impl traits::Documents for Engine {
         index_uid: &str,
         request: &FetchDocumentsRequest,
     ) -> Result<DocumentsResponse> {
-        let idx = self.resolve_index(index_uid)?;
-        let options = crate::core::search::GetDocumentsOptions {
+        let ids = request
+            .ids
+            .as_ref()
+            .map(|ids| {
+                ids.iter()
+                    .cloned()
+                    .map(|id| {
+                        milli::documents::validate_document_id_value(id)
+                            .map_err(|e| crate::core::Error::Internal(e.to_string()))
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
+        let options = crate::core::GetDocumentsOptions {
             offset: request.offset.unwrap_or(0) as usize,
             limit: request.limit.unwrap_or(20) as usize,
             fields: request.fields.clone(),
-            filter: request.filter.as_ref().map(|f| Value::String(f.clone())),
-            ..Default::default()
+            filter: request.filter.clone(),
+            ids,
+            sort: request.sort.clone(),
+            retrieve_vectors: request.retrieve_vectors,
         };
-        let result = idx.get_documents_with_options(&options)?;
+        let result = self.inner.get_documents(index_uid, &options)?;
         Ok(DocumentsResponse {
             results: result.documents,
-            offset: u32::try_from(result.offset).unwrap_or(u32::MAX),
-            limit: u32::try_from(result.limit).unwrap_or(u32::MAX),
             total: result.total,
+            offset: result.offset as u32,
+            limit: result.limit as u32,
         })
     }
 
@@ -95,7 +87,17 @@ impl traits::Documents for Engine {
         query: &AddDocumentsQuery,
     ) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
-        idx.add_documents(documents.to_vec(), query.primary_key.as_deref())?;
+        if query.csv_delimiter.is_some() {
+            return Err(crate::core::Error::Internal(
+                "csvDelimiter is not valid for JSON documents".into(),
+            ));
+        }
+        idx.index_documents(
+            documents.to_vec(),
+            query.primary_key.as_deref(),
+            false,
+            query.skip_creation,
+        )?;
         self.mutation_task(index_uid, "documentAdditionOrUpdate")
     }
 
@@ -106,7 +108,17 @@ impl traits::Documents for Engine {
         query: &AddDocumentsQuery,
     ) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
-        idx.update_documents(documents.to_vec(), query.primary_key.as_deref())?;
+        if query.csv_delimiter.is_some() {
+            return Err(crate::core::Error::Internal(
+                "csvDelimiter is not valid for JSON documents".into(),
+            ));
+        }
+        idx.index_documents(
+            documents.to_vec(),
+            query.primary_key.as_deref(),
+            true,
+            query.skip_creation,
+        )?;
         self.mutation_task(index_uid, "documentAdditionOrUpdate")
     }
 
@@ -122,7 +134,11 @@ impl traits::Documents for Engine {
         request: &DeleteDocumentsByFilterRequest,
     ) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
-        idx.delete_by_filter(&request.filter)?;
+        let filter = self
+            .inner
+            .resolve_filter(index_uid, Some(&request.filter))?
+            .ok_or_else(|| crate::core::Error::InvalidFilter("Empty filter".into()))?;
+        idx.delete_by_index_filter(filter)?;
         self.mutation_task(index_uid, "documentDeletion")
     }
 
@@ -132,14 +148,14 @@ impl traits::Documents for Engine {
         document_ids: &[Value],
     ) -> Result<TaskInfo> {
         let idx = self.resolve_index(index_uid)?;
-        let ids: Vec<String> = document_ids
+        let ids = document_ids
             .iter()
-            .map(|v| match v {
-                Value::String(s) => s.clone(),
-                Value::Number(n) => n.to_string(),
-                other => other.to_string(),
+            .cloned()
+            .map(|id| {
+                milli::documents::validate_document_id_value(id)
+                    .map_err(|e| crate::core::Error::Internal(e.to_string()))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         idx.delete_documents(ids)?;
         self.mutation_task(index_uid, "documentDeletion")
     }

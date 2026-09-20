@@ -2,17 +2,17 @@
 //!
 //! Demonstrates the full lifecycle of index settings management:
 //!
-//! 1. Updating settings via the `Settings` builder (filterable, sortable, etc.)
+//! 1. Updating settings via the `Settings` type (filterable, sortable, etc.)
 //! 2. Reading settings back with `get_settings()`
 //! 3. Using individual setting accessors (get/update/reset per setting)
 //! 4. Configuring synonyms, stop words, and typo tolerance
 //! 5. Resetting all settings to defaults
 
+use serde_json::json;
+use std::collections::HashMap;
 use wilysearch::core::{
     Meilisearch, MeilisearchOptions, MinWordSizeForTypos, Settings, TypoToleranceSettings,
 };
-use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet};
 
 fn main() -> wilysearch::core::Result<()> {
     let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
@@ -35,30 +35,16 @@ fn main() -> wilysearch::core::Result<()> {
     println!("3 products added.\n");
 
     // ======================================================================
-    // 1. Bulk settings update via the Settings builder
+    // 1. Bulk settings update via the Settings type
     // ======================================================================
     println!("=== 1. Bulk settings update ===");
 
-    let settings = Settings::new()
-        .with_searchable_attributes(vec![
-            "name".into(),
-            "brand".into(),
-            "category".into(),
-        ])
-        .with_filterable_attributes(vec![
-            "price".into(),
-            "category".into(),
-            "brand".into(),
-        ])
-        .with_sortable_attributes(
-            ["price".into(), "name".into()].into_iter().collect(),
-        )
-        .with_displayed_attributes(vec![
-            "name".into(),
-            "brand".into(),
-            "price".into(),
-            "category".into(),
-        ]);
+    let settings: Settings = serde_json::from_value(json!({
+        "searchableAttributes": ["name", "brand", "category"],
+        "filterableAttributes": ["price", "category", "brand"],
+        "sortableAttributes": ["price", "name"],
+        "displayedAttributes": ["name", "brand", "price", "category"]
+    }))?;
 
     index.update_settings(&settings)?;
     println!("Settings updated: searchable, filterable, sortable, displayed.");
@@ -69,23 +55,11 @@ fn main() -> wilysearch::core::Result<()> {
     println!("\n=== 2. Read current settings ===");
 
     let current = index.get_settings()?;
-    println!(
-        "Searchable attributes: {:?}",
-        current.searchable_attributes
-    );
-    println!(
-        "Filterable attributes: {:?}",
-        current.filterable_attributes
-    );
+    println!("Searchable attributes: {:?}", current.searchable_attributes);
+    println!("Filterable attributes: {:?}", current.filterable_attributes);
     println!("Sortable attributes:   {:?}", current.sortable_attributes);
-    println!(
-        "Displayed attributes:  {:?}",
-        current.displayed_attributes
-    );
-    println!(
-        "Ranking rules:         {:?}",
-        current.ranking_rules
-    );
+    println!("Displayed attributes:  {:?}", current.displayed_attributes);
+    println!("Ranking rules:         {:?}", current.ranking_rules);
 
     // ======================================================================
     // 3. Individual setting accessors
@@ -101,16 +75,15 @@ fn main() -> wilysearch::core::Result<()> {
     println!("get_sortable_attributes:   {:?}", sortable);
 
     // -- Update stop words --
-    let stop_words: BTreeSet<String> =
-        ["the", "a", "an", "is", "at", "on"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-    index.update_stop_words(stop_words)?;
+    let stop_words: Vec<String> = ["the", "a", "an", "is", "at", "on"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    index.update_stop_words(&stop_words)?;
     println!("\nStop words set: {:?}", index.get_stop_words()?);
 
     // -- Update synonyms --
-    let mut synonyms = BTreeMap::new();
+    let mut synonyms = HashMap::new();
     synonyms.insert(
         "laptop".to_string(),
         vec!["notebook".to_string(), "computer".to_string()],
@@ -119,7 +92,7 @@ fn main() -> wilysearch::core::Result<()> {
         "chair".to_string(),
         vec!["seat".to_string(), "stool".to_string()],
     );
-    index.update_synonyms(synonyms)?;
+    index.update_synonyms(&synonyms)?;
     println!("Synonyms set:   {:?}", index.get_synonyms()?);
 
     // ======================================================================
@@ -133,21 +106,16 @@ fn main() -> wilysearch::core::Result<()> {
             one_typo: Some(4),
             two_typos: Some(8),
         }),
-        disable_on_words: Some(
-            ["Acme", "ErgoMax"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-        ),
+        disable_on_words: Some(["Acme", "ErgoMax"].iter().map(|s| s.to_string()).collect()),
         disable_on_attributes: None,
         disable_on_numbers: None,
     };
 
-    let settings = Settings::new().with_typo_tolerance(typo_settings);
-    index.update_settings(&settings)?;
+    index.update_typo_tolerance(&typo_settings)?;
     println!("Typo tolerance configured:");
     let typo = index.get_typo_tolerance()?;
-    if let Some(ref t) = typo {
+    {
+        let t = &typo;
         println!("  enabled: {:?}", t.enabled);
         if let Some(ref sizes) = t.min_word_size_for_typos {
             println!(
@@ -176,8 +144,14 @@ fn main() -> wilysearch::core::Result<()> {
 
     index.reset_settings()?;
     let after_reset = index.get_settings()?;
-    println!("Filterable after full reset: {:?}", after_reset.filterable_attributes);
-    println!("Sortable after full reset:   {:?}", after_reset.sortable_attributes);
+    println!(
+        "Filterable after full reset: {:?}",
+        after_reset.filterable_attributes
+    );
+    println!(
+        "Sortable after full reset:   {:?}",
+        after_reset.sortable_attributes
+    );
     println!("Stop words after full reset: {:?}", after_reset.stop_words);
     println!("Synonyms after full reset:   {:?}", after_reset.synonyms);
 

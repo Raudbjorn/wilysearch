@@ -187,8 +187,14 @@ fn test_index_has_created_at() {
     assert!(!index.created_at.is_empty(), "created_at should be set");
     assert!(!index.updated_at.is_empty(), "updated_at should be set");
     // Verify ISO-8601 format (starts with a year)
-    assert!(index.created_at.starts_with("20"), "created_at should be ISO-8601");
-    assert!(index.updated_at.starts_with("20"), "updated_at should be ISO-8601");
+    assert!(
+        index.created_at.starts_with("20"),
+        "created_at should be ISO-8601"
+    );
+    assert!(
+        index.updated_at.starts_with("20"),
+        "updated_at should be ISO-8601"
+    );
 }
 
 #[test]
@@ -219,8 +225,14 @@ fn test_updated_at_changes_on_document_add() {
         .expect("failed to add documents");
 
     let after = ctx.engine.get_index("movies").unwrap();
-    assert_eq!(after.created_at, created_at_before, "created_at should not change");
-    assert!(after.updated_at > updated_at_before, "updated_at should advance");
+    assert_eq!(
+        after.created_at, created_at_before,
+        "created_at should not change"
+    );
+    assert!(
+        after.updated_at > updated_at_before,
+        "updated_at should advance"
+    );
 }
 
 #[test]
@@ -228,8 +240,14 @@ fn test_global_stats_last_update() {
     let ctx = TestContext::new();
     common::create_test_index(&ctx, "movies");
 
-    let stats = ctx.engine.global_stats().expect("failed to get global stats");
-    assert!(stats.last_update.is_some(), "last_update should be Some after mutations");
+    let stats = ctx
+        .engine
+        .global_stats()
+        .expect("failed to get global stats");
+    assert!(
+        stats.last_update.is_some(),
+        "last_update should be Some after mutations"
+    );
     let ts = stats.last_update.unwrap();
     assert!(ts.starts_with("20"), "last_update should be ISO-8601");
 }
@@ -254,8 +272,14 @@ fn test_list_indexes_has_timestamps() {
 
     assert_eq!(list.results.len(), 1);
     let idx = &list.results[0];
-    assert!(!idx.created_at.is_empty(), "created_at should be set in list");
-    assert!(!idx.updated_at.is_empty(), "updated_at should be set in list");
+    assert!(
+        !idx.created_at.is_empty(),
+        "created_at should be set in list"
+    );
+    assert!(
+        !idx.updated_at.is_empty(),
+        "updated_at should be set in list"
+    );
 }
 
 #[test]
@@ -266,6 +290,7 @@ fn test_timestamps_persist_across_restart() {
     let created_at;
     {
         let engine = Engine::new(MeilisearchOptions {
+            allow_local_provider_urls: false,
             db_path: db_path.clone(),
             max_index_size: 100 * 1024 * 1024,
             max_task_db_size: 10 * 1024 * 1024,
@@ -286,6 +311,7 @@ fn test_timestamps_persist_across_restart() {
 
     // Reopen with a fresh Engine pointing at the same db_path
     let engine2 = Engine::new(MeilisearchOptions {
+        allow_local_provider_urls: false,
         db_path,
         max_index_size: 100 * 1024 * 1024,
         max_task_db_size: 10 * 1024 * 1024,
@@ -293,8 +319,14 @@ fn test_timestamps_persist_across_restart() {
     .expect("failed to reopen engine");
 
     let index = engine2.get_index("movies").unwrap();
-    assert_eq!(index.created_at, created_at, "created_at should survive restart");
-    assert!(!index.updated_at.is_empty(), "updated_at should survive restart");
+    assert_eq!(
+        index.created_at, created_at,
+        "created_at should survive restart"
+    );
+    assert!(
+        !index.updated_at.is_empty(),
+        "updated_at should survive restart"
+    );
 }
 
 #[test]
@@ -315,8 +347,14 @@ fn test_export_all_indexes() {
     for uid in &["movies", "books"] {
         let index_dir = export_dir.path().join(uid);
         assert!(index_dir.exists(), "{uid} dir should exist");
-        assert!(index_dir.join("documents.json").exists(), "{uid}/documents.json should exist");
-        assert!(index_dir.join("settings.json").exists(), "{uid}/settings.json should exist");
+        assert!(
+            index_dir.join("documents.json").exists(),
+            "{uid}/documents.json should exist"
+        );
+        assert!(
+            index_dir.join("settings.json").exists(),
+            "{uid}/settings.json should exist"
+        );
 
         // Verify documents.json is valid JSON array with content
         let docs: Vec<serde_json::Value> = serde_json::from_str(
@@ -337,8 +375,18 @@ fn test_export_filtered_indexes() {
     let export_dir = tempfile::TempDir::new().expect("failed to create export dir");
 
     let mut indexes = HashMap::new();
-    indexes.insert("movies".to_string(), ExportIndexConfig { override_settings: None });
-    indexes.insert("songs".to_string(), ExportIndexConfig { override_settings: None });
+    indexes.insert(
+        "movies".to_string(),
+        ExportIndexConfig {
+            override_settings: None,
+        },
+    );
+    indexes.insert(
+        "songs".to_string(),
+        ExportIndexConfig {
+            override_settings: None,
+        },
+    );
 
     let result = ctx.engine.export(&ExportRequest {
         url: export_dir.path().to_string_lossy().to_string(),
@@ -348,9 +396,18 @@ fn test_export_filtered_indexes() {
     assert!(result.is_ok(), "export should succeed: {result:?}");
 
     // Only movies and songs should be exported
-    assert!(export_dir.path().join("movies").exists(), "movies should be exported");
-    assert!(export_dir.path().join("songs").exists(), "songs should be exported");
-    assert!(!export_dir.path().join("books").exists(), "books should NOT be exported");
+    assert!(
+        export_dir.path().join("movies").exists(),
+        "movies should be exported"
+    );
+    assert!(
+        export_dir.path().join("songs").exists(),
+        "songs should be exported"
+    );
+    assert!(
+        !export_dir.path().join("books").exists(),
+        "books should NOT be exported"
+    );
 }
 
 #[test]
@@ -363,7 +420,9 @@ fn test_export_without_settings() {
     let mut indexes = HashMap::new();
     indexes.insert(
         "movies".to_string(),
-        ExportIndexConfig { override_settings: Some(false) },
+        ExportIndexConfig {
+            override_settings: Some(false),
+        },
     );
 
     let result = ctx.engine.export(&ExportRequest {
@@ -374,6 +433,12 @@ fn test_export_without_settings() {
     assert!(result.is_ok(), "export should succeed: {result:?}");
 
     let index_dir = export_dir.path().join("movies");
-    assert!(index_dir.join("documents.json").exists(), "documents.json should exist");
-    assert!(!index_dir.join("settings.json").exists(), "settings.json should NOT exist when override_settings=false");
+    assert!(
+        index_dir.join("documents.json").exists(),
+        "documents.json should exist"
+    );
+    assert!(
+        !index_dir.join("settings.json").exists(),
+        "settings.json should NOT exist when override_settings=false"
+    );
 }

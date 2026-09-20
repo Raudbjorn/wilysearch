@@ -30,8 +30,8 @@
 
 use serde_json::Value;
 
-use crate::types::*;
 use crate::error::Error;
+use crate::types::*;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -47,11 +47,7 @@ pub trait Documents {
     ) -> Result<Value>;
 
     /// GET /indexes/{indexUid}/documents
-    fn get_documents(
-        &self,
-        index_uid: &str,
-        query: &DocumentsQuery,
-    ) -> Result<DocumentsResponse>;
+    fn get_documents(&self, index_uid: &str, query: &DocumentsQuery) -> Result<DocumentsResponse>;
 
     /// POST /indexes/{indexUid}/documents/fetch
     fn fetch_documents(
@@ -101,18 +97,10 @@ pub trait Documents {
 
 pub trait Search {
     /// POST /indexes/{indexUid}/search
-    fn search(
-        &self,
-        index_uid: &str,
-        request: &SearchRequest,
-    ) -> Result<SearchResponse>;
+    fn search(&self, index_uid: &str, request: &SearchRequest) -> Result<SearchResponse>;
 
     /// POST /indexes/{indexUid}/similar
-    fn similar(
-        &self,
-        index_uid: &str,
-        request: &SimilarRequest,
-    ) -> Result<SimilarResponse>;
+    fn similar(&self, index_uid: &str, request: &SimilarRequest) -> Result<SimilarResponse>;
 
     /// POST /multi-search
     fn multi_search(&self, request: &MultiSearchRequest) -> Result<MultiSearchResult>;
@@ -138,11 +126,7 @@ pub trait Indexes {
     fn create_index(&self, request: &CreateIndexRequest) -> Result<TaskInfo>;
 
     /// PATCH /indexes/{indexUid}
-    fn update_index(
-        &self,
-        index_uid: &str,
-        request: &UpdateIndexRequest,
-    ) -> Result<TaskInfo>;
+    fn update_index(&self, index_uid: &str, request: &UpdateIndexRequest) -> Result<TaskInfo>;
 
     /// POST /swap-indexes
     fn swap_indexes(&self, swaps: &[SwapIndexesRequest]) -> Result<TaskInfo>;
@@ -191,307 +175,385 @@ pub trait SettingsApi {
     fn get_settings(&self, index_uid: &str) -> Result<Settings>;
 
     /// PATCH /indexes/{indexUid}/settings
-    fn update_settings(
-        &self,
-        index_uid: &str,
-        settings: &Settings,
-    ) -> Result<TaskInfo>;
+    fn update_settings(&self, index_uid: &str, settings: &Settings) -> Result<TaskInfo>;
 
     /// DELETE /indexes/{indexUid}/settings
     fn reset_settings(&self, index_uid: &str) -> Result<TaskInfo>;
 
-    // ── Sub-settings: each follows get / update / reset ──────────────────
-    //
-    // Default implementations delegate to get_settings / update_settings /
-    // reset_settings so that alternative backends only need to implement
-    // the three core methods above.
-    //
-    // **Performance note:** These defaults perform a full settings roundtrip
-    // (serialize all settings, update, deserialize) for each sub-setting
-    // operation. The `Engine` implementation overrides every method with
-    // direct per-setting calls for O(1) performance. Alternative backends
-    // using the defaults will have O(N) overhead proportional to the total
-    // number of settings per operation. Override individual methods if this
-    // becomes a bottleneck.
-
     fn get_ranking_rules(&self, index_uid: &str) -> Result<Vec<String>> {
-        Ok(self.get_settings(index_uid)?.ranking_rules.unwrap_or_default())
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings(index_uid)?)?["rankingRules"].clone(),
+        )?)
     }
+
     fn update_ranking_rules(&self, index_uid: &str, rules: &[String]) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.ranking_rules = Some(rules.to_vec());
-        self.update_settings(index_uid, &s)
+        let settings = serde_json::from_value(serde_json::json!({"rankingRules": rules}))?;
+        self.update_settings(index_uid, &settings)
     }
+
     fn reset_ranking_rules(&self, index_uid: &str) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.ranking_rules = Some(vec![]);
-        self.update_settings(index_uid, &s)
+        let settings =
+            serde_json::from_value(serde_json::json!({"rankingRules": serde_json::Value::Null}))?;
+        self.update_settings(index_uid, &settings)
     }
 
     fn get_distinct_attribute(&self, index_uid: &str) -> Result<Option<String>> {
-        Ok(self.get_settings(index_uid)?.distinct_attribute)
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings(index_uid)?)?["distinctAttribute"].clone(),
+        )?)
     }
+
     fn update_distinct_attribute(&self, index_uid: &str, attr: &str) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.distinct_attribute = Some(attr.to_string());
-        self.update_settings(index_uid, &s)
+        let settings = serde_json::from_value(serde_json::json!({"distinctAttribute": attr}))?;
+        self.update_settings(index_uid, &settings)
     }
+
     fn reset_distinct_attribute(&self, index_uid: &str) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.distinct_attribute = None;
-        self.update_settings(index_uid, &s)
+        let settings = serde_json::from_value(
+            serde_json::json!({"distinctAttribute": serde_json::Value::Null}),
+        )?;
+        self.update_settings(index_uid, &settings)
     }
 
     fn get_searchable_attributes(&self, index_uid: &str) -> Result<Vec<String>> {
-        Ok(self.get_settings(index_uid)?.searchable_attributes.unwrap_or_default())
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings(index_uid)?)?["searchableAttributes"].clone(),
+        )?)
     }
+
     fn update_searchable_attributes(&self, index_uid: &str, attrs: &[String]) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.searchable_attributes = Some(attrs.to_vec());
-        self.update_settings(index_uid, &s)
+        let settings = serde_json::from_value(serde_json::json!({"searchableAttributes": attrs}))?;
+        self.update_settings(index_uid, &settings)
     }
+
     fn reset_searchable_attributes(&self, index_uid: &str) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.searchable_attributes = Some(vec![]);
-        self.update_settings(index_uid, &s)
+        let settings = serde_json::from_value(
+            serde_json::json!({"searchableAttributes": serde_json::Value::Null}),
+        )?;
+        self.update_settings(index_uid, &settings)
     }
 
     fn get_displayed_attributes(&self, index_uid: &str) -> Result<Vec<String>> {
-        Ok(self.get_settings(index_uid)?.displayed_attributes.unwrap_or_default())
-    }
-    fn update_displayed_attributes(&self, index_uid: &str, attrs: &[String]) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.displayed_attributes = Some(attrs.to_vec());
-        self.update_settings(index_uid, &s)
-    }
-    fn reset_displayed_attributes(&self, index_uid: &str) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.displayed_attributes = Some(vec![]);
-        self.update_settings(index_uid, &s)
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings(index_uid)?)?["displayedAttributes"].clone(),
+        )?)
     }
 
-    fn get_synonyms(&self, index_uid: &str) -> Result<std::collections::HashMap<String, Vec<String>>> {
-        Ok(self.get_settings(index_uid)?.synonyms.unwrap_or_default())
+    fn update_displayed_attributes(&self, index_uid: &str, attrs: &[String]) -> Result<TaskInfo> {
+        let settings = serde_json::from_value(serde_json::json!({"displayedAttributes": attrs}))?;
+        self.update_settings(index_uid, &settings)
     }
-    fn update_synonyms(&self, index_uid: &str, synonyms: &std::collections::HashMap<String, Vec<String>>) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.synonyms = Some(synonyms.clone());
-        self.update_settings(index_uid, &s)
+
+    fn reset_displayed_attributes(&self, index_uid: &str) -> Result<TaskInfo> {
+        let settings = serde_json::from_value(
+            serde_json::json!({"displayedAttributes": serde_json::Value::Null}),
+        )?;
+        self.update_settings(index_uid, &settings)
     }
+
+    fn get_synonyms(
+        &self,
+        index_uid: &str,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings(index_uid)?)?["synonyms"].clone(),
+        )?)
+    }
+
+    fn update_synonyms(
+        &self,
+        index_uid: &str,
+        synonyms: &std::collections::HashMap<String, Vec<String>>,
+    ) -> Result<TaskInfo> {
+        let settings = serde_json::from_value(serde_json::json!({"synonyms": synonyms}))?;
+        self.update_settings(index_uid, &settings)
+    }
+
     fn reset_synonyms(&self, index_uid: &str) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.synonyms = Some(std::collections::HashMap::new());
-        self.update_settings(index_uid, &s)
+        let settings =
+            serde_json::from_value(serde_json::json!({"synonyms": serde_json::Value::Null}))?;
+        self.update_settings(index_uid, &settings)
     }
 
     fn get_stop_words(&self, index_uid: &str) -> Result<Vec<String>> {
-        Ok(self.get_settings(index_uid)?.stop_words.unwrap_or_default())
-    }
-    fn update_stop_words(&self, index_uid: &str, words: &[String]) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.stop_words = Some(words.to_vec());
-        self.update_settings(index_uid, &s)
-    }
-    fn reset_stop_words(&self, index_uid: &str) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.stop_words = Some(vec![]);
-        self.update_settings(index_uid, &s)
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings(index_uid)?)?["stopWords"].clone(),
+        )?)
     }
 
-    fn get_filterable_attributes(&self, index_uid: &str) -> Result<Vec<String>> {
-        Ok(self.get_settings(index_uid)?.filterable_attributes.unwrap_or_default())
+    fn update_stop_words(&self, index_uid: &str, words: &[String]) -> Result<TaskInfo> {
+        let settings = serde_json::from_value(serde_json::json!({"stopWords": words}))?;
+        self.update_settings(index_uid, &settings)
     }
-    fn update_filterable_attributes(&self, index_uid: &str, attrs: &[String]) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.filterable_attributes = Some(attrs.to_vec());
-        self.update_settings(index_uid, &s)
+
+    fn reset_stop_words(&self, index_uid: &str) -> Result<TaskInfo> {
+        let settings =
+            serde_json::from_value(serde_json::json!({"stopWords": serde_json::Value::Null}))?;
+        self.update_settings(index_uid, &settings)
     }
+
+    fn get_filterable_attributes(&self, index_uid: &str) -> Result<Vec<FilterableAttributesRule>> {
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings(index_uid)?)?["filterableAttributes"].clone(),
+        )?)
+    }
+
+    fn update_filterable_attributes(
+        &self,
+        index_uid: &str,
+        attrs: &[FilterableAttributesRule],
+    ) -> Result<TaskInfo> {
+        let settings = serde_json::from_value(serde_json::json!({"filterableAttributes": attrs}))?;
+        self.update_settings(index_uid, &settings)
+    }
+
     fn reset_filterable_attributes(&self, index_uid: &str) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.filterable_attributes = Some(vec![]);
-        self.update_settings(index_uid, &s)
+        let settings = serde_json::from_value(
+            serde_json::json!({"filterableAttributes": serde_json::Value::Null}),
+        )?;
+        self.update_settings(index_uid, &settings)
     }
 
     fn get_sortable_attributes(&self, index_uid: &str) -> Result<Vec<String>> {
-        Ok(self.get_settings(index_uid)?.sortable_attributes.unwrap_or_default())
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings(index_uid)?)?["sortableAttributes"].clone(),
+        )?)
     }
+
     fn update_sortable_attributes(&self, index_uid: &str, attrs: &[String]) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.sortable_attributes = Some(attrs.to_vec());
-        self.update_settings(index_uid, &s)
+        let settings = serde_json::from_value(serde_json::json!({"sortableAttributes": attrs}))?;
+        self.update_settings(index_uid, &settings)
     }
+
     fn reset_sortable_attributes(&self, index_uid: &str) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.sortable_attributes = Some(vec![]);
-        self.update_settings(index_uid, &s)
+        let settings = serde_json::from_value(
+            serde_json::json!({"sortableAttributes": serde_json::Value::Null}),
+        )?;
+        self.update_settings(index_uid, &settings)
     }
 
     fn get_typo_tolerance(&self, index_uid: &str) -> Result<TypoTolerance> {
-        Ok(self.get_settings(index_uid)?.typo_tolerance.unwrap_or_default())
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings(index_uid)?)?["typoTolerance"].clone(),
+        )?)
     }
+
     fn update_typo_tolerance(&self, index_uid: &str, config: &TypoTolerance) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.typo_tolerance = Some(config.clone());
-        self.update_settings(index_uid, &s)
+        let settings = serde_json::from_value(serde_json::json!({"typoTolerance": config}))?;
+        self.update_settings(index_uid, &settings)
     }
+
     fn reset_typo_tolerance(&self, index_uid: &str) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.typo_tolerance = Some(TypoTolerance::default());
-        self.update_settings(index_uid, &s)
+        let settings =
+            serde_json::from_value(serde_json::json!({"typoTolerance": serde_json::Value::Null}))?;
+        self.update_settings(index_uid, &settings)
     }
 
     fn get_pagination(&self, index_uid: &str) -> Result<Pagination> {
-        Ok(self.get_settings(index_uid)?.pagination.unwrap_or_default())
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings(index_uid)?)?["pagination"].clone(),
+        )?)
     }
+
     fn update_pagination(&self, index_uid: &str, config: &Pagination) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.pagination = Some(config.clone());
-        self.update_settings(index_uid, &s)
+        let settings = serde_json::from_value(serde_json::json!({"pagination": config}))?;
+        self.update_settings(index_uid, &settings)
     }
+
     fn reset_pagination(&self, index_uid: &str) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.pagination = Some(Pagination::default());
-        self.update_settings(index_uid, &s)
+        let settings =
+            serde_json::from_value(serde_json::json!({"pagination": serde_json::Value::Null}))?;
+        self.update_settings(index_uid, &settings)
     }
 
     fn get_faceting(&self, index_uid: &str) -> Result<Faceting> {
-        Ok(self.get_settings(index_uid)?.faceting.unwrap_or_default())
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings(index_uid)?)?["faceting"].clone(),
+        )?)
     }
+
     fn update_faceting(&self, index_uid: &str, config: &Faceting) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.faceting = Some(config.clone());
-        self.update_settings(index_uid, &s)
+        let settings = serde_json::from_value(serde_json::json!({"faceting": config}))?;
+        self.update_settings(index_uid, &settings)
     }
+
     fn reset_faceting(&self, index_uid: &str) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.faceting = Some(Faceting::default());
-        self.update_settings(index_uid, &s)
+        let settings =
+            serde_json::from_value(serde_json::json!({"faceting": serde_json::Value::Null}))?;
+        self.update_settings(index_uid, &settings)
     }
 
     fn get_dictionary(&self, index_uid: &str) -> Result<Vec<String>> {
-        Ok(self.get_settings(index_uid)?.dictionary.unwrap_or_default())
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings(index_uid)?)?["dictionary"].clone(),
+        )?)
     }
+
     fn update_dictionary(&self, index_uid: &str, words: &[String]) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.dictionary = Some(words.to_vec());
-        self.update_settings(index_uid, &s)
+        let settings = serde_json::from_value(serde_json::json!({"dictionary": words}))?;
+        self.update_settings(index_uid, &settings)
     }
+
     fn reset_dictionary(&self, index_uid: &str) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.dictionary = Some(vec![]);
-        self.update_settings(index_uid, &s)
+        let settings =
+            serde_json::from_value(serde_json::json!({"dictionary": serde_json::Value::Null}))?;
+        self.update_settings(index_uid, &settings)
     }
 
     fn get_separator_tokens(&self, index_uid: &str) -> Result<Vec<String>> {
-        Ok(self.get_settings(index_uid)?.separator_tokens.unwrap_or_default())
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings(index_uid)?)?["separatorTokens"].clone(),
+        )?)
     }
+
     fn update_separator_tokens(&self, index_uid: &str, tokens: &[String]) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.separator_tokens = Some(tokens.to_vec());
-        self.update_settings(index_uid, &s)
+        let settings = serde_json::from_value(serde_json::json!({"separatorTokens": tokens}))?;
+        self.update_settings(index_uid, &settings)
     }
+
     fn reset_separator_tokens(&self, index_uid: &str) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.separator_tokens = Some(vec![]);
-        self.update_settings(index_uid, &s)
+        let settings = serde_json::from_value(
+            serde_json::json!({"separatorTokens": serde_json::Value::Null}),
+        )?;
+        self.update_settings(index_uid, &settings)
     }
 
     fn get_non_separator_tokens(&self, index_uid: &str) -> Result<Vec<String>> {
-        Ok(self.get_settings(index_uid)?.non_separator_tokens.unwrap_or_default())
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings(index_uid)?)?["nonSeparatorTokens"].clone(),
+        )?)
     }
+
     fn update_non_separator_tokens(&self, index_uid: &str, tokens: &[String]) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.non_separator_tokens = Some(tokens.to_vec());
-        self.update_settings(index_uid, &s)
+        let settings = serde_json::from_value(serde_json::json!({"nonSeparatorTokens": tokens}))?;
+        self.update_settings(index_uid, &settings)
     }
+
     fn reset_non_separator_tokens(&self, index_uid: &str) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.non_separator_tokens = Some(vec![]);
-        self.update_settings(index_uid, &s)
+        let settings = serde_json::from_value(
+            serde_json::json!({"nonSeparatorTokens": serde_json::Value::Null}),
+        )?;
+        self.update_settings(index_uid, &settings)
     }
 
     fn get_proximity_precision(&self, index_uid: &str) -> Result<ProximityPrecision> {
-        Ok(self.get_settings(index_uid)?.proximity_precision.unwrap_or(ProximityPrecision::ByWord))
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings(index_uid)?)?["proximityPrecision"].clone(),
+        )?)
     }
-    fn update_proximity_precision(&self, index_uid: &str, precision: ProximityPrecision) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.proximity_precision = Some(precision);
-        self.update_settings(index_uid, &s)
+
+    fn update_proximity_precision(
+        &self,
+        index_uid: &str,
+        precision: ProximityPrecision,
+    ) -> Result<TaskInfo> {
+        let settings =
+            serde_json::from_value(serde_json::json!({"proximityPrecision": precision}))?;
+        self.update_settings(index_uid, &settings)
     }
+
     fn reset_proximity_precision(&self, index_uid: &str) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.proximity_precision = None;
-        self.update_settings(index_uid, &s)
+        let settings = serde_json::from_value(
+            serde_json::json!({"proximityPrecision": serde_json::Value::Null}),
+        )?;
+        self.update_settings(index_uid, &settings)
     }
 
     fn get_facet_search(&self, index_uid: &str) -> Result<bool> {
-        Ok(self.get_settings(index_uid)?.facet_search.unwrap_or(true))
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings(index_uid)?)?["facetSearch"].clone(),
+        )?)
     }
+
     fn update_facet_search(&self, index_uid: &str, enabled: bool) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.facet_search = Some(enabled);
-        self.update_settings(index_uid, &s)
+        let settings = serde_json::from_value(serde_json::json!({"facetSearch": enabled}))?;
+        self.update_settings(index_uid, &settings)
     }
+
     fn reset_facet_search(&self, index_uid: &str) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.facet_search = None;
-        self.update_settings(index_uid, &s)
+        let settings =
+            serde_json::from_value(serde_json::json!({"facetSearch": serde_json::Value::Null}))?;
+        self.update_settings(index_uid, &settings)
     }
 
     fn get_prefix_search(&self, index_uid: &str) -> Result<PrefixSearch> {
-        Ok(self.get_settings(index_uid)?.prefix_search.unwrap_or(PrefixSearch::IndexingTime))
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings(index_uid)?)?["prefixSearch"].clone(),
+        )?)
     }
+
     fn update_prefix_search(&self, index_uid: &str, mode: PrefixSearch) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.prefix_search = Some(mode);
-        self.update_settings(index_uid, &s)
+        let settings = serde_json::from_value(serde_json::json!({"prefixSearch": mode}))?;
+        self.update_settings(index_uid, &settings)
     }
+
     fn reset_prefix_search(&self, index_uid: &str) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.prefix_search = None;
-        self.update_settings(index_uid, &s)
+        let settings =
+            serde_json::from_value(serde_json::json!({"prefixSearch": serde_json::Value::Null}))?;
+        self.update_settings(index_uid, &settings)
     }
 
     fn get_search_cutoff_ms(&self, index_uid: &str) -> Result<Option<u64>> {
-        Ok(self.get_settings(index_uid)?.search_cutoff_ms)
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings(index_uid)?)?["searchCutoffMs"].clone(),
+        )?)
     }
+
     fn update_search_cutoff_ms(&self, index_uid: &str, ms: u64) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.search_cutoff_ms = Some(ms);
-        self.update_settings(index_uid, &s)
+        let settings = serde_json::from_value(serde_json::json!({"searchCutoffMs": ms}))?;
+        self.update_settings(index_uid, &settings)
     }
+
     fn reset_search_cutoff_ms(&self, index_uid: &str) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.search_cutoff_ms = None;
-        self.update_settings(index_uid, &s)
+        let settings =
+            serde_json::from_value(serde_json::json!({"searchCutoffMs": serde_json::Value::Null}))?;
+        self.update_settings(index_uid, &settings)
     }
 
     fn get_localized_attributes(&self, index_uid: &str) -> Result<Option<Vec<LocalizedAttribute>>> {
-        Ok(self.get_settings(index_uid)?.localized_attributes)
-    }
-    fn update_localized_attributes(&self, index_uid: &str, attrs: &[LocalizedAttribute]) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.localized_attributes = Some(attrs.to_vec());
-        self.update_settings(index_uid, &s)
-    }
-    fn reset_localized_attributes(&self, index_uid: &str) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.localized_attributes = None;
-        self.update_settings(index_uid, &s)
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings(index_uid)?)?["localizedAttributes"].clone(),
+        )?)
     }
 
-    fn get_embedders(&self, index_uid: &str) -> Result<Option<std::collections::HashMap<String, EmbedderConfig>>> {
-        Ok(self.get_settings(index_uid)?.embedders)
+    fn update_localized_attributes(
+        &self,
+        index_uid: &str,
+        attrs: &[LocalizedAttribute],
+    ) -> Result<TaskInfo> {
+        let settings = serde_json::from_value(serde_json::json!({"localizedAttributes": attrs}))?;
+        self.update_settings(index_uid, &settings)
     }
-    fn update_embedders(&self, index_uid: &str, embedders: &std::collections::HashMap<String, EmbedderConfig>) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.embedders = Some(embedders.clone());
-        self.update_settings(index_uid, &s)
+
+    fn reset_localized_attributes(&self, index_uid: &str) -> Result<TaskInfo> {
+        let settings = serde_json::from_value(
+            serde_json::json!({"localizedAttributes": serde_json::Value::Null}),
+        )?;
+        self.update_settings(index_uid, &settings)
     }
+
+    fn get_embedders(
+        &self,
+        index_uid: &str,
+    ) -> Result<Option<std::collections::HashMap<String, EmbedderConfig>>> {
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings(index_uid)?)?["embedders"].clone(),
+        )?)
+    }
+
+    fn update_embedders(
+        &self,
+        index_uid: &str,
+        embedders: &std::collections::HashMap<String, EmbedderConfig>,
+    ) -> Result<TaskInfo> {
+        let settings = serde_json::from_value(serde_json::json!({"embedders": embedders}))?;
+        self.update_settings(index_uid, &settings)
+    }
+
     fn reset_embedders(&self, index_uid: &str) -> Result<TaskInfo> {
-        let mut s = Settings::default();
-        s.embedders = None;
-        self.update_settings(index_uid, &s)
+        let settings =
+            serde_json::from_value(serde_json::json!({"embedders": serde_json::Value::Null}))?;
+        self.update_settings(index_uid, &settings)
     }
 }
 
@@ -527,11 +589,7 @@ pub trait Webhooks {
     fn create_webhook(&self, request: &CreateWebhookRequest) -> Result<Webhook>;
 
     /// PATCH /webhooks/{uuid}
-    fn update_webhook(
-        &self,
-        webhook_uid: &str,
-        request: &UpdateWebhookRequest,
-    ) -> Result<Webhook>;
+    fn update_webhook(&self, webhook_uid: &str, request: &UpdateWebhookRequest) -> Result<Webhook>;
 
     /// DELETE /webhooks/{uuid}
     fn delete_webhook(&self, webhook_uid: &str) -> Result<()>;
@@ -579,11 +637,29 @@ pub trait ExperimentalFeaturesApi {
 
 /// Full Meilisearch API surface. Implement this or compose from the individual traits.
 pub trait MeilisearchApi:
-    Documents + Search + Indexes + Tasks + Batches + SettingsApi + Keys + Webhooks + System + ExperimentalFeaturesApi
+    Documents
+    + Search
+    + Indexes
+    + Tasks
+    + Batches
+    + SettingsApi
+    + Keys
+    + Webhooks
+    + System
+    + ExperimentalFeaturesApi
 {
 }
 
 impl<T> MeilisearchApi for T where
-    T: Documents + Search + Indexes + Tasks + Batches + SettingsApi + Keys + Webhooks + System + ExperimentalFeaturesApi
+    T: Documents
+        + Search
+        + Indexes
+        + Tasks
+        + Batches
+        + SettingsApi
+        + Keys
+        + Webhooks
+        + System
+        + ExperimentalFeaturesApi
 {
 }

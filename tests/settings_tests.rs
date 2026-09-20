@@ -1,9 +1,9 @@
 mod common;
 
 use common::TestContext;
+use std::collections::HashMap;
 use wilysearch::traits::*;
 use wilysearch::types::*;
-use std::collections::HashMap;
 
 #[test]
 fn test_get_default_settings() {
@@ -21,23 +21,34 @@ fn test_get_default_settings() {
         .expect("failed to get settings");
 
     // Default ranking rules should be present
-    let rules = settings.ranking_rules.expect("ranking_rules should be set");
-    assert!(!rules.is_empty(), "default ranking rules should not be empty");
+    let rules = settings
+        .ranking_rules
+        .set()
+        .expect("ranking_rules should be set");
+    assert!(
+        !rules.is_empty(),
+        "default ranking rules should not be empty"
+    );
 
     // Default: filterable and sortable should be empty
     let filterable = settings
         .filterable_attributes
+        .set()
         .expect("filterable should be set");
     assert!(filterable.is_empty());
 
     let sortable = settings
         .sortable_attributes
+        .set()
         .expect("sortable should be set");
     assert!(sortable.is_empty());
 
     // Typo tolerance should be enabled by default
-    let typo = settings.typo_tolerance.expect("typo_tolerance should be set");
-    assert_eq!(typo.enabled, Some(true));
+    let typo = settings
+        .typo_tolerance
+        .set()
+        .expect("typo_tolerance should be set");
+    assert_eq!(typo.enabled, Setting::Set(true));
 }
 
 #[test]
@@ -45,13 +56,14 @@ fn test_update_settings_bulk() {
     let ctx = TestContext::new();
     common::create_test_index(&ctx, "movies");
 
-    let settings = Settings {
-        searchable_attributes: Some(vec!["title".to_string()]),
-        filterable_attributes: Some(vec!["year".to_string(), "genres".to_string()]),
-        sortable_attributes: Some(vec!["year".to_string(), "rating".to_string()]),
-        stop_words: Some(vec!["the".to_string(), "a".to_string()]),
-        ..Default::default()
-    };
+    let settings = serde_json::from_value::<wilysearch::types::Settings>(serde_json::json!({
+        "searchableAttributes": vec!["title".to_string()],
+        "filterableAttributes": vec!["year".to_string(), "genres".to_string()],
+        "sortableAttributes": vec!["year".to_string(), "rating".to_string()],
+        "stopWords": vec!["the".to_string(), "a".to_string()],
+
+    }))
+    .unwrap();
 
     ctx.engine
         .update_settings("movies", &settings)
@@ -63,19 +75,32 @@ fn test_update_settings_bulk() {
         .expect("failed to get settings");
 
     assert_eq!(
-        got.searchable_attributes,
+        (*got.searchable_attributes).clone().set(),
         Some(vec!["title".to_string()])
     );
 
-    let mut filterable = got.filterable_attributes.expect("filterable should be set");
+    let mut filterable: Vec<String> = serde_json::from_value(
+        serde_json::to_value(
+            got.filterable_attributes
+                .set()
+                .expect("filterable should be set"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
     filterable.sort();
     assert_eq!(filterable, vec!["genres".to_string(), "year".to_string()]);
 
-    let mut sortable = got.sortable_attributes.expect("sortable should be set");
+    let mut sortable: Vec<_> = got
+        .sortable_attributes
+        .set()
+        .expect("sortable should be set")
+        .into_iter()
+        .collect();
     sortable.sort();
     assert_eq!(sortable, vec!["rating".to_string(), "year".to_string()]);
 
-    let stop = got.stop_words.expect("stop_words should be set");
+    let stop = got.stop_words.set().expect("stop_words should be set");
     assert!(stop.contains(&"the".to_string()));
     assert!(stop.contains(&"a".to_string()));
 }
@@ -90,18 +115,22 @@ fn test_reset_settings() {
         })
         .expect("failed to create index");
 
-    let settings = Settings {
-        filterable_attributes: Some(vec!["year".to_string()]),
-        stop_words: Some(vec!["the".to_string()]),
-        ..Default::default()
-    };
+    let settings = serde_json::from_value::<wilysearch::types::Settings>(serde_json::json!({
+        "filterableAttributes": vec!["year".to_string()],
+        "stopWords": vec!["the".to_string()],
+
+    }))
+    .unwrap();
     ctx.engine
         .update_settings("test", &settings)
         .expect("failed to update settings");
 
     // Verify they were set
-    let got = ctx.engine.get_settings("test").expect("failed to get settings");
-    assert!(!got.filterable_attributes.as_ref().unwrap().is_empty());
+    let got = ctx
+        .engine
+        .get_settings("test")
+        .expect("failed to get settings");
+    assert!(!got.filterable_attributes.set().unwrap().is_empty());
 
     // Reset
     ctx.engine
@@ -114,8 +143,12 @@ fn test_reset_settings() {
         .expect("failed to get settings after reset");
     let filterable = after
         .filterable_attributes
+        .set()
         .expect("filterable should be set");
-    assert!(filterable.is_empty(), "filterable should be empty after reset");
+    assert!(
+        filterable.is_empty(),
+        "filterable should be empty after reset"
+    );
 }
 
 #[test]
@@ -141,7 +174,7 @@ fn test_individual_searchable_attributes() {
         .engine
         .get_searchable_attributes("movies")
         .expect("failed to get searchable after reset");
-    assert!(after.len() > 1, "expected multiple searchable fields after reset");
+    assert_eq!(after, vec!["*"], "reset restores wildcard searchability");
 }
 
 #[test]
@@ -155,13 +188,20 @@ fn test_individual_filterable_attributes() {
         .expect("failed to create index");
 
     ctx.engine
-        .update_filterable_attributes("test", &["year".to_string(), "genre".to_string()])
+        .update_filterable_attributes(
+            "test",
+            &serde_json::from_value::<Vec<FilterableAttributesRule>>(serde_json::json!([
+                "year", "genre"
+            ]))
+            .unwrap(),
+        )
         .expect("failed to update filterable");
 
     let mut got = ctx
         .engine
         .get_filterable_attributes("test")
         .expect("failed to get filterable");
+    let mut got: Vec<String> = serde_json::from_value(serde_json::to_value(got).unwrap()).unwrap();
     got.sort();
     assert_eq!(got, vec!["genre".to_string(), "year".to_string()]);
 

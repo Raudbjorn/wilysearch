@@ -1,228 +1,335 @@
-use milli::progress::EmbedderStats;
-use milli::update::IndexerConfig;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
-
-use crate::core::error::{Error, Result};
-use crate::core::settings::{
-    read_settings_from_index, EmbedderSettings, FacetingSettings, LocalizedAttributeRule,
-    PaginationSettings, ProximityPrecision, Settings, SettingsApplier, TypoToleranceSettings,
-};
-
 use super::Index;
-
-/// Generate get/update/reset methods for a single `Settings` field.
-///
-/// Each invocation produces three public methods on `Index`:
-/// - `get_{name}(&self) -> Result<Option<T>>`
-/// - `update_{name}(&self, val: T) -> Result<()>`
-/// - `reset_{name}(&self) -> Result<()>`
-macro_rules! settings_accessor {
-    ($name:ident, $doc_name:literal, $ty:ty, $reset:expr) => {
-        paste::paste! {
-            #[doc = "Get the " $doc_name " setting."]
-            pub fn [<get_ $name>](&self) -> Result<Option<$ty>> {
-                let settings = self.get_settings()?;
-                Ok(settings.$name)
-            }
-
-            #[doc = "Update the " $doc_name " setting."]
-            pub fn [<update_ $name>](&self, val: $ty) -> Result<()> {
-                let settings = Settings::new().[<with_ $name>](val);
-                self.update_settings(&settings)
-            }
-
-            #[doc = "Reset the " $doc_name " to its default value."]
-            pub fn [<reset_ $name>](&self) -> Result<()> {
-                self.execute_settings_reset($reset)
-            }
-        }
-    };
-}
+use crate::core::{Result, Settings};
+use crate::types::*;
+use meilisearch_types::settings::SecretPolicy;
 
 impl Index {
-    // ========================================================================
-    // Settings Operations
-    // ========================================================================
-
-    /// Get the current settings of the index.
-    ///
-    /// Returns a [`Settings`] struct containing all configured index settings
-    /// including searchable/filterable/sortable attributes, ranking rules,
-    /// embedders, and more.
     pub fn get_settings(&self) -> Result<Settings> {
-        let rtxn = self.inner.read_txn().map_err(Error::Heed)?;
-        read_settings_from_index(&rtxn, &self.inner)
+        self.settings_with_policy(SecretPolicy::HideSecrets)
     }
 
-    /// Update the index settings.
-    ///
-    /// Only the fields that are set (not `None`) in the provided [`Settings`]
-    /// will be updated. Fields set to `None` are left unchanged.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use wilysearch::core::{Meilisearch, MeilisearchOptions};
-    /// # let meili = Meilisearch::new(MeilisearchOptions::default()).unwrap();
-    /// # let index = meili.create_index("movies", Some("id")).unwrap();
-    /// use wilysearch::core::{Settings, EmbedderSettings};
-    ///
-    /// let settings = Settings::new()
-    ///     .with_searchable_attributes(vec!["title".to_string(), "content".to_string()])
-    ///     .with_filterable_attributes(vec!["category".to_string(), "price".to_string()])
-    ///     .with_embedder("default", EmbedderSettings::openai("your-api-key"));
-    ///
-    /// index.update_settings(&settings)?;
-    /// # Ok::<(), wilysearch::core::Error>(())
-    /// ```
+    pub(crate) fn settings_with_policy(&self, policy: SecretPolicy) -> Result<Settings> {
+        let txn = self.inner.read_txn()?;
+        Ok(meilisearch_types::settings::settings(&self.inner, &txn, policy)?.into_unchecked())
+    }
     pub fn update_settings(&self, settings: &Settings) -> Result<()> {
-        let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
-        let indexer_config = IndexerConfig::default();
-
-        let milli_settings =
-            milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
-
-        let applier = SettingsApplier { builder: milli_settings };
-        let milli_settings = applier.apply(settings)?;
-
-        // Execute the settings update
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-        let embedder_stats = Arc::new(EmbedderStats::default());
-        let progress = milli::progress::Progress::default();
-
-        milli_settings
-            .execute(&|| false, &progress, &ip_policy, embedder_stats)
-            .map_err(Error::Milli)?;
-
-        wtxn.commit().map_err(Error::Heed)?;
-
+        let checked = settings.clone().validate()?.check();
+        let mut txn = self.inner.write_txn()?;
+        let config = milli::update::IndexerConfig::default();
+        let mut builder = milli::update::Settings::new(&mut txn, &self.inner, &config);
+        meilisearch_types::settings::apply_settings_to_builder(&checked, &mut builder);
+        builder.execute(
+            &milli::MustStopProcessing::default(),
+            &milli::progress::Progress::quiet(),
+            &self.ip_policy.clone(),
+            Default::default(),
+        )?;
+        txn.commit()?;
         Ok(())
     }
-
-    /// Reset all settings to their default values.
-    ///
-    /// This resets:
-    /// - Searchable attributes (all fields become searchable)
-    /// - Displayed attributes (all fields become displayed)
-    /// - Filterable attributes (cleared)
-    /// - Sortable attributes (cleared)
-    /// - Ranking rules (reset to default)
-    /// - Stop words (cleared)
-    /// - Synonyms (cleared)
-    /// - Embedders (cleared)
-    /// - Distinct attribute (cleared)
-    /// - Typo tolerance (reset to default)
-    ///
-    /// Note: This does NOT delete documents.
     pub fn reset_settings(&self) -> Result<()> {
-        let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
-        let indexer_config = IndexerConfig::default();
-
-        let mut milli_settings =
-            milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
-
-        milli_settings.reset_searchable_fields();
-        milli_settings.reset_displayed_fields();
-        milli_settings.reset_filterable_fields();
-        milli_settings.reset_sortable_fields();
-        milli_settings.reset_criteria();
-        milli_settings.reset_stop_words();
-        milli_settings.reset_non_separator_tokens();
-        milli_settings.reset_separator_tokens();
-        milli_settings.reset_dictionary();
-        milli_settings.reset_synonyms();
-        milli_settings.reset_embedder_settings();
-        milli_settings.reset_distinct_field();
-        milli_settings.reset_proximity_precision();
-        milli_settings.reset_authorize_typos();
-        milli_settings.reset_min_word_len_one_typo();
-        milli_settings.reset_min_word_len_two_typos();
-        milli_settings.reset_exact_words();
-        milli_settings.reset_exact_attributes();
-        milli_settings.reset_disable_on_numbers();
-        milli_settings.reset_max_values_per_facet();
-        milli_settings.reset_pagination_max_total_hits();
-        milli_settings.reset_search_cutoff();
-        milli_settings.reset_localized_attributes_rules();
-        milli_settings.reset_facet_search();
-        milli_settings.reset_prefix_search();
-
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-        let embedder_stats = Arc::new(EmbedderStats::default());
-        let progress = milli::progress::Progress::default();
-
-        milli_settings
-            .execute(&|| false, &progress, &ip_policy, embedder_stats)
-            .map_err(Error::Milli)?;
-
-        wtxn.commit().map_err(Error::Heed)?;
-
-        Ok(())
+        self.update_settings(&meilisearch_types::settings::Settings::cleared().into_unchecked())
     }
-
-    /// Helper: open a write transaction, create a milli settings builder,
-    /// apply a single reset closure, execute, and commit.
-    fn execute_settings_reset(
-        &self,
-        apply: impl FnOnce(&mut milli::update::Settings<'_, '_, '_>),
-    ) -> Result<()> {
-        let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
-        let indexer_config = IndexerConfig::default();
-        let mut milli_settings =
-            milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
-        apply(&mut milli_settings);
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-        let embedder_stats = Arc::new(EmbedderStats::default());
-        milli_settings
-            .execute(
-                &|| false,
-                &milli::progress::Progress::default(),
-                &ip_policy,
-                embedder_stats,
-            )
-            .map_err(Error::Milli)?;
-        wtxn.commit().map_err(Error::Heed)?;
-        Ok(())
-    }
-
-    // ========================================================================
-    // Individual Settings Accessors
-    // ========================================================================
-
-    settings_accessor!(displayed_attributes,  "displayed attributes",  Vec<String>,                       |s| s.reset_displayed_fields());
-    settings_accessor!(searchable_attributes, "searchable attributes", Vec<String>,                       |s| s.reset_searchable_fields());
-    settings_accessor!(filterable_attributes, "filterable attributes", Vec<String>,                       |s| s.reset_filterable_fields());
-    settings_accessor!(sortable_attributes,   "sortable attributes",  BTreeSet<String>,                  |s| s.reset_sortable_fields());
-    settings_accessor!(ranking_rules,         "ranking rules",        Vec<String>,                       |s| s.reset_criteria());
-    settings_accessor!(stop_words,            "stop words",           BTreeSet<String>,                  |s| s.reset_stop_words());
-    settings_accessor!(non_separator_tokens,  "non-separator tokens", BTreeSet<String>,                  |s| s.reset_non_separator_tokens());
-    settings_accessor!(separator_tokens,      "separator tokens",     BTreeSet<String>,                  |s| s.reset_separator_tokens());
-    settings_accessor!(dictionary,            "dictionary",           BTreeSet<String>,                  |s| s.reset_dictionary());
-    settings_accessor!(synonyms,             "synonyms",             BTreeMap<String, Vec<String>>,      |s| s.reset_synonyms());
-    settings_accessor!(distinct_attribute,    "distinct attribute",   String,                            |s| s.reset_distinct_field());
-    settings_accessor!(proximity_precision,   "proximity precision",  ProximityPrecision,                |s| s.reset_proximity_precision());
-    settings_accessor!(typo_tolerance,        "typo tolerance",       TypoToleranceSettings,             |s| {
-        s.reset_authorize_typos();
-        s.reset_min_word_len_one_typo();
-        s.reset_min_word_len_two_typos();
-        s.reset_exact_words();
-        s.reset_exact_attributes();
-    });
-    settings_accessor!(faceting,              "faceting",             FacetingSettings,                  |s| s.reset_max_values_per_facet());
-    settings_accessor!(pagination,            "pagination",           PaginationSettings,                |s| s.reset_pagination_max_total_hits());
-    settings_accessor!(embedders,             "embedders",            HashMap<String, EmbedderSettings>, |s| s.reset_embedder_settings());
-    settings_accessor!(search_cutoff_ms,      "search cutoff ms",    u64,                               |s| s.reset_search_cutoff());
-    settings_accessor!(localized_attributes,  "localized attributes", Vec<LocalizedAttributeRule>,       |s| s.reset_localized_attributes_rules());
-    settings_accessor!(facet_search,          "facet search",         bool,                              |s| s.reset_facet_search());
-    settings_accessor!(prefix_search,         "prefix search",        String,                            |s| s.reset_prefix_search());
-
-    /// Get the primary key field name for this index.
-    ///
-    /// Returns `None` if no primary key has been set yet (the index has no documents).
     pub fn primary_key(&self) -> Result<Option<String>> {
-        let rtxn = self.inner.read_txn().map_err(Error::Heed)?;
-        let pk = self.inner.primary_key(&rtxn).map_err(Error::Heed)?;
-        Ok(pk.map(|s| s.to_string()))
+        let txn = self.inner.read_txn()?;
+        Ok(self.inner.primary_key(&txn)?.map(str::to_owned))
+    }
+    pub fn get_ranking_rules(&self) -> Result<Vec<String>> {
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings()?)?["rankingRules"].clone(),
+        )?)
+    }
+    pub fn update_ranking_rules(&self, rules: &[String]) -> Result<()> {
+        let settings = serde_json::from_value(serde_json::json!({"rankingRules": rules}))?;
+        self.update_settings(&settings)
+    }
+    pub fn reset_ranking_rules(&self) -> Result<()> {
+        let settings =
+            serde_json::from_value(serde_json::json!({"rankingRules": serde_json::Value::Null}))?;
+        self.update_settings(&settings)
+    }
+    pub fn get_distinct_attribute(&self) -> Result<Option<String>> {
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings()?)?["distinctAttribute"].clone(),
+        )?)
+    }
+    pub fn update_distinct_attribute(&self, attr: &str) -> Result<()> {
+        let settings = serde_json::from_value(serde_json::json!({"distinctAttribute": attr}))?;
+        self.update_settings(&settings)
+    }
+    pub fn reset_distinct_attribute(&self) -> Result<()> {
+        let settings = serde_json::from_value(
+            serde_json::json!({"distinctAttribute": serde_json::Value::Null}),
+        )?;
+        self.update_settings(&settings)
+    }
+    pub fn get_searchable_attributes(&self) -> Result<Vec<String>> {
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings()?)?["searchableAttributes"].clone(),
+        )?)
+    }
+    pub fn update_searchable_attributes(&self, attrs: &[String]) -> Result<()> {
+        let settings = serde_json::from_value(serde_json::json!({"searchableAttributes": attrs}))?;
+        self.update_settings(&settings)
+    }
+    pub fn reset_searchable_attributes(&self) -> Result<()> {
+        let settings = serde_json::from_value(
+            serde_json::json!({"searchableAttributes": serde_json::Value::Null}),
+        )?;
+        self.update_settings(&settings)
+    }
+    pub fn get_displayed_attributes(&self) -> Result<Vec<String>> {
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings()?)?["displayedAttributes"].clone(),
+        )?)
+    }
+    pub fn update_displayed_attributes(&self, attrs: &[String]) -> Result<()> {
+        let settings = serde_json::from_value(serde_json::json!({"displayedAttributes": attrs}))?;
+        self.update_settings(&settings)
+    }
+    pub fn reset_displayed_attributes(&self) -> Result<()> {
+        let settings = serde_json::from_value(
+            serde_json::json!({"displayedAttributes": serde_json::Value::Null}),
+        )?;
+        self.update_settings(&settings)
+    }
+    pub fn get_synonyms(&self) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings()?)?["synonyms"].clone(),
+        )?)
+    }
+    pub fn update_synonyms(
+        &self,
+        synonyms: &std::collections::HashMap<String, Vec<String>>,
+    ) -> Result<()> {
+        let settings = serde_json::from_value(serde_json::json!({"synonyms": synonyms}))?;
+        self.update_settings(&settings)
+    }
+    pub fn reset_synonyms(&self) -> Result<()> {
+        let settings =
+            serde_json::from_value(serde_json::json!({"synonyms": serde_json::Value::Null}))?;
+        self.update_settings(&settings)
+    }
+    pub fn get_stop_words(&self) -> Result<Vec<String>> {
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings()?)?["stopWords"].clone(),
+        )?)
+    }
+    pub fn update_stop_words(&self, words: &[String]) -> Result<()> {
+        let settings = serde_json::from_value(serde_json::json!({"stopWords": words}))?;
+        self.update_settings(&settings)
+    }
+    pub fn reset_stop_words(&self) -> Result<()> {
+        let settings =
+            serde_json::from_value(serde_json::json!({"stopWords": serde_json::Value::Null}))?;
+        self.update_settings(&settings)
+    }
+    pub fn get_filterable_attributes(&self) -> Result<Vec<FilterableAttributesRule>> {
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings()?)?["filterableAttributes"].clone(),
+        )?)
+    }
+    pub fn update_filterable_attributes(&self, attrs: &[FilterableAttributesRule]) -> Result<()> {
+        let settings = serde_json::from_value(serde_json::json!({"filterableAttributes": attrs}))?;
+        self.update_settings(&settings)
+    }
+    pub fn reset_filterable_attributes(&self) -> Result<()> {
+        let settings = serde_json::from_value(
+            serde_json::json!({"filterableAttributes": serde_json::Value::Null}),
+        )?;
+        self.update_settings(&settings)
+    }
+    pub fn get_sortable_attributes(&self) -> Result<Vec<String>> {
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings()?)?["sortableAttributes"].clone(),
+        )?)
+    }
+    pub fn update_sortable_attributes(&self, attrs: &[String]) -> Result<()> {
+        let settings = serde_json::from_value(serde_json::json!({"sortableAttributes": attrs}))?;
+        self.update_settings(&settings)
+    }
+    pub fn reset_sortable_attributes(&self) -> Result<()> {
+        let settings = serde_json::from_value(
+            serde_json::json!({"sortableAttributes": serde_json::Value::Null}),
+        )?;
+        self.update_settings(&settings)
+    }
+    pub fn get_typo_tolerance(&self) -> Result<TypoTolerance> {
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings()?)?["typoTolerance"].clone(),
+        )?)
+    }
+    pub fn update_typo_tolerance(&self, config: &TypoTolerance) -> Result<()> {
+        let settings = serde_json::from_value(serde_json::json!({"typoTolerance": config}))?;
+        self.update_settings(&settings)
+    }
+    pub fn reset_typo_tolerance(&self) -> Result<()> {
+        let settings =
+            serde_json::from_value(serde_json::json!({"typoTolerance": serde_json::Value::Null}))?;
+        self.update_settings(&settings)
+    }
+    pub fn get_pagination(&self) -> Result<Pagination> {
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings()?)?["pagination"].clone(),
+        )?)
+    }
+    pub fn update_pagination(&self, config: &Pagination) -> Result<()> {
+        let settings = serde_json::from_value(serde_json::json!({"pagination": config}))?;
+        self.update_settings(&settings)
+    }
+    pub fn reset_pagination(&self) -> Result<()> {
+        let settings =
+            serde_json::from_value(serde_json::json!({"pagination": serde_json::Value::Null}))?;
+        self.update_settings(&settings)
+    }
+    pub fn get_faceting(&self) -> Result<Faceting> {
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings()?)?["faceting"].clone(),
+        )?)
+    }
+    pub fn update_faceting(&self, config: &Faceting) -> Result<()> {
+        let settings = serde_json::from_value(serde_json::json!({"faceting": config}))?;
+        self.update_settings(&settings)
+    }
+    pub fn reset_faceting(&self) -> Result<()> {
+        let settings =
+            serde_json::from_value(serde_json::json!({"faceting": serde_json::Value::Null}))?;
+        self.update_settings(&settings)
+    }
+    pub fn get_dictionary(&self) -> Result<Vec<String>> {
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings()?)?["dictionary"].clone(),
+        )?)
+    }
+    pub fn update_dictionary(&self, words: &[String]) -> Result<()> {
+        let settings = serde_json::from_value(serde_json::json!({"dictionary": words}))?;
+        self.update_settings(&settings)
+    }
+    pub fn reset_dictionary(&self) -> Result<()> {
+        let settings =
+            serde_json::from_value(serde_json::json!({"dictionary": serde_json::Value::Null}))?;
+        self.update_settings(&settings)
+    }
+    pub fn get_separator_tokens(&self) -> Result<Vec<String>> {
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings()?)?["separatorTokens"].clone(),
+        )?)
+    }
+    pub fn update_separator_tokens(&self, tokens: &[String]) -> Result<()> {
+        let settings = serde_json::from_value(serde_json::json!({"separatorTokens": tokens}))?;
+        self.update_settings(&settings)
+    }
+    pub fn reset_separator_tokens(&self) -> Result<()> {
+        let settings = serde_json::from_value(
+            serde_json::json!({"separatorTokens": serde_json::Value::Null}),
+        )?;
+        self.update_settings(&settings)
+    }
+    pub fn get_non_separator_tokens(&self) -> Result<Vec<String>> {
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings()?)?["nonSeparatorTokens"].clone(),
+        )?)
+    }
+    pub fn update_non_separator_tokens(&self, tokens: &[String]) -> Result<()> {
+        let settings = serde_json::from_value(serde_json::json!({"nonSeparatorTokens": tokens}))?;
+        self.update_settings(&settings)
+    }
+    pub fn reset_non_separator_tokens(&self) -> Result<()> {
+        let settings = serde_json::from_value(
+            serde_json::json!({"nonSeparatorTokens": serde_json::Value::Null}),
+        )?;
+        self.update_settings(&settings)
+    }
+    pub fn get_proximity_precision(&self) -> Result<ProximityPrecision> {
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings()?)?["proximityPrecision"].clone(),
+        )?)
+    }
+    pub fn update_proximity_precision(&self, precision: ProximityPrecision) -> Result<()> {
+        let settings =
+            serde_json::from_value(serde_json::json!({"proximityPrecision": precision}))?;
+        self.update_settings(&settings)
+    }
+    pub fn reset_proximity_precision(&self) -> Result<()> {
+        let settings = serde_json::from_value(
+            serde_json::json!({"proximityPrecision": serde_json::Value::Null}),
+        )?;
+        self.update_settings(&settings)
+    }
+    pub fn get_facet_search(&self) -> Result<bool> {
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings()?)?["facetSearch"].clone(),
+        )?)
+    }
+    pub fn update_facet_search(&self, enabled: bool) -> Result<()> {
+        let settings = serde_json::from_value(serde_json::json!({"facetSearch": enabled}))?;
+        self.update_settings(&settings)
+    }
+    pub fn reset_facet_search(&self) -> Result<()> {
+        let settings =
+            serde_json::from_value(serde_json::json!({"facetSearch": serde_json::Value::Null}))?;
+        self.update_settings(&settings)
+    }
+    pub fn get_prefix_search(&self) -> Result<PrefixSearch> {
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings()?)?["prefixSearch"].clone(),
+        )?)
+    }
+    pub fn update_prefix_search(&self, mode: PrefixSearch) -> Result<()> {
+        let settings = serde_json::from_value(serde_json::json!({"prefixSearch": mode}))?;
+        self.update_settings(&settings)
+    }
+    pub fn reset_prefix_search(&self) -> Result<()> {
+        let settings =
+            serde_json::from_value(serde_json::json!({"prefixSearch": serde_json::Value::Null}))?;
+        self.update_settings(&settings)
+    }
+    pub fn get_search_cutoff_ms(&self) -> Result<Option<u64>> {
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings()?)?["searchCutoffMs"].clone(),
+        )?)
+    }
+    pub fn update_search_cutoff_ms(&self, ms: u64) -> Result<()> {
+        let settings = serde_json::from_value(serde_json::json!({"searchCutoffMs": ms}))?;
+        self.update_settings(&settings)
+    }
+    pub fn reset_search_cutoff_ms(&self) -> Result<()> {
+        let settings =
+            serde_json::from_value(serde_json::json!({"searchCutoffMs": serde_json::Value::Null}))?;
+        self.update_settings(&settings)
+    }
+    pub fn get_localized_attributes(&self) -> Result<Option<Vec<LocalizedAttribute>>> {
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings()?)?["localizedAttributes"].clone(),
+        )?)
+    }
+    pub fn update_localized_attributes(&self, attrs: &[LocalizedAttribute]) -> Result<()> {
+        let settings = serde_json::from_value(serde_json::json!({"localizedAttributes": attrs}))?;
+        self.update_settings(&settings)
+    }
+    pub fn reset_localized_attributes(&self) -> Result<()> {
+        let settings = serde_json::from_value(
+            serde_json::json!({"localizedAttributes": serde_json::Value::Null}),
+        )?;
+        self.update_settings(&settings)
+    }
+    pub fn get_embedders(
+        &self,
+    ) -> Result<Option<std::collections::HashMap<String, EmbedderConfig>>> {
+        Ok(serde_json::from_value(
+            serde_json::to_value(self.get_settings()?)?["embedders"].clone(),
+        )?)
+    }
+    pub fn update_embedders(
+        &self,
+        embedders: &std::collections::HashMap<String, EmbedderConfig>,
+    ) -> Result<()> {
+        let settings = serde_json::from_value(serde_json::json!({"embedders": embedders}))?;
+        self.update_settings(&settings)
+    }
+    pub fn reset_embedders(&self) -> Result<()> {
+        let settings =
+            serde_json::from_value(serde_json::json!({"embedders": serde_json::Value::Null}))?;
+        self.update_settings(&settings)
     }
 }

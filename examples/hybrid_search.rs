@@ -11,10 +11,10 @@
 //! HuggingFace, or user-provided vectors). This example shows the API surface
 //! and falls back to keyword-only search when no embedder is configured.
 
+use serde_json::json;
 use wilysearch::core::{
     HybridQuery, HybridSearchQuery, Meilisearch, MeilisearchOptions, SearchQuery, Settings,
 };
-use serde_json::json;
 
 fn main() -> wilysearch::core::Result<()> {
     let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
@@ -72,9 +72,7 @@ fn main() -> wilysearch::core::Result<()> {
         .with_limit(5);
 
     let result = index.search(&query)?;
-    println!(
-        "Query: 'artificial intelligence' (hybrid, semantic_ratio=0.5)"
-    );
+    println!("Query: 'artificial intelligence' (hybrid, semantic_ratio=0.5)");
     println!(
         "Hits: {}, Time: {}ms",
         result.hits.len(),
@@ -129,9 +127,7 @@ fn main() -> wilysearch::core::Result<()> {
 
     // Note: Without a VectorStore configured, this falls back to keyword search.
     let hybrid_result = index.hybrid_search(&hybrid_query)?;
-    println!(
-        "Query: 'learning systems' (semantic_ratio=0.3, keyword-heavy)"
-    );
+    println!("Query: 'learning systems' (semantic_ratio=0.3, keyword-heavy)");
     println!(
         "Hits: {}, Semantic hits: {:?}",
         hybrid_result.result.hits.len(),
@@ -152,7 +148,7 @@ fn main() -> wilysearch::core::Result<()> {
     //
     //   use wilysearch::core::EmbedderSettings;
     //
-    //   let settings = Settings::new()
+    //   let settings = Settings::default()
     //       .with_embedder("default", EmbedderSettings::openai("sk-your-api-key"))
     //       // Or Ollama:
     //       // .with_embedder("default", EmbedderSettings::ollama(
@@ -168,7 +164,7 @@ fn main() -> wilysearch::core::Result<()> {
     // genuine semantic results blended with keyword results.
 
     // Suppress unused import warning -- Settings is shown in the doc comment above.
-    let _ = Settings::new();
+    let _ = Settings::default();
 
     println!("\nDone.");
     Ok(())

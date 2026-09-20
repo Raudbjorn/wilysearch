@@ -1,3 +1,4 @@
+use meilisearch_types::settings::SecretPolicy;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::instrument;
@@ -6,7 +7,7 @@ use uuid::Uuid;
 use crate::core::error::{Error, Result};
 use crate::core::now_iso8601;
 
-use super::{write_documents_to_json, save_index_metadata, DumpInfo, Meilisearch};
+use super::{DumpInfo, Meilisearch, save_index_metadata, write_documents_to_json};
 
 impl Meilisearch {
     /// Create a database dump at the specified directory.
@@ -23,7 +24,7 @@ impl Meilisearch {
             std::fs::create_dir_all(&index_dump_dir)?;
 
             // Export settings
-            let settings = index.get_settings()?;
+            let settings = index.settings_with_policy(SecretPolicy::RevealSecrets)?;
             let settings_json = serde_json::to_string_pretty(&settings)?;
             std::fs::write(index_dump_dir.join("settings.json"), settings_json)?;
 
@@ -31,6 +32,7 @@ impl Meilisearch {
             write_documents_to_json(&index, &index_dump_dir.join("documents.json"))?;
         }
 
+        self.export_local_metadata(&dump_path, false)?;
         Ok(DumpInfo {
             uid,
             path: dump_path.to_string_lossy().to_string(),
@@ -51,7 +53,11 @@ impl Meilisearch {
 
         let all_uids = self.list_indexes()?;
         let uids_to_export: Vec<&str> = match indexes {
-            Some(map) => all_uids.iter().filter(|uid| map.contains_key(*uid)).map(|s| s.as_str()).collect(),
+            Some(map) => all_uids
+                .iter()
+                .filter(|uid| map.contains_key(*uid))
+                .map(|s| s.as_str())
+                .collect(),
             None => all_uids.iter().map(|s| s.as_str()).collect(),
         };
 
@@ -61,12 +67,9 @@ impl Meilisearch {
             std::fs::create_dir_all(&index_dir)?;
 
             // Write settings if requested (default: true)
-            let include_settings = indexes
-                .and_then(|m| m.get(*uid))
-                .copied()
-                .unwrap_or(true);
+            let include_settings = indexes.and_then(|m| m.get(*uid)).copied().unwrap_or(true);
             if include_settings {
-                let settings = index.get_settings()?;
+                let settings = index.settings_with_policy(SecretPolicy::RevealSecrets)?;
                 let settings_json = serde_json::to_string_pretty(&settings)?;
                 std::fs::write(index_dir.join("settings.json"), settings_json)?;
             }
@@ -75,6 +78,7 @@ impl Meilisearch {
             write_documents_to_json(&index, &index_dir.join("documents.json"))?;
         }
 
+        self.export_local_metadata(export_path, false)?;
         Ok(())
     }
 
@@ -88,9 +92,6 @@ impl Meilisearch {
         std::fs::create_dir_all(snapshot_dir)?;
 
         let index_uids = self.list_indexes()?;
-        if index_uids.is_empty() {
-            return Ok(());
-        }
 
         let snapshot_indexes = snapshot_dir.join("indexes");
         std::fs::create_dir_all(&snapshot_indexes)?;
@@ -108,8 +109,12 @@ impl Meilisearch {
                 .inner
                 .copy_to_file(&mut file, milli::heed::CompactionOption::Disabled)
                 .map_err(Error::Milli)?;
+            if let Some(meta) = self.get_index_metadata(uid) {
+                save_index_metadata(&dest, &meta)?;
+            }
         }
 
+        self.export_local_metadata(snapshot_dir, true)?;
         Ok(())
     }
 
@@ -123,45 +128,50 @@ impl Meilisearch {
     ///
     /// Returns [`Error::IndexNotFound`] if the index does not exist.
     pub fn compact_index(&self, uid: &str) -> Result<()> {
+        if !super::is_valid_uid(uid) {
+            return Err(Error::InvalidIndexUid(uid.into()));
+        }
         let index_path = self.options.db_path.join("indexes").join(uid);
         if !index_path.exists() {
             return Err(Error::IndexNotFound(uid.to_string()));
         }
 
-        // Remove from cache so we can close the LMDB environment
-        {
-            let mut lock = self.indexes.write().unwrap_or_else(|e| {
-                tracing::warn!(uid, "indexes RwLock poisoned in compact_index, recovering");
-                e.into_inner()
-            });
-            let mut indexes = (**lock).clone();
+        // Hold the write lock through replacement so an index cannot be reopened mid-compaction.
+        let mut lock = self.indexes.write().unwrap_or_else(|e| {
+            tracing::warn!(uid, "indexes RwLock poisoned in compact_index, recovering");
+            e.into_inner()
+        });
+        let mut indexes = (**lock).clone();
 
-            if let Some(index) = indexes.remove(uid) {
-                // SAFETY: Arc::strong_count is generally unreliable for synchronization
-                // because other threads can clone/drop Arcs concurrently. However, this
-                // usage is sound because:
-                //  1. We hold the WRITE lock on `indexes`, so no thread can enter
-                //     `get_index` (which requires at least a READ lock) to obtain a new
-                //     clone of this Arc.
-                //  2. The only way to obtain an Arc<Index> is through `get_index` or
-                //     `create_index`, both of which acquire the `indexes` lock.
-                //  3. Therefore the strong count cannot increase while we hold the write
-                //     lock. Existing clones may still be live (count > 2), and that is
-                //     exactly what we are detecting here.
-                //  4. Count == 2: one in the original map (inside `lock`), one in `index`.
-                if Arc::strong_count(&index) > 2 {
-                    return Err(Error::IndexInUse(uid.to_string()));
-                }
-
-                drop(index); // drop our reference
-
-                // Update the lock to the new map (without the index)
-                *lock = Arc::new(indexes);
+        if let Some(index) = indexes.remove(uid) {
+            // SAFETY: Arc::strong_count is generally unreliable for synchronization
+            // because other threads can clone/drop Arcs concurrently. However, this
+            // usage is sound because:
+            //  1. We hold the WRITE lock on `indexes`, so no thread can enter
+            //     `get_index` (which requires at least a READ lock) to obtain a new
+            //     clone of this Arc.
+            //  2. The only way to obtain an Arc<Index> is through `get_index` or
+            //     `create_index`, both of which acquire the `indexes` lock.
+            //  3. Therefore the strong count cannot increase while we hold the write
+            //     lock. Existing clones may still be live (count > 2), and that is
+            //     exactly what we are detecting here.
+            //  4. Count == 2: one in the original map (inside `lock`), one in `index`.
+            if Arc::strong_count(&index) > 2 {
+                return Err(Error::IndexInUse(uid.to_string()));
             }
+
+            drop(index); // drop our reference
+
+            // Update the lock to the new map (without the index)
+            *lock = Arc::new(indexes);
         }
 
         // Perform copy-compact: open env, copy compact to temp, replace original
-        let tmp_path = self.options.db_path.join("indexes").join(format!("_compact_tmp_{}", Uuid::new_v4()));
+        let tmp_path = self
+            .options
+            .db_path
+            .join("indexes")
+            .join(format!("_compact_tmp_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&tmp_path)?;
 
         {
@@ -214,12 +224,26 @@ impl Meilisearch {
             }
         }
 
+        for (a, b) in swaps {
+            for uid in [a, b] {
+                if lock
+                    .get(*uid)
+                    .is_some_and(|index| Arc::strong_count(index) > 1)
+                {
+                    return Err(Error::IndexInUse(uid.to_string()));
+                }
+            }
+        }
         let mut indexes = (**lock).clone();
 
         for (a, b) in swaps {
             let index_path_a = self.options.db_path.join("indexes").join(a);
             let index_path_b = self.options.db_path.join("indexes").join(b);
-            let tmp_path = self.options.db_path.join("indexes").join(format!("_swap_tmp_{}", Uuid::new_v4()));
+            let tmp_path = self
+                .options
+                .db_path
+                .join("indexes")
+                .join(format!("_swap_tmp_{}", Uuid::new_v4()));
 
             // Perform filesystem renames FIRST, before evicting from cache.
             // On Linux, renaming directories with open LMDB envs is safe because
@@ -276,6 +300,76 @@ impl Meilisearch {
         *lock = Arc::new(indexes);
 
         // Indexes will be re-loaded on next access via get_index()
+        Ok(())
+    }
+}
+
+impl Meilisearch {
+    pub fn rename_index(&self, uid: &str, new_uid: &str) -> Result<()> {
+        if !super::is_valid_uid(uid) || !super::is_valid_uid(new_uid) {
+            return Err(Error::InvalidIndexUid(new_uid.into()));
+        }
+        let mut indexes = self
+            .indexes
+            .write()
+            .map_err(|_| Error::Internal("Index lock poisoned".into()))?;
+        if !self.index_exists(uid) {
+            return Err(Error::IndexNotFound(uid.into()));
+        }
+        if uid == new_uid {
+            return Ok(());
+        }
+        if self.index_exists(new_uid) {
+            return Err(Error::IndexAlreadyExists(new_uid.into()));
+        }
+        // Existing handles retain their UID and directory; require callers to release them first.
+        if indexes
+            .get(uid)
+            .is_some_and(|index| Arc::strong_count(index) > 1)
+        {
+            return Err(Error::IndexInUse(uid.into()));
+        }
+        let root = self.options.db_path.join("indexes");
+        std::fs::rename(root.join(uid), root.join(new_uid))?;
+        Arc::make_mut(&mut indexes).remove(uid);
+        let mut metadata = self
+            .index_metadata
+            .write()
+            .map_err(|_| Error::Internal("Metadata lock poisoned".into()))?;
+        if let Some(meta) = metadata.remove(uid) {
+            metadata.insert(new_uid.into(), meta);
+        }
+        Ok(())
+    }
+}
+
+impl Meilisearch {
+    fn export_local_metadata(&self, destination: &std::path::Path, snapshot: bool) -> Result<()> {
+        let manifest = crate::core::storage::MANIFEST;
+        std::fs::copy(
+            self.options.db_path.join(manifest),
+            destination.join(manifest),
+        )?;
+        for name in ["chat-workspaces.json", "task_counter"] {
+            let source = self.options.db_path.join(name);
+            if source.exists() {
+                std::fs::copy(source, destination.join(name))?;
+            }
+        }
+        if let Some(index) = self.rule_index(false)? {
+            if snapshot {
+                let path = destination.join("internal/rules");
+                std::fs::create_dir_all(&path)?;
+                let mut file = std::fs::File::create(path.join("data.mdb"))?;
+                index
+                    .inner
+                    .copy_to_file(&mut file, milli::heed::CompactionOption::Disabled)?;
+            } else {
+                let path = destination.join("internal");
+                std::fs::create_dir_all(&path)?;
+                write_documents_to_json(&index, &path.join("rules.json"))?;
+            }
+        }
         Ok(())
     }
 }

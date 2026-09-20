@@ -1,9 +1,9 @@
+use serde_json::{Value, json};
+use tempfile::TempDir;
 use wilysearch::core::MeilisearchOptions;
 use wilysearch::engine::Engine;
 use wilysearch::traits::*;
 use wilysearch::types::*;
-use serde_json::{json, Value};
-use tempfile::TempDir;
 
 /// Test context that creates a temporary Engine instance.
 ///
@@ -19,8 +19,9 @@ impl TestContext {
     pub fn new() -> Self {
         let temp_dir = TempDir::new().expect("failed to create temp dir");
         let options = MeilisearchOptions {
+            allow_local_provider_urls: false,
             db_path: temp_dir.path().to_path_buf(),
-            max_index_size: 100 * 1024 * 1024, // 100 MB for tests
+            max_index_size: 100 * 1024 * 1024,  // 100 MB for tests
             max_task_db_size: 10 * 1024 * 1024, // 10 MB for tests
         };
         let engine = Engine::new(options).expect("failed to create Engine");
@@ -53,18 +54,19 @@ pub fn create_test_index(ctx: &TestContext, uid: &str) {
 pub fn create_configured_index(ctx: &TestContext, uid: &str) {
     create_test_index(ctx, uid);
 
-    let settings = Settings {
-        filterable_attributes: Some(vec![
+    let settings = serde_json::from_value::<wilysearch::types::Settings>(serde_json::json!({
+        "filterableAttributes": vec![
             "year".to_string(),
             "genres".to_string(),
             "rating".to_string(),
-        ]),
-        sortable_attributes: Some(vec![
+        ],
+        "sortableAttributes": vec![
             "year".to_string(),
             "rating".to_string(),
-        ]),
-        ..Default::default()
-    };
+        ],
+
+    }))
+    .unwrap();
 
     ctx.engine
         .update_settings(uid, &settings)

@@ -167,32 +167,40 @@ pub struct SwapIndexesRequest {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DocumentQuery {
+    #[serde(default)]
+    pub retrieve_vectors: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub fields: Option<String>,
+    pub fields: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DocumentsQuery {
+    #[serde(default)]
+    pub retrieve_vectors: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub offset: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub fields: Option<String>,
+    pub fields: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub filter: Option<String>,
+    pub filter: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ids: Option<String>,
+    pub ids: Option<Vec<Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sort: Option<String>,
+    pub sort: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FetchDocumentsRequest {
+    #[serde(default)]
+    pub retrieve_vectors: bool,
+    pub ids: Option<Vec<Value>>,
+    pub sort: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub filter: Option<String>,
+    pub filter: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fields: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -213,6 +221,8 @@ pub struct DocumentsResponse {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddDocumentsQuery {
+    #[serde(default)]
+    pub skip_creation: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub primary_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -222,14 +232,49 @@ pub struct AddDocumentsQuery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteDocumentsByFilterRequest {
-    pub filter: String,
+    pub filter: Value,
 }
 
 // ─── Search ──────────────────────────────────────────────────────────────────
 
+/// Hybrid search configuration. An omitted embedder selects `default`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct HybridQuery {
+    /// Balance between keyword (0.0) and semantic (1.0) search. Default: 0.5.
+    pub semantic_ratio: f32,
+    /// Name of the embedder. Default: `default`.
+    pub embedder: String,
+}
+
+impl Default for HybridQuery {
+    fn default() -> Self {
+        Self::new("default")
+    }
+}
+
+impl HybridQuery {
+    /// Select an embedder with a default semantic ratio of 0.5.
+    pub fn new(embedder: impl Into<String>) -> Self {
+        Self {
+            semantic_ratio: 0.5,
+            embedder: embedder.into(),
+        }
+    }
+    /// Set the ratio, clamped to 0.0 (keyword) through 1.0 (semantic).
+    pub fn with_semantic_ratio(mut self, ratio: f32) -> Self {
+        self.semantic_ratio = ratio.clamp(0.0, 1.0);
+        self
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub personalize: Option<Personalize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub q: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -279,7 +324,7 @@ pub struct SearchRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub locales: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub hybrid: Option<Value>,
+    pub hybrid: Option<HybridQuery>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vector: Option<Vec<f64>>,
 }
@@ -462,7 +507,7 @@ impl SearchRequest {
     }
 
     #[must_use]
-    pub fn hybrid(mut self, hybrid: Value) -> Self {
+    pub fn hybrid(mut self, hybrid: HybridQuery) -> Self {
         self.hybrid = Some(hybrid);
         self
     }
@@ -477,6 +522,10 @@ impl SearchRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchResponse {
+    pub degraded: bool,
+    pub used_negative_operator: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_hit_count: Option<u32>,
     pub hits: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub offset: Option<u32>,
@@ -493,7 +542,8 @@ pub struct SearchResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hits_per_page: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub facet_distribution: Option<HashMap<String, HashMap<String, u64>>>,
+    pub facet_distribution:
+        Option<std::collections::BTreeMap<String, indexmap::IndexMap<String, u64>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub facet_stats: Option<Value>,
     pub processing_time_ms: u64,
@@ -575,8 +625,12 @@ pub enum MultiSearchResult {
 
 /// Federation configuration for merged multi-search.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct FederationSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub personalize: Option<Personalize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distinct: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -603,6 +657,9 @@ pub struct MergeFacetsSettings {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FederationQueryOptions {
+    /// Remote indexes are outside the embedded library's scope; requests must leave this unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub weight: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -630,7 +687,8 @@ pub struct FederatedSearchResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hits_per_page: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub facet_distribution: Option<HashMap<String, HashMap<String, u64>>>,
+    pub facet_distribution:
+        Option<std::collections::BTreeMap<String, indexmap::IndexMap<String, u64>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub facet_stats: Option<Value>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -641,9 +699,13 @@ pub struct FederatedSearchResponse {
 
 // ─── Facet search ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FacetSearchRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ranking_score_threshold: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locales: Option<Vec<String>>,
     pub facet_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub facet_query: Option<String>,
@@ -674,50 +736,10 @@ pub struct FacetHit {
 
 // ─── Settings ────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Settings {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ranking_rules: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub distinct_attribute: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub searchable_attributes: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub displayed_attributes: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop_words: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub synonyms: Option<HashMap<String, Vec<String>>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub filterable_attributes: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sortable_attributes: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub typo_tolerance: Option<TypoTolerance>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pagination: Option<Pagination>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub faceting: Option<Faceting>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dictionary: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub separator_tokens: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub non_separator_tokens: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub proximity_precision: Option<ProximityPrecision>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub facet_search: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefix_search: Option<PrefixSearch>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub search_cutoff_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub localized_attributes: Option<Vec<LocalizedAttribute>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub embedders: Option<HashMap<String, EmbedderConfig>>,
-}
+/// Upstream settings preserve omitted, explicit null (reset), and set values.
+pub type Settings = meilisearch_types::settings::Settings<meilisearch_types::settings::Unchecked>;
+pub use milli::update::Setting;
+pub use milli::{FilterableAttributesRule, ForeignKey};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -872,6 +894,10 @@ pub struct GlobalStats {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IndexStats {
+    pub number_of_embeddings: u64,
+    pub number_of_embedded_documents: u64,
+    pub database_size: u64,
+    pub used_database_size: u64,
     pub number_of_documents: u64,
     pub is_indexing: bool,
     pub field_distribution: HashMap<String, u64>,
@@ -912,7 +938,7 @@ pub struct ExportIndexConfig {
 
 // ─── Experimental features ───────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExperimentalFeatures {
     #[serde(flatten)]
@@ -928,4 +954,130 @@ pub struct PaginationQuery {
     pub offset: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+}
+
+pub use meilisearch_types::dynamic_search_rules::{
+    DynamicSearchRule, DynamicSearchRuleUpdateRequest, RuleUid,
+};
+
+/// A bounded Rhai program executed atomically over matching documents.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateDocumentsByFunction {
+    pub function: String,
+    pub filter: Option<Value>,
+    pub context: Option<serde_json::Map<String, Value>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FieldsQuery {
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+    pub filter: Option<FieldsFilter>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FieldsFilter {
+    pub attribute_patterns: Option<milli::AttributePatterns>,
+    pub displayed: Option<bool>,
+    pub searchable: Option<bool>,
+    pub sortable: Option<bool>,
+    pub distinct: Option<bool>,
+    pub ranking_rule: Option<bool>,
+    pub filterable: Option<bool>,
+}
+
+/// Field metadata uses the upstream JSON shape, including capability details and locales.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FieldsResponse {
+    pub results: Vec<Value>,
+    pub offset: usize,
+    pub limit: usize,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RenderRequest {
+    pub template: RenderTemplate,
+    pub input: Option<RenderInput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum RenderTemplate {
+    InlineDocumentTemplate {
+        inline: String,
+        document_template_max_bytes: Option<std::num::NonZeroUsize>,
+    },
+    DocumentTemplate {
+        index_uid: String,
+        embedder: String,
+        document_template_max_bytes: Option<std::num::NonZeroUsize>,
+    },
+    ChatDocumentTemplate {
+        index_uid: String,
+        document_template_max_bytes: Option<std::num::NonZeroUsize>,
+    },
+    InlineFragment {
+        inline: Value,
+    },
+    IndexingFragment {
+        index_uid: String,
+        embedder: String,
+        fragment: String,
+    },
+    SearchFragment {
+        index_uid: String,
+        embedder: String,
+        fragment: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum RenderInput {
+    InlineDocument {
+        inline: serde_json::Map<String, Value>,
+    },
+    IndexDocument {
+        index_uid: String,
+        id: Value,
+    },
+    InlineSearch {
+        inline: RenderSearchInput,
+    },
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RenderSearchInput {
+    pub q: Option<String>,
+    pub media: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderResponse {
+    pub template: Value,
+    pub rendered: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Personalize {
+    pub user_context: String,
 }

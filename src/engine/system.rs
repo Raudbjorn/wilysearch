@@ -12,7 +12,13 @@ impl traits::System for Engine {
         let lib_stats = self.inner.stats()?;
         Ok(GlobalStats {
             database_size: lib_stats.database_size,
-            used_database_size: None,
+            used_database_size: Some(
+                lib_stats
+                    .indexes
+                    .values()
+                    .map(|s| s.used_database_size)
+                    .sum(),
+            ),
             last_update: lib_stats.last_update,
             indexes: lib_stats
                 .indexes
@@ -21,6 +27,10 @@ impl traits::System for Engine {
                     (
                         k,
                         IndexStats {
+                            number_of_embeddings: v.number_of_embeddings,
+                            number_of_embedded_documents: v.number_of_embedded_documents,
+                            database_size: v.database_size,
+                            used_database_size: v.used_database_size,
                             number_of_documents: v.number_of_documents,
                             is_indexing: v.is_indexing,
                             field_distribution: v.field_distribution.into_iter().collect(),
@@ -34,6 +44,10 @@ impl traits::System for Engine {
     fn index_stats(&self, index_uid: &str) -> Result<IndexStats> {
         let lib_stats = self.inner.index_stats(index_uid)?;
         Ok(IndexStats {
+            number_of_embeddings: lib_stats.number_of_embeddings,
+            number_of_embedded_documents: lib_stats.number_of_embedded_documents,
+            database_size: lib_stats.database_size,
+            used_database_size: lib_stats.used_database_size,
             number_of_documents: lib_stats.number_of_documents,
             is_indexing: lib_stats.is_indexing,
             field_distribution: lib_stats.field_distribution.into_iter().collect(),
@@ -90,10 +104,14 @@ impl traits::System for Engine {
         // Belt-and-suspenders: canonicalize() resolves symlinks and removes
         // `..` components, so this check should never trigger. Kept as
         // defense-in-depth against hypothetical platform edge cases.
-        if export_path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        if export_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
             return Err(crate::core::error::Error::Internal(
                 "Export path must not contain '..' components".to_string(),
-            ).into());
+            )
+            .into());
         }
 
         let index_settings: Option<HashMap<String, bool>> = request.indexes.as_ref().map(|m| {

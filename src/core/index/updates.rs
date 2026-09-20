@@ -1,7 +1,7 @@
-use milli::documents::{DocumentsBatchBuilder, DocumentsBatchReader, PrimaryKey};
+use milli::Filter;
+use milli::documents::PrimaryKey;
 use milli::progress::EmbedderStats;
 use milli::update::IndexerConfig;
-use milli::Filter;
 use serde_json::Value;
 use std::sync::Arc;
 use tracing::instrument;
@@ -36,7 +36,7 @@ impl Index {
     /// operation fails.
     #[instrument(skip(self, documents))]
     pub fn add_documents(&self, documents: Vec<Value>, primary_key: Option<&str>) -> Result<()> {
-        self.index_documents_impl(documents, primary_key, milli::update::IndexDocumentsConfig::default())
+        self.index_documents(documents, primary_key, false, false)
     }
 
     /// Update (partially merge) documents into the index.
@@ -46,25 +46,15 @@ impl Index {
     /// replacing them entirely. Only the fields present in the new document
     /// are overwritten; other existing fields are preserved.
     pub fn update_documents(&self, documents: Vec<Value>, primary_key: Option<&str>) -> Result<()> {
-        self.index_documents_impl(
-            documents,
-            primary_key,
-            milli::update::IndexDocumentsConfig {
-                update_method: milli::update::IndexDocumentsMethod::UpdateDocuments,
-                ..Default::default()
-            },
-        )
+        self.index_documents(documents, primary_key, true, false)
     }
 
-    /// Shared implementation for `add_documents` and `update_documents`.
-    ///
-    /// The only difference between the two is the `IndexDocumentsConfig`
-    /// (default = replace, `UpdateDocuments` = merge).
-    fn index_documents_impl(
+    pub fn index_documents(
         &self,
         documents: Vec<Value>,
         primary_key: Option<&str>,
-        config: milli::update::IndexDocumentsConfig,
+        merge: bool,
+        skip_creation: bool,
     ) -> Result<()> {
         let mut wtxn = self.inner.write_txn().map_err(|e| Error::Heed(e))?;
 
@@ -73,12 +63,19 @@ impl Index {
             let existing_pk = self.inner.primary_key(&wtxn).map_err(Error::Heed)?;
             if existing_pk.is_none() {
                 let indexer_config = IndexerConfig::default();
-                let mut settings = milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
+                let mut settings =
+                    milli::update::Settings::new(&mut wtxn, &self.inner, &indexer_config);
                 settings.set_primary_key(pk.to_string());
-                let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
+                let ip_policy = self.ip_policy.clone();
                 let embedder_stats = Arc::new(EmbedderStats::default());
-                let progress = milli::progress::Progress::default();
-                settings.execute(&|| false, &progress, &ip_policy, embedder_stats)
+                let progress = milli::progress::Progress::quiet();
+                settings
+                    .execute(
+                        &milli::MustStopProcessing::default(),
+                        &progress,
+                        &ip_policy,
+                        embedder_stats,
+                    )
                     .map_err(Error::Milli)?;
             }
         }
@@ -87,43 +84,90 @@ impl Index {
         // Use the provided PK or read the one already set on the index.
         let pk_name = match primary_key {
             Some(pk) => Some(pk.to_string()),
-            None => self.inner.primary_key(&wtxn).map_err(Error::Heed)?.map(|s| s.to_string()),
+            None => self
+                .inner
+                .primary_key(&wtxn)
+                .map_err(Error::Heed)?
+                .map(|s| s.to_string()),
         };
         let pending_vectors = Self::extract_pending_vectors(&documents, pk_name.as_deref())?;
 
         let indexer_config = IndexerConfig::default();
         let embedder_stats = Arc::new(EmbedderStats::default());
-        let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
+        let ip_policy = self.ip_policy.clone();
 
-        let builder = milli::update::IndexDocuments::new(
-            &mut wtxn,
-            &self.inner,
-            &indexer_config,
-            config,
-            move |_| (),
-            || false,
-            &embedder_stats,
-            &ip_policy,
-        )
-        .map_err(Error::Milli)?;
-
-        // Convert JSON documents to DocumentsBatchReader
-        let mut batch_builder = DocumentsBatchBuilder::new(Vec::new());
-        for doc in documents {
-            if let Value::Object(obj) = doc {
-                batch_builder
-                    .append_json_object(&obj)
-                    .map_err(|e| Error::Internal(e.to_string()))?;
-            } else {
-                return Err(Error::Internal("Document must be a JSON object".to_string()));
+        use milli::update::{InnerIndexSettings, MissingDocumentPolicy, new::indexer};
+        let mut payload = Vec::new();
+        for doc in &documents {
+            if !doc.is_object() {
+                return Err(Error::Internal("Document must be a JSON object".into()));
             }
+            serde_json::to_writer(&mut payload, doc)?;
+            payload.push(b'\n');
         }
-        let vector = batch_builder.into_inner().map_err(|e| Error::Internal(e.to_string()))?;
-        let reader = DocumentsBatchReader::from_reader(std::io::Cursor::new(vector))
-            .map_err(|e| Error::Internal(e.to_string()))?;
-
-        let (builder, _user_result) = builder.add_documents(reader).map_err(Error::Milli)?;
-        builder.execute().map_err(Error::Milli)?;
+        {
+            let rtxn = self.inner.read_txn()?;
+            let fields = self.inner.fields_ids_map(&rtxn)?;
+            let mut new_fields = fields.clone();
+            let embedders = InnerIndexSettings::from_index(&self.inner, &rtxn, &ip_policy, None)?
+                .runtime_embedders;
+            let mut ops = indexer::IndexOperations::new();
+            let on_missing_document = if skip_creation {
+                MissingDocumentPolicy::Skip
+            } else {
+                MissingDocumentPolicy::Create
+            };
+            ops.push_raw_operation(if merge {
+                indexer::Payload::Update {
+                    payload: &payload,
+                    on_missing_document,
+                }
+            } else {
+                indexer::Payload::Replace {
+                    payload: &payload,
+                    on_missing_document,
+                }
+            });
+            let arena = bumpalo::Bump::new();
+            let stop = milli::MustStopProcessing::default();
+            let progress = milli::progress::Progress::quiet();
+            let (changes, stats, pk) = ops.into_changes(
+                &arena,
+                &self.inner,
+                &rtxn,
+                primary_key,
+                &mut new_fields,
+                &stop,
+                progress.clone(),
+                None,
+            )?;
+            if let Some(error) = stats.into_iter().find_map(|s| s.error) {
+                return Err(Error::Milli(error.into()));
+            }
+            let pool = milli::ThreadPoolNoAbortBuilder::new()
+                .build()
+                .map_err(|e| Error::Internal(e.to_string()))?;
+            indexer_config
+                .thread_pool
+                .install(|| {
+                    indexer::index(
+                        &mut wtxn,
+                        &self.inner,
+                        &pool,
+                        indexer_config.grenad_parameters(),
+                        &fields,
+                        new_fields,
+                        pk,
+                        &changes,
+                        embedders,
+                        &stop,
+                        &progress,
+                        &ip_policy,
+                        &embedder_stats,
+                    )
+                })
+                .map_err(|e| Error::Internal(e.to_string()))??;
+        }
 
         wtxn.commit().map_err(|e| Error::Heed(e))?;
 
@@ -149,8 +193,8 @@ impl Index {
     /// Documents that don't exist are silently ignored.
     pub fn delete_documents(&self, ids: Vec<String>) -> Result<u64> {
         use bumpalo::Bump;
-        use milli::update::new::indexer;
         use milli::update::InnerIndexSettings;
+        use milli::update::new::indexer;
 
         if ids.is_empty() {
             return Ok(0);
@@ -192,14 +236,14 @@ impl Index {
             let db_fields_ids_map = self.inner.fields_ids_map(&rtxn).map_err(Error::Heed)?;
             let mut new_fields_ids_map = db_fields_ids_map.clone();
 
-            let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
+            let ip_policy = self.ip_policy.clone();
             let embedders = InnerIndexSettings::from_index(&self.inner, &rtxn, &ip_policy, None)
                 .map_err(Error::Milli)?
                 .runtime_embedders;
 
             let mut indexer_ops = indexer::IndexOperations::new();
             let id_refs: Vec<&str> = ids.iter().map(AsRef::as_ref).collect();
-            indexer_ops.delete_documents(&id_refs);
+            indexer_ops.delete_documents_by_external_ids(&id_refs);
 
             let indexer_alloc = Bump::new();
             let (document_changes, operation_stats, primary_key) = indexer_ops
@@ -209,8 +253,8 @@ impl Index {
                     &rtxn,
                     None,
                     &mut new_fields_ids_map,
-                    &|| false,
-                    milli::progress::Progress::default(),
+                    &milli::MustStopProcessing::default(),
+                    milli::progress::Progress::quiet(),
                     None,
                 )
                 .map_err(Error::Milli)?;
@@ -222,7 +266,9 @@ impl Index {
             let grenad_params = indexer_config.grenad_parameters();
             let indexing_pool = milli::ThreadPoolNoAbortBuilder::new()
                 .build()
-                .map_err(|e| Error::Internal(format!("failed to build indexing thread pool: {e}")))?;
+                .map_err(|e| {
+                    Error::Internal(format!("failed to build indexing thread pool: {e}"))
+                })?;
 
             pool.install(|| {
                 indexer::index(
@@ -235,8 +281,8 @@ impl Index {
                     primary_key,
                     &document_changes,
                     embedders,
-                    &|| false,
-                    &milli::progress::Progress::default(),
+                    &milli::MustStopProcessing::default(),
+                    &milli::progress::Progress::quiet(),
                     &ip_policy,
                     &Default::default(),
                 )
@@ -268,9 +314,15 @@ impl Index {
     ///
     /// Note: The field used in the filter must be configured as filterable in the index settings.
     pub fn delete_by_filter(&self, filter: &str) -> Result<u64> {
+        let filter =
+            Filter::from_str(filter)?.ok_or_else(|| Error::InvalidFilter("Empty filter".into()))?;
+        self.delete_by_index_filter(super::local_filter(filter)?)
+    }
+
+    pub(crate) fn delete_by_index_filter(&self, filter: milli::IndexFilter) -> Result<u64> {
         use bumpalo::Bump;
-        use milli::update::new::indexer::{self, DocumentDeletion};
         use milli::update::InnerIndexSettings;
+        use milli::update::new::indexer::{self, DocumentDeletion};
 
         let mut wtxn = self.inner.write_txn().map_err(Error::Heed)?;
 
@@ -279,11 +331,8 @@ impl Index {
         let (candidates, count, vector_ids_to_remove) = {
             let rtxn = self.inner.read_txn().map_err(Error::Heed)?;
 
-            let filter = Filter::from_str(filter)
-                .map_err(|e| Error::Internal(format!("Invalid filter: {e}")))?
-                .ok_or_else(|| Error::Internal("Empty filter expression".to_string()))?;
-
-            let candidates = filter.evaluate(&rtxn, &self.inner).map_err(Error::Milli)?;
+            let candidates =
+                filter.evaluate(&rtxn, &self.inner, &self.inner.fields_ids_map(&rtxn)?)?;
             let count = candidates.len();
             let vector_ids: Vec<u32> = if self.vector_store.is_some() {
                 candidates.iter().collect()
@@ -310,19 +359,16 @@ impl Index {
             let db_fields_ids_map = self.inner.fields_ids_map(&rtxn).map_err(Error::Heed)?;
             let new_fields_ids_map = db_fields_ids_map.clone();
 
-            let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
-            let embedders =
-                InnerIndexSettings::from_index(&self.inner, &rtxn, &ip_policy, None)
-                    .map_err(Error::Milli)?
-                    .runtime_embedders;
+            let ip_policy = self.ip_policy.clone();
+            let embedders = InnerIndexSettings::from_index(&self.inner, &rtxn, &ip_policy, None)
+                .map_err(Error::Milli)?
+                .runtime_embedders;
 
             let primary_key_str = self
                 .inner
                 .primary_key(&rtxn)
                 .map_err(Error::Heed)?
-                .ok_or_else(|| {
-                    Error::Internal("Index has no primary key configured".to_string())
-                })?
+                .ok_or_else(|| Error::Internal("Index has no primary key configured".to_string()))?
                 .to_string();
             let primary_key =
                 PrimaryKey::new(&primary_key_str, &db_fields_ids_map).ok_or_else(|| {
@@ -356,8 +402,8 @@ impl Index {
                     None, // primary_key already set
                     &document_changes,
                     embedders,
-                    &|| false,
-                    &milli::progress::Progress::default(),
+                    &milli::MustStopProcessing::default(),
+                    &milli::progress::Progress::quiet(),
                     &ip_policy,
                     &Default::default(),
                 )
@@ -380,5 +426,76 @@ impl Index {
         }
 
         Ok(count)
+    }
+}
+
+impl Index {
+    pub(crate) fn update_by_function(
+        &self,
+        filter: Option<milli::IndexFilter>,
+        context: Option<milli::Object>,
+        code: String,
+    ) -> Result<()> {
+        use milli::update::{InnerIndexSettings, new::indexer};
+        let mut txn = self.inner.write_txn()?;
+        let read = self.inner.read_txn()?;
+        let fields = self.inner.fields_ids_map(&read)?;
+        let candidates = match filter {
+            Some(filter) => filter.evaluate(&read, &self.inner, &fields)?,
+            None => self.inner.documents_ids(&read)?,
+        };
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let mut new_fields = fields.clone();
+        let name = self
+            .inner
+            .primary_key(&read)?
+            .ok_or_else(|| Error::Internal("Missing primary key".into()))?;
+        let key = PrimaryKey::new_or_insert(name, &mut new_fields).map_err(milli::Error::from)?;
+        let ids = candidates.clone();
+        let changes =
+            indexer::UpdateByFunction::new(candidates, context, code).into_changes(&key)?;
+        let config = IndexerConfig::default();
+        let pool = milli::ThreadPoolNoAbortBuilder::new()
+            .build()
+            .map_err(|e| Error::Internal(e.to_string()))?;
+        let embedders = InnerIndexSettings::from_index(&self.inner, &read, &self.ip_policy, None)?
+            .runtime_embedders;
+        config
+            .thread_pool
+            .install(|| {
+                indexer::index(
+                    &mut txn,
+                    &self.inner,
+                    &pool,
+                    config.grenad_parameters(),
+                    &fields,
+                    new_fields,
+                    None,
+                    &changes,
+                    embedders,
+                    &milli::MustStopProcessing::default(),
+                    &milli::progress::Progress::quiet(),
+                    &self.ip_policy,
+                    &Default::default(),
+                )
+            })
+            .map_err(|e| Error::Internal(e.to_string()))??;
+        drop(read);
+        txn.commit()?;
+        if let Some(store) = &self.vector_store {
+            store.remove_documents(&ids.iter().collect::<Vec<_>>())?;
+            let txn = self.inner.read_txn()?;
+            let fields = self.inner.fields_ids_map(&txn)?;
+            let documents = ids
+                .iter()
+                .filter(|id| self.inner.document(&txn, *id).is_ok())
+                .map(|id| self.make_document(&txn, &fields, id, None, true, false))
+                .collect::<Result<Vec<_>>>()?;
+            let pending = Self::extract_pending_vectors(&documents, self.inner.primary_key(&txn)?)?;
+            self.sync_pending_vectors_post_commit(pending)?;
+        }
+        Ok(())
     }
 }

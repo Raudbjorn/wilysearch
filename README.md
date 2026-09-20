@@ -2,13 +2,16 @@
 
 An embedded, HTTP-less Meilisearch engine for Rust. Wraps the [milli](https://github.com/meilisearch/milli) indexing engine directly, giving you full-text search, filtering, sorting, faceting, and hybrid vector search without running a server.
 
+**0.2 uses a new storage format and requires rebuilding 0.1 databases.** See the
+[capability matrix and upgrade guide](docs/parity-0.2.md) before updating.
+
 ## Why?
 
 Meilisearch is excellent, but the standard deployment requires running an HTTP server and communicating over the network. **wilysearch** strips that away:
 
-- **No HTTP layer** -- operations execute synchronously, in-process
+- **No HTTP server** -- index operations execute synchronously, in-process; optional chat uses async provider clients
 - **No task queue** -- mutations complete immediately and return a synthetic `TaskInfo` with `status: Succeeded`
-- **Trait-based API** -- 10 domain traits with 107 methods covering the full Meilisearch SDK surface
+- **Trait-based API** -- synchronous document, index, settings and search traits; local APIs for rules, templates and field metadata
 - **Composable** -- implement only the traits you need, or use the `MeilisearchApi` super-trait for everything
 - **Embeddable** -- LMDB-backed storage lives wherever you point it; great for desktop apps, CLI tools, and testing
 
@@ -114,18 +117,17 @@ See [docs/configuration.md](docs/configuration.md) for the full configuration re
 wilysearch (public API)
 ├── engine::Engine          -- single struct implementing all traits
 ├── traits                  -- 10 domain traits + MeilisearchApi composite
-├── types                   -- 48 API-surface structs, 2 enums (camelCase JSON)
+├── types                   -- request/response types and upstream settings
+├── ai/                     -- optional chat retrieval and Cohere reranking
 └── core                    -- internal milli/LMDB wrapper
-    ├── meilisearch.rs      -- Meilisearch facade (index lifecycle, LMDB env)
-    ├── index.rs            -- Index operations (2,299 LOC)
-    ├── search.rs           -- Search execution (787 LOC)
-    ├── settings.rs         -- Settings conversion (1,130 LOC)
+    ├── meilisearch/        -- index lifecycle, federation, joins and rules
+    ├── index/              -- indexing, search, settings and document operations
+    ├── search.rs           -- core query and result types
+    ├── settings.rs         -- upstream settings aliases
     ├── preprocessing/      -- Query pipeline (SymSpell typo + synonym expansion)
     ├── rag/                -- RAG pipeline (Embedder, Retriever, Reranker, Generator)
     └── vector/             -- VectorStore trait + SurrealDB backend
 ```
-
-**Total: ~15,300 lines of Rust across 30 source files.**
 
 ### Trait API
 
@@ -136,33 +138,24 @@ The public surface is organized into 10 domain traits:
 | `Documents` | 9 | CRUD, batch delete, filter delete |
 | `Search` | 4 | Keyword search, similar, multi-search, facet search |
 | `Indexes` | 6 | Create, get, list, delete, swap, update |
-| `Tasks` | 4 | Get, list, cancel, delete tasks |
-| `Batches` | 2 | Get, list batches |
+| `Tasks` | 4 | Compatibility surface; no persistent task queue |
+| `Batches` | 2 | Compatibility surface; no batch scheduler |
 | `SettingsApi` | 63 | Bulk + 20 individual settings (get/update/reset each) |
-| `Keys` | 5 | API key management |
-| `Webhooks` | 5 | Webhook CRUD |
+| `Keys` | 5 | Compatibility surface; no server authentication |
+| `Webhooks` | 5 | Compatibility surface; no webhook delivery |
 | `System` | 7 | Health, version, stats, dumps, snapshots, export |
 | `ExperimentalFeaturesApi` | 2 | Get/update experimental features |
 | **`MeilisearchApi`** | **107** | **Composite super-trait (auto-implemented)** |
 
-All trait methods are synchronous and return `Result<T>` where `Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>`.
+All trait methods are synchronous and return `Result<T, wilysearch::error::Error>`. `Engine` also exposes local methods for rules, template previews, field metadata, rename and Rhai document editing. Chat uses a separate async API.
 
 ### Engine
 
-`Engine` is the single implementation struct. It wraps `core::Meilisearch` and converts between the public `types::*` structs and the internal milli types:
-
-```rust
-pub struct Engine {
-    inner: core::Meilisearch,    // LMDB-backed milli instance
-    task_counter: AtomicU64,      // synthetic task UID generator
-    dump_dir: PathBuf,
-    snapshot_dir: PathBuf,
-}
-```
+`Engine` wraps `core::Meilisearch` and connects the public `types::*` requests to native milli operations. Use it for cross-index behavior such as foreign keys and dynamic search rules.
 
 ### Type System
 
-All 48 public types in `types.rs` serialize to the same JSON shape as the Meilisearch HTTP API:
+Request and response fields use Meilisearch's camelCase JSON names. For example:
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -172,10 +165,10 @@ pub struct SearchRequest {
     pub filter: Option<Value>,
     pub sort: Option<Vec<String>>,
     pub facets: Option<Vec<String>>,
-    pub limit: Option<usize>,
-    pub offset: Option<usize>,
-    pub page: Option<usize>,
-    pub hits_per_page: Option<usize>,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+    pub page: Option<u32>,
+    pub hits_per_page: Option<u32>,
     // ... 20+ fields matching the HTTP API
 }
 ```
@@ -183,7 +176,7 @@ pub struct SearchRequest {
 ## Features
 
 ### Core Search
-- Full-text search with BM25 ranking
+- Full-text search with native milli ranking rules
 - Typo tolerance (configurable per word length)
 - Filters (`year > 2000`, `genres = "Action"`)
 - Sorting (`year:desc`, `rating:asc`)
@@ -203,13 +196,14 @@ pub struct SearchRequest {
 - Pluggable implementations
 
 ### Settings
-- 20 individual settings with get/update/reset for each
+- Lossless upstream settings with explicit omission/reset/value semantics
 - Includes: ranking rules, searchable/filterable/sortable/displayed attributes, stop words, synonyms, typo tolerance, pagination, faceting, dictionary, separator tokens, proximity precision, embedders, localized attributes, and more
 
 ## Feature Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `ai` | off | Async chat workspaces/tool loops/streaming and synchronous Cohere personalization |
 | `surrealdb` | off | SurrealDB vector store backend (`kv-mem` + `kv-rocksdb`) |
 
 ```toml
@@ -219,39 +213,22 @@ wilysearch = { path = ".", features = ["surrealdb"] }
 
 ## Dependencies
 
-wilysearch pins against **Meilisearch v1.35.0** for its core crates:
-
-| Category | Crates |
-|----------|--------|
-| **Meilisearch Core** | `milli`, `meilisearch-types`, `file-store`, `http-client` (git tag v1.35.0) |
-| **Serialization** | `serde`, `serde_json`, `indexmap`, `toml` |
-| **ML / Embeddings** | `candle-core`, `candle-nn`, `candle-transformers` (pinned `=0.9.1`) |
-| **Query Processing** | `symspell`, `strsim` |
-| **Data Structures** | `uuid`, `time`, `roaring`, `fst`, `bumpalo` |
-| **Concurrency** | `crossbeam-channel`, `rayon` |
-| **Error Handling** | `thiserror`, `anyhow`, `log`, `tracing` |
-| **Optional** | `surrealdb`, `tokio` (behind `surrealdb` feature) |
-
-> **Note:** `candle-core`, `candle-nn`, and `candle-transformers` are pinned to exact version `=0.9.1` because 0.9.2 pulls in `zip 7.x` -> `typed-path 0.12`, which introduces an ambiguous `AsRef` impl that breaks milli's compilation. This matches upstream's Cargo.lock for Meilisearch v1.35.0.
->
-> **Important for downstream consumers:** Exact version pins (`=0.9.1`) are viral — any crate in your dependency tree that also depends on candle must use the exact same version, or Cargo will refuse to resolve. If you need a different candle version, you cannot use wilysearch in the same workspace without patching.
+Wilysearch pins its engine and optional chat client to Meilisearch 1.54.0 development,
+revision `1380adaacebad8a019d88549a06bae2dd90de249`. Rust 1.98.1 is selected by
+`rust-toolchain.toml`. Candle versions follow the upstream dependency graph.
 
 ## Testing
 
-42 integration tests covering the trait API surface:
+The existing integration suite and new parity/provider regressions cover the library and CLI:
 
 ```bash
-cargo test
+cargo test --workspace
+cargo test --workspace --features ai
+cargo test --workspace --features surrealdb
+cargo test --workspace --all-features
 ```
 
-| Test File | Tests | Coverage |
-|-----------|-------|----------|
-| `index_tests.rs` | 10 | Create, get, delete, list, pagination, stats, health, version |
-| `document_tests.rs` | 9 | CRUD, batch delete, filter delete, pagination |
-| `search_tests.rs` | 15 | Keywords, filters, sort, facets, highlighting, pagination, crop, distinct, matching strategy |
-| `settings_tests.rs` | 8 | Bulk update/reset, individual per-setting accessors |
-
-Tests use `tempfile::TempDir` for isolated LMDB environments that are automatically cleaned up.
+Tests use isolated temporary LMDB environments. Provider tests use local HTTP mocks with no real credentials. CI runs all four feature combinations.
 
 ## Examples
 
@@ -266,43 +243,6 @@ cargo run --example settings
 ```
 
 > **Note:** Examples use the lower-level `core::` API directly. The recommended public API is the trait-based `Engine` + `traits::*` + `types::*` interface shown in Quick Start.
-
-## Project Layout
-
-```
-wilysearch/
-├── src/
-│   ├── lib.rs              -- crate root (4 modules)
-│   ├── config.rs           -- WilysearchConfig unified configuration (805 LOC)
-│   ├── engine.rs           -- Engine struct (1,415 LOC)
-│   ├── traits.rs           -- 10 traits, 107 methods (340 LOC)
-│   ├── types.rs            -- 48 structs, 2 enums (669 LOC)
-│   └── core/               -- internal milli wrapper
-│       ├── mod.rs           -- module root + re-exports
-│       ├── meilisearch.rs   -- Meilisearch facade (824 LOC)
-│       ├── index.rs         -- index operations (2,299 LOC)
-│       ├── search.rs        -- search execution (787 LOC)
-│       ├── settings.rs      -- settings conversion (1,130 LOC)
-│       ├── preprocessing/   -- typo + synonym pipeline (3,671 LOC)
-│       ├── rag/             -- RAG pipeline (1,106 LOC)
-│       └── vector/          -- vector store (826 LOC)
-├── tests/
-│   ├── common/mod.rs        -- TestContext + sample data
-│   ├── index_tests.rs
-│   ├── document_tests.rs
-│   ├── search_tests.rs
-│   └── settings_tests.rs
-├── examples/
-│   ├── basic_search.rs
-│   ├── hybrid_search.rs
-│   ├── multi_search.rs
-│   ├── preprocessing.rs
-│   └── settings.rs
-└── docs/
-    ├── configuration.md                 -- full configuration reference
-    ├── dependency-reduction-analysis.md  -- future: replacing milli
-    └── tool-execution-spec.md           -- future: LLM tool calling
-```
 
 ## Roadmap
 

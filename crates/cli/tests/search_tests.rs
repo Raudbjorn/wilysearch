@@ -470,3 +470,58 @@ fn test_search_combined_options() {
         );
     }
 }
+
+#[test]
+fn test_complete_search_request_file() {
+    let tmp=TempDir::new().unwrap();
+    let db=setup_searchable_movies(&tmp);
+    let path=tmp.path().join("request.json");
+    std::fs::write(&path,r#"{"filter":["year > 2000"],"sort":["year:desc"],"attributesToRetrieve":["title"],"limit":1}"#).unwrap();
+    let output=wily().arg("--db").arg(db).args(["search","movies","--request"]).arg(&path).assert().success().get_output().stdout.clone();
+    let result:Value=serde_json::from_slice(&output).unwrap();
+    assert_eq!(result["hits"][0]["title"],"Interstellar");
+    assert!(result["hits"][0].get("year").is_none());
+}
+
+#[test]
+fn test_search_request_rejects_bad_files_and_conflicting_flags() {
+    use predicates::str::contains;
+
+    let tmp = TempDir::new().unwrap();
+    let db = setup_searchable_movies(&tmp);
+    let path = tmp.path().join("request.json");
+    wily()
+        .arg("--db")
+        .arg(db)
+        .args(["search", "movies", "--request"])
+        .arg(&path)
+        .assert()
+        .failure()
+        .stderr(contains("os error"));
+    std::fs::write(&path, "{").unwrap();
+    wily()
+        .arg("--db")
+        .arg(db)
+        .args(["search", "movies", "--request"])
+        .arg(&path)
+        .assert()
+        .failure()
+        .stderr(contains("EOF"));
+    std::fs::write(&path, "{}").unwrap();
+    for flags in [
+        vec!["matrix"],
+        vec!["--limit", "1"],
+        vec!["--filter", "year > 2000"],
+        vec!["--show-ranking-score"],
+    ] {
+        wily()
+            .arg("--db")
+            .arg(db)
+            .args(["search", "movies", "--request"])
+            .arg(&path)
+            .args(flags)
+            .assert()
+            .code(2)
+            .stderr(contains("cannot be used with"));
+    }
+}

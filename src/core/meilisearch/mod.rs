@@ -1,5 +1,7 @@
 mod federation;
+mod joins;
 mod maintenance;
+pub(crate) mod rules;
 
 use milli::progress::EmbedderStats;
 use serde::{Deserialize, Serialize};
@@ -17,6 +19,10 @@ use crate::core::vector::VectorStore;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IndexStats {
+    pub number_of_embeddings: u64,
+    pub number_of_embedded_documents: u64,
+    pub database_size: u64,
+    pub used_database_size: u64,
     /// Number of documents in the index.
     pub number_of_documents: u64,
     /// Whether the index is currently loaded in memory.
@@ -73,13 +79,21 @@ pub struct DumpInfo {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExperimentalFeatures {
-    /// Enable Prometheus metrics endpoint.
+    #[serde(default)]
+    pub foreign_keys: bool,
+    #[serde(default)]
+    pub dynamic_search_rules: bool,
+    #[serde(default)]
+    pub render_templates: bool,
+    #[serde(default)]
+    pub chat_completions: bool,
+    /// Compatibility flag; embedded mode has no metrics endpoint.
     #[serde(default)]
     pub metrics: bool,
-    /// Enable the logs route for real-time log streaming.
+    /// Compatibility flag; embedded mode has no logs route.
     #[serde(default)]
     pub logs_route: bool,
-    /// Enable editing documents by function (JavaScript runtime).
+    /// Enable editing documents with native Rhai functions.
     #[serde(default)]
     pub edit_documents_by_function: bool,
     /// Enable the `CONTAINS` filter operator.
@@ -148,15 +162,16 @@ fn save_index_metadata(index_dir: &Path, meta: &IndexMetadata) -> Result<()> {
 /// The underlying `milli::Index` and `heed::Env` handle their own cleanup
 /// (flushing writes, closing environments) safely.
 pub struct Meilisearch {
+    pub(crate) rules_write: std::sync::Mutex<()>,
+    pub(crate) rules: std::sync::Mutex<Option<Arc<Index>>>,
     // Fields are `pub(crate)` so that `impl Meilisearch` blocks in sibling
     // sub-modules (federation.rs, maintenance.rs) can access them. They are
     // NOT part of the public API -- external crates cannot reach these fields.
     pub(crate) options: MeilisearchOptions,
     /// In-memory cache of opened index handles, keyed by index UID.
     ///
-    /// Uses an `RwLock<Arc<HashMap>>` (COW pattern) to optimize for read-heavy workloads.
-    /// Readers acquire a read lock, clone the Arc (cheap), and release the lock immediately.
-    /// Writers acquire a write lock and clone the HashMap (expensive) to update it.
+    /// Readers clone individual index handles while holding the read lock.
+    /// Writers use `Arc::make_mut` under the write lock to update the cache.
     ///
     /// # Lock Poisoning Strategy
     ///
@@ -167,8 +182,6 @@ pub struct Meilisearch {
     /// is logged so operators can investigate the original panic. The underlying
     /// LMDB data remains consistent regardless of in-memory cache state because
     /// LMDB uses its own transactional isolation.
-    ///
-    /// In-memory cache of opened index handles, keyed by index UID.
     ///
     /// # Lock ordering
     ///
@@ -213,6 +226,7 @@ impl Meilisearch {
     ///
     /// Returns an error if the database directory cannot be created.
     pub fn new(options: MeilisearchOptions) -> Result<Self> {
+        crate::core::storage::check_or_create(&options.db_path)?;
         std::fs::create_dir_all(&options.db_path)?;
 
         // Load persisted metadata for all existing indexes, backfilling any that lack it
@@ -243,6 +257,8 @@ impl Meilisearch {
         }
 
         Ok(Self {
+            rules: std::sync::Mutex::new(None),
+            rules_write: std::sync::Mutex::new(()),
             options,
             indexes: RwLock::new(Arc::new(HashMap::new())),
             index_metadata: RwLock::new(metadata_cache),
@@ -306,7 +322,12 @@ impl Meilisearch {
         let mut options = milli::heed::EnvOpenOptions::new().read_txn_without_tls();
         options.map_size(self.options.max_index_size);
 
-        let milli_index = milli::Index::new(options, &index_path, true).map_err(Error::Milli)?;
+        let milli_index = milli::Index::new(
+            options,
+            &index_path,
+            milli::CreateOrOpen::create_without_shards(),
+        )
+        .map_err(Error::Milli)?;
 
         if let Some(pk) = primary_key {
             let mut wtxn = milli_index.write_txn().map_err(Error::Heed)?;
@@ -315,17 +336,14 @@ impl Meilisearch {
             let ip_policy = http_client::policy::IpPolicy::deny_all_local_ips();
             let indexer_config = milli::update::IndexerConfig::default();
 
-            let mut builder = milli::update::Settings::new(
-                &mut wtxn,
-                &milli_index,
-                &indexer_config,
-            );
+            let mut builder =
+                milli::update::Settings::new(&mut wtxn, &milli_index, &indexer_config);
             builder.set_primary_key(pk.to_string());
 
             builder
                 .execute(
-                    &|| false,
-                    &milli::progress::Progress::default(),
+                    &milli::MustStopProcessing::default(),
+                    &milli::progress::Progress::quiet(),
                     &ip_policy,
                     embedder_stats,
                 )
@@ -334,7 +352,10 @@ impl Meilisearch {
             wtxn.commit().map_err(Error::Heed)?;
         }
 
-        let index = Arc::new(Index::new(milli_index, self.vector_store.clone()));
+        let mut index = Index::new(milli_index, self.vector_store.clone());
+        index.uid = uid.to_owned();
+        index.ip_policy = self.options.ip_policy();
+        let index = Arc::new(index);
 
         // COW update -- we already hold the write lock
         let mut new_map = (**lock).clone();
@@ -353,7 +374,10 @@ impl Meilisearch {
         self.index_metadata
             .write()
             .unwrap_or_else(|e| {
-                tracing::warn!(uid, "index_metadata RwLock poisoned in create_index, recovering");
+                tracing::warn!(
+                    uid,
+                    "index_metadata RwLock poisoned in create_index, recovering"
+                );
                 e.into_inner()
             })
             .insert(uid.to_string(), meta);
@@ -368,49 +392,38 @@ impl Meilisearch {
     /// Returns [`Error::IndexNotFound`] if no index with the given UID exists.
     #[instrument(skip(self))]
     pub fn get_index(&self, uid: &str) -> Result<Arc<Index>> {
-        // COW read: clone the Arc, release the lock
-        let indexes = self.indexes.read().unwrap_or_else(|e| {
-            tracing::warn!(uid, "indexes RwLock poisoned in get_index (read), recovering");
+        if !is_valid_uid(uid) {
+            return Err(Error::InvalidIndexUid(uid.into()));
+        }
+        {
+            let indexes = self.indexes.read().unwrap_or_else(|e| {
+                tracing::warn!(uid, "indexes RwLock poisoned in get_index, recovering");
+                e.into_inner()
+            });
+            if let Some(index) = indexes.get(uid) {
+                return Ok(index.clone());
+            }
+        }
+        let mut indexes = self.indexes.write().unwrap_or_else(|e| {
+            tracing::warn!(uid, "indexes RwLock poisoned in get_index, recovering");
             e.into_inner()
-        }).clone();
+        });
         if let Some(index) = indexes.get(uid) {
             return Ok(index.clone());
         }
-
-        // Try to load it if it exists on disk
-        let index_path = self.options.db_path.join("indexes").join(uid);
-        if index_path.exists() {
-            // Drop read lock arc
-            drop(indexes);
-
-            let mut lock = self.indexes.write().unwrap_or_else(|e| {
-                tracing::warn!(uid, "indexes RwLock poisoned in get_index (write), recovering");
-                e.into_inner()
-            });
-
-            // Check again in case someone else loaded it
-            if let Some(index) = lock.get(uid) {
-                return Ok(index.clone());
-            }
-
-            debug!(uid, "loading index from disk");
-            let mut options = milli::heed::EnvOpenOptions::new().read_txn_without_tls();
-            options.map_size(self.options.max_index_size);
-
-            // milli::Index::new(options, path, creation_bool)
-            let milli_index =
-                milli::Index::new(options, &index_path, false).map_err(Error::Milli)?;
-            let index = Arc::new(Index::new(milli_index, self.vector_store.clone()));
-
-            // COW write
-            let mut new_map = (**lock).clone();
-            new_map.insert(uid.to_string(), index.clone());
-            *lock = Arc::new(new_map);
-
-            return Ok(index);
+        let path = self.options.db_path.join("indexes").join(uid);
+        if !path.join("data.mdb").exists() {
+            return Err(Error::IndexNotFound(uid.into()));
         }
-
-        Err(Error::IndexNotFound(uid.to_string()))
+        let mut options = milli::heed::EnvOpenOptions::new().read_txn_without_tls();
+        options.map_size(self.options.max_index_size);
+        let inner = milli::Index::new(options, &path, milli::CreateOrOpen::Open)?;
+        let mut index = Index::new(inner, self.vector_store.clone());
+        index.uid = uid.into();
+        index.ip_policy = self.options.ip_policy();
+        let index = Arc::new(index);
+        Arc::make_mut(&mut indexes).insert(uid.into(), index.clone());
+        Ok(index)
     }
 
     /// Delete an index and all its data from disk.
@@ -424,6 +437,9 @@ impl Meilisearch {
     /// - The index is still in use (has other references)
     #[instrument(skip(self))]
     pub fn delete_index(&self, uid: &str) -> Result<()> {
+        if !is_valid_uid(uid) {
+            return Err(Error::InvalidIndexUid(uid.into()));
+        }
         let index_path = self.options.db_path.join("indexes").join(uid);
 
         // Hold write lock for the full delete sequence to prevent TOCTOU race.
@@ -459,7 +475,6 @@ impl Meilisearch {
         }
 
         *lock = Arc::new(indexes);
-        drop(lock);
 
         // Delete index directory from disk (metadata.json goes with it)
         if index_path.exists() {
@@ -470,7 +485,10 @@ impl Meilisearch {
         self.index_metadata
             .write()
             .unwrap_or_else(|e| {
-                tracing::warn!(uid, "index_metadata RwLock poisoned in delete_index, recovering");
+                tracing::warn!(
+                    uid,
+                    "index_metadata RwLock poisoned in delete_index, recovering"
+                );
                 e.into_inner()
             })
             .remove(uid);
@@ -507,6 +525,9 @@ impl Meilisearch {
     ///
     /// Returns `true` if the index exists on disk (does not require loading).
     pub fn index_exists(&self, uid: &str) -> bool {
+        if !is_valid_uid(uid) {
+            return false;
+        }
         let index_path = self.options.db_path.join("indexes").join(uid);
         index_path.exists() && index_path.is_dir()
     }
@@ -520,11 +541,23 @@ impl Meilisearch {
 
         let rtxn = index.inner.read_txn().map_err(Error::Heed)?;
 
-        let number_of_documents = index.inner.number_of_documents(&rtxn).map_err(Error::Milli)?;
+        let number_of_documents = index
+            .inner
+            .number_of_documents(&rtxn)
+            .map_err(Error::Milli)?;
         let field_distribution = index.inner.field_distribution(&rtxn).map_err(Error::Heed)?;
-        let primary_key = index.inner.primary_key(&rtxn).map_err(Error::Heed)?.map(String::from);
+        let primary_key = index
+            .inner
+            .primary_key(&rtxn)
+            .map_err(Error::Heed)?
+            .map(String::from);
 
+        let vectors = index.inner.vector_store_stats(&rtxn)?;
         Ok(IndexStats {
+            number_of_embeddings: vectors.number_of_embeddings,
+            number_of_embedded_documents: vectors.documents.len(),
+            database_size: index.inner.on_disk_size()?,
+            used_database_size: index.inner.used_size()?,
             number_of_documents,
             is_indexing: false, // We don't track this currently
             field_distribution,
@@ -534,10 +567,16 @@ impl Meilisearch {
 
     /// Update the `updated_at` timestamp for an index and persist to disk.
     pub fn touch_index_updated(&self, uid: &str) -> Result<()> {
+        if !is_valid_uid(uid) {
+            return Err(Error::InvalidIndexUid(uid.into()));
+        }
         let now = now_iso8601();
         let index_path = self.options.db_path.join("indexes").join(uid);
         let mut cache = self.index_metadata.write().unwrap_or_else(|e| {
-            tracing::warn!(uid, "index_metadata RwLock poisoned in touch_index_updated, recovering");
+            tracing::warn!(
+                uid,
+                "index_metadata RwLock poisoned in touch_index_updated, recovering"
+            );
             e.into_inner()
         });
         if let Some(meta) = cache.get_mut(uid) {
@@ -552,7 +591,10 @@ impl Meilisearch {
         self.index_metadata
             .read()
             .unwrap_or_else(|e| {
-                tracing::warn!(uid, "index_metadata RwLock poisoned in get_index_metadata, recovering");
+                tracing::warn!(
+                    uid,
+                    "index_metadata RwLock poisoned in get_index_metadata, recovering"
+                );
                 e.into_inner()
             })
             .get(uid)
@@ -565,13 +607,15 @@ impl Meilisearch {
 
     /// Check if the embedded instance is operational.
     pub fn health(&self) -> HealthStatus {
-        HealthStatus { status: "available".to_string() }
+        HealthStatus {
+            status: "available".to_string(),
+        }
     }
 
     /// Get version information for the embedded Meilisearch engine.
     pub fn version(&self) -> VersionInfo {
         VersionInfo {
-            commit_sha: "embedded".to_string(),
+            commit_sha: crate::core::storage::UPSTREAM_REVISION.into(),
             commit_date: "embedded".to_string(),
             pkg_version: env!("CARGO_PKG_VERSION").to_string(),
         }
@@ -586,8 +630,12 @@ impl Meilisearch {
 
         for uid in &index_uids {
             match self.index_stats(uid) {
-                Ok(stats) => { indexes.insert(uid.clone(), stats); }
-                Err(e) => { tracing::warn!(uid, error = %e, "failed to collect index stats"); }
+                Ok(stats) => {
+                    indexes.insert(uid.clone(), stats);
+                }
+                Err(e) => {
+                    tracing::warn!(uid, error = %e, "failed to collect index stats");
+                }
             }
         }
 
@@ -617,16 +665,26 @@ impl Meilisearch {
 
     /// Get the current experimental feature flags.
     pub fn get_experimental_features(&self) -> ExperimentalFeatures {
-        self.experimental_features.read().unwrap_or_else(|e| {
-            tracing::warn!("experimental_features RwLock poisoned in get_experimental_features, recovering");
-            e.into_inner()
-        }).clone()
+        self.experimental_features
+            .read()
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "experimental_features RwLock poisoned in get_experimental_features, recovering"
+                );
+                e.into_inner()
+            })
+            .clone()
     }
 
     /// Update experimental feature flags.
-    pub fn update_experimental_features(&self, features: ExperimentalFeatures) -> ExperimentalFeatures {
+    pub fn update_experimental_features(
+        &self,
+        features: ExperimentalFeatures,
+    ) -> ExperimentalFeatures {
         let mut current = self.experimental_features.write().unwrap_or_else(|e| {
-            tracing::warn!("experimental_features RwLock poisoned in update_experimental_features, recovering");
+            tracing::warn!(
+                "experimental_features RwLock poisoned in update_experimental_features, recovering"
+            );
             e.into_inner()
         });
         *current = features;
@@ -634,7 +692,11 @@ impl Meilisearch {
     }
 
     /// List indexes with pagination and metadata.
-    pub fn list_indexes_with_pagination(&self, offset: usize, limit: usize) -> Result<(Vec<IndexInfo>, usize)> {
+    pub fn list_indexes_with_pagination(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<IndexInfo>, usize)> {
         let all_uids = self.list_indexes()?;
         let total = all_uids.len();
 
@@ -647,7 +709,9 @@ impl Meilisearch {
             .index_metadata
             .read()
             .unwrap_or_else(|e| {
-                tracing::warn!("index_metadata RwLock poisoned in list_indexes_with_pagination, recovering");
+                tracing::warn!(
+                    "index_metadata RwLock poisoned in list_indexes_with_pagination, recovering"
+                );
                 e.into_inner()
             })
             .clone();
@@ -692,7 +756,12 @@ fn write_documents_to_json(index: &Index, path: &Path) -> Result<()> {
     let mut offset = 0;
     let mut first = true;
     loop {
-        let batch = index.get_documents(offset, BATCH_SIZE)?;
+        let batch = index.get_documents_with_options(&crate::core::GetDocumentsOptions {
+            offset,
+            limit: BATCH_SIZE,
+            retrieve_vectors: true,
+            ..Default::default()
+        })?;
         for doc in &batch.documents {
             if !first {
                 write!(writer, ",")?;
@@ -711,7 +780,10 @@ fn write_documents_to_json(index: &Index, path: &Path) -> Result<()> {
 }
 
 fn is_valid_uid(uid: &str) -> bool {
-    !uid.is_empty() && uid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    !uid.is_empty()
+        && uid
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 fn dir_size(path: &std::path::Path) -> std::io::Result<u64> {
@@ -728,4 +800,58 @@ fn dir_size(path: &std::path::Path) -> std::io::Result<u64> {
         }
     }
     Ok(size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_index_recovers_a_poisoned_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let meili = Meilisearch::new(MeilisearchOptions {
+            db_path: dir.path().into(),
+            ..Default::default()
+        })
+        .unwrap();
+        meili.create_index("docs", Some("id")).unwrap();
+        std::thread::scope(|scope| {
+            assert!(
+                scope
+                    .spawn(|| {
+                        let _guard = meili.indexes.write().unwrap();
+                        panic!("simulate a cache writer panic");
+                    })
+                    .join()
+                    .is_err()
+            );
+        });
+        assert_eq!(
+            meili
+                .get_index("docs")
+                .unwrap()
+                .primary_key()
+                .unwrap()
+                .as_deref(),
+            Some("id")
+        );
+        {
+            let mut cache = meili
+                .indexes
+                .write()
+                .err()
+                .expect("poisoned lock")
+                .into_inner();
+            Arc::make_mut(&mut cache).clear();
+        }
+        assert_eq!(
+            meili
+                .get_index("docs")
+                .unwrap()
+                .primary_key()
+                .unwrap()
+                .as_deref(),
+            Some("id")
+        );
+    }
 }

@@ -6,6 +6,10 @@ use thiserror::Error;
 /// automatically from underlying crate errors via `#[from]`.
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error(
+        "Incompatible database format: {0}. Rebuild with Wilysearch 0.2 in a new directory; the existing data has not been migrated"
+    )]
+    IncompatibleDatabase(String),
     /// An error propagated from the milli search engine.
     #[error("Milli error: {0}")]
     Milli(#[from] milli::Error),
@@ -49,6 +53,13 @@ pub enum Error {
     /// An invalid filter expression was provided.
     #[error("Invalid filter expression: {0}")]
     InvalidFilter(String),
+
+    /// Search parameters supplied by the caller are invalid.
+    #[error("Invalid search request: {0}")]
+    InvalidSearchRequest(String),
+
+    #[error("Invalid search rule UID: {0}")]
+    InvalidSearchRuleUid(String),
 
     /// An invalid sort expression was provided.
     #[error("Invalid sort expression: {0}")]

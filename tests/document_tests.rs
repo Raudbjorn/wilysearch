@@ -118,7 +118,7 @@ fn test_delete_by_filter() {
 
     ctx.engine
         .delete_documents_by_filter("movies", &DeleteDocumentsByFilterRequest {
-            filter: "year = 1994".to_string(),
+            filter: serde_json::json!("year = 1994"),
         })
         .expect("failed to delete by filter");
 

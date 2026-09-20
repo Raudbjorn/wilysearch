@@ -13,6 +13,7 @@ fn setup() -> (Meilisearch, Arc<InMemoryVectorStore>, TempDir) {
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     let store = Arc::new(InMemoryVectorStore::new());
     let options = MeilisearchOptions {
+        allow_local_provider_urls: false,
         db_path: temp_dir.path().to_path_buf(),
         max_index_size: 100 * 1024 * 1024,
         max_task_db_size: 10 * 1024 * 1024,
@@ -21,6 +22,31 @@ fn setup() -> (Meilisearch, Arc<InMemoryVectorStore>, TempDir) {
         .expect("failed to create Meilisearch")
         .with_vector_store(store.clone() as Arc<dyn wilysearch::core::VectorStore>);
     (meili, store, temp_dir)
+}
+
+#[test]
+fn external_hybrid_respects_retrieve_vectors() {
+    let (meili, _store, _tmp) = setup();
+    let index = meili.create_index("docs", Some("id")).unwrap();
+    index
+        .add_documents(
+            vec![json!({"id":1,"title":"Rust","_vectors":{"default":[1.0,0.0]}})],
+            None,
+        )
+        .unwrap();
+    let mut query = wilysearch::core::HybridSearchQuery::new("Rust").with_vector(vec![1.0, 0.0]);
+    assert!(
+        index.hybrid_search(&query).unwrap().result.hits[0]
+            .document
+            .get("_vectors")
+            .is_none()
+    );
+    query.search.retrieve_vectors = true;
+    let result = index.hybrid_search(&query).unwrap();
+    assert_eq!(
+        result.result.hits[0].document["_vectors"]["default"],
+        json!([1.0, 0.0])
+    );
 }
 
 #[test]
@@ -66,7 +92,10 @@ fn test_add_documents_without_vectors_leaves_store_empty() {
     ];
 
     index.add_documents(docs, None).unwrap();
-    assert!(store.is_empty().unwrap(), "store should be empty when no _vectors");
+    assert!(
+        store.is_empty().unwrap(),
+        "store should be empty when no _vectors"
+    );
 }
 
 #[test]
@@ -126,7 +155,11 @@ fn test_delete_documents_removes_from_store() {
     // Delete doc 2
     let deleted = index.delete_documents(vec!["2".to_string()]).unwrap();
     assert_eq!(deleted, 1);
-    assert_eq!(store.len().unwrap(), 2, "store should have 2 docs after deleting 1");
+    assert_eq!(
+        store.len().unwrap(),
+        2,
+        "store should have 2 docs after deleting 1"
+    );
 }
 
 #[test]
@@ -160,16 +193,21 @@ fn test_delete_by_filter_removes_from_store() {
     assert_eq!(store.len().unwrap(), 3);
 
     // Configure filterable attributes
-    let settings = wilysearch::core::Settings {
-        filterable_attributes: Some(vec!["year".to_string()]),
-        ..Default::default()
-    };
+    let settings = serde_json::from_value::<wilysearch::types::Settings>(serde_json::json!({
+        "filterableAttributes": vec!["year".to_string()],
+
+    }))
+    .unwrap();
     index.update_settings(&settings).unwrap();
 
     // Delete all movies before 2010
     let deleted = index.delete_by_filter("year < 2010").unwrap();
     assert_eq!(deleted, 1); // The Dark Knight (2008)
-    assert_eq!(store.len().unwrap(), 2, "store should have 2 docs after filter delete");
+    assert_eq!(
+        store.len().unwrap(),
+        2,
+        "store should have 2 docs after filter delete"
+    );
 }
 
 #[test]
@@ -195,7 +233,10 @@ fn test_clear_empties_store() {
 
     let cleared = index.clear().unwrap();
     assert_eq!(cleared, 2);
-    assert!(store.is_empty().unwrap(), "store should be empty after clear");
+    assert!(
+        store.is_empty().unwrap(),
+        "store should be empty after clear"
+    );
 }
 
 #[test]
@@ -217,7 +258,11 @@ fn test_multi_vector_format() {
     assert_eq!(snapshot.len(), 1);
     // The document should have 2 vectors
     let vecs = snapshot.values().next().unwrap();
-    assert_eq!(vecs.len(), 2, "should have 2 vectors for multi-vector format");
+    assert_eq!(
+        vecs.len(),
+        2,
+        "should have 2 vectors for multi-vector format"
+    );
 }
 
 #[test]

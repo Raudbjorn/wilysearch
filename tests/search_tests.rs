@@ -12,10 +12,13 @@ fn test_basic_search() {
 
     let result = ctx
         .engine
-        .search("movies", &SearchRequest {
-            q: Some("dark knight".to_string()),
-            ..Default::default()
-        })
+        .search(
+            "movies",
+            &SearchRequest {
+                q: Some("dark knight".to_string()),
+                ..Default::default()
+            },
+        )
         .expect("search failed");
 
     assert!(!result.hits.is_empty(), "expected at least one hit");
@@ -35,11 +38,14 @@ fn test_search_with_filter() {
 
     let result = ctx
         .engine
-        .search("movies", &SearchRequest {
-            filter: Some(json!("year > 2000")),
-            limit: Some(20),
-            ..Default::default()
-        })
+        .search(
+            "movies",
+            &SearchRequest {
+                filter: Some(json!("year > 2000")),
+                limit: Some(20),
+                ..Default::default()
+            },
+        )
         .expect("search failed");
 
     assert!(
@@ -61,11 +67,14 @@ fn test_search_with_sort() {
 
     let result = ctx
         .engine
-        .search("movies", &SearchRequest {
-            sort: Some(vec!["year:desc".to_string()]),
-            limit: Some(20),
-            ..Default::default()
-        })
+        .search(
+            "movies",
+            &SearchRequest {
+                sort: Some(vec!["year:desc".to_string()]),
+                limit: Some(20),
+                ..Default::default()
+            },
+        )
         .expect("search failed");
 
     assert!(!result.hits.is_empty());
@@ -92,11 +101,14 @@ fn test_search_with_facets() {
 
     let result = ctx
         .engine
-        .search("movies", &SearchRequest {
-            facets: Some(vec!["genres".to_string()]),
-            limit: Some(20),
-            ..Default::default()
-        })
+        .search(
+            "movies",
+            &SearchRequest {
+                facets: Some(vec!["genres".to_string()]),
+                limit: Some(20),
+                ..Default::default()
+            },
+        )
         .expect("search failed");
 
     let facets = result
@@ -122,11 +134,14 @@ fn test_search_with_highlighting() {
 
     let result = ctx
         .engine
-        .search("movies", &SearchRequest {
-            q: Some("dark".to_string()),
-            attributes_to_highlight: Some(vec!["title".to_string()]),
-            ..Default::default()
-        })
+        .search(
+            "movies",
+            &SearchRequest {
+                q: Some("dark".to_string()),
+                attributes_to_highlight: Some(vec!["title".to_string()]),
+                ..Default::default()
+            },
+        )
         .expect("search failed");
 
     assert!(!result.hits.is_empty(), "expected at least one hit");
@@ -151,11 +166,14 @@ fn test_search_page_pagination() {
 
     let result = ctx
         .engine
-        .search("movies", &SearchRequest {
-            page: Some(1),
-            hits_per_page: Some(3),
-            ..Default::default()
-        })
+        .search(
+            "movies",
+            &SearchRequest {
+                page: Some(1),
+                hits_per_page: Some(3),
+                ..Default::default()
+            },
+        )
         .expect("search failed");
 
     assert_eq!(result.hits.len(), 3);
@@ -172,11 +190,14 @@ fn test_search_offset_pagination() {
 
     let result = ctx
         .engine
-        .search("movies", &SearchRequest {
-            offset: Some(2),
-            limit: Some(3),
-            ..Default::default()
-        })
+        .search(
+            "movies",
+            &SearchRequest {
+                offset: Some(2),
+                limit: Some(3),
+                ..Default::default()
+            },
+        )
         .expect("search failed");
 
     assert_eq!(result.hits.len(), 3);
@@ -192,11 +213,14 @@ fn test_search_matching_strategy_all() {
 
     let result = ctx
         .engine
-        .search("movies", &SearchRequest {
-            q: Some("dark knight".to_string()),
-            matching_strategy: Some(MatchingStrategy::All),
-            ..Default::default()
-        })
+        .search(
+            "movies",
+            &SearchRequest {
+                q: Some("dark knight".to_string()),
+                matching_strategy: Some(MatchingStrategy::All),
+                ..Default::default()
+            },
+        )
         .expect("search failed");
 
     for hit in &result.hits {
@@ -215,10 +239,13 @@ fn test_search_empty_query() {
 
     let result = ctx
         .engine
-        .search("movies", &SearchRequest {
-            limit: Some(20),
-            ..Default::default()
-        })
+        .search(
+            "movies",
+            &SearchRequest {
+                limit: Some(20),
+                ..Default::default()
+            },
+        )
         .expect("search failed");
 
     assert_eq!(result.hits.len(), 10);
@@ -231,10 +258,13 @@ fn test_search_no_results() {
 
     let result = ctx
         .engine
-        .search("movies", &SearchRequest {
-            q: Some("xyzzy_nonexistent_gobbledygook".to_string()),
-            ..Default::default()
-        })
+        .search(
+            "movies",
+            &SearchRequest {
+                q: Some("xyzzy_nonexistent_gobbledygook".to_string()),
+                ..Default::default()
+            },
+        )
         .expect("search failed");
 
     assert!(
@@ -251,11 +281,14 @@ fn test_search_attributes_to_retrieve() {
 
     let result = ctx
         .engine
-        .search("movies", &SearchRequest {
-            q: Some("inception".to_string()),
-            attributes_to_retrieve: Some(vec!["title".to_string(), "year".to_string()]),
-            ..Default::default()
-        })
+        .search(
+            "movies",
+            &SearchRequest {
+                q: Some("inception".to_string()),
+                attributes_to_retrieve: Some(vec!["title".to_string(), "year".to_string()]),
+                ..Default::default()
+            },
+        )
         .expect("search failed");
 
     assert!(!result.hits.is_empty());
@@ -274,11 +307,14 @@ fn test_search_attributes_to_search_on() {
 
     let result = ctx
         .engine
-        .search("movies", &SearchRequest {
-            q: Some("Drama".to_string()),
-            attributes_to_search_on: Some(vec!["title".to_string()]),
-            ..Default::default()
-        })
+        .search(
+            "movies",
+            &SearchRequest {
+                q: Some("Drama".to_string()),
+                attributes_to_search_on: Some(vec!["title".to_string()]),
+                ..Default::default()
+            },
+        )
         .expect("search failed");
 
     assert!(
@@ -295,14 +331,19 @@ fn test_facet_search() {
 
     let result = ctx
         .engine
-        .facet_search("movies", &FacetSearchRequest {
-            facet_name: "genres".to_string(),
-            facet_query: Some("act".to_string()),
-            q: None,
-            filter: None,
-            matching_strategy: None,
-            attributes_to_search_on: None,
-        })
+        .facet_search(
+            "movies",
+            &FacetSearchRequest {
+                ranking_score_threshold: None,
+                locales: None,
+                facet_name: "genres".to_string(),
+                facet_query: Some("act".to_string()),
+                q: None,
+                filter: None,
+                matching_strategy: None,
+                attributes_to_search_on: None,
+            },
+        )
         .expect("facet search failed");
 
     let values: Vec<&str> = result.facet_hits.iter().map(|h| h.value.as_str()).collect();
@@ -319,19 +360,26 @@ fn test_search_distinct() {
 
     // Set year as distinct attribute
     ctx.engine
-        .update_settings("movies", &Settings {
-            distinct_attribute: Some("year".to_string()),
-            ..Default::default()
-        })
+        .update_settings(
+            "movies",
+            &serde_json::from_value::<wilysearch::types::Settings>(serde_json::json!({
+                "distinctAttribute": "year".to_string(),
+
+            }))
+            .unwrap(),
+        )
         .expect("failed to update settings");
 
     let result = ctx
         .engine
-        .search("movies", &SearchRequest {
-            distinct: Some("year".to_string()),
-            limit: Some(20),
-            ..Default::default()
-        })
+        .search(
+            "movies",
+            &SearchRequest {
+                distinct: Some("year".to_string()),
+                limit: Some(20),
+                ..Default::default()
+            },
+        )
         .expect("search failed");
 
     let years: Vec<i64> = result
@@ -372,12 +420,15 @@ fn test_search_crop() {
 
     let result = ctx
         .engine
-        .search("books", &SearchRequest {
-            q: Some("dark".to_string()),
-            attributes_to_crop: Some(vec!["description".to_string()]),
-            crop_length: Some(5),
-            ..Default::default()
-        })
+        .search(
+            "books",
+            &SearchRequest {
+                q: Some("dark".to_string()),
+                attributes_to_crop: Some(vec!["description".to_string()]),
+                crop_length: Some(5),
+                ..Default::default()
+            },
+        )
         .expect("search failed");
 
     assert!(!result.hits.is_empty());
@@ -408,7 +459,11 @@ fn create_movies_and_books(ctx: &TestContext) {
         .expect("failed to create books index");
 
     ctx.engine
-        .add_or_replace_documents("books", &common::sample_books(), &AddDocumentsQuery::default())
+        .add_or_replace_documents(
+            "books",
+            &common::sample_books(),
+            &AddDocumentsQuery::default(),
+        )
         .expect("failed to add books");
 }
 
@@ -439,11 +494,17 @@ fn test_federated_multi_search_basic() {
         federation: Some(FederationSettings::default()),
     };
 
-    let result = ctx.engine.multi_search(&request).expect("federated search failed");
+    let result = ctx
+        .engine
+        .multi_search(&request)
+        .expect("federated search failed");
 
     match result {
         MultiSearchResult::Federated(fed) => {
-            assert!(!fed.hits.is_empty(), "expected merged hits from both indexes");
+            assert!(
+                !fed.hits.is_empty(),
+                "expected merged hits from both indexes"
+            );
             // Default pagination uses offset/limit
             assert!(fed.offset.is_some() || fed.limit.is_some());
         }
@@ -468,6 +529,7 @@ fn test_federated_multi_search_with_weights() {
                     ..Default::default()
                 },
                 federation_options: Some(FederationQueryOptions {
+                    remote: None,
                     weight: Some(0.1),
                     query_position: None,
                 }),
@@ -479,6 +541,7 @@ fn test_federated_multi_search_with_weights() {
                     ..Default::default()
                 },
                 federation_options: Some(FederationQueryOptions {
+                    remote: None,
                     weight: Some(10.0),
                     query_position: None,
                 }),
@@ -487,7 +550,10 @@ fn test_federated_multi_search_with_weights() {
         federation: Some(FederationSettings::default()),
     };
 
-    let result = ctx.engine.multi_search(&request).expect("federated search failed");
+    let result = ctx
+        .engine
+        .multi_search(&request)
+        .expect("federated search failed");
 
     match result {
         MultiSearchResult::Federated(fed) => {
@@ -524,18 +590,28 @@ fn test_federated_multi_search_pagination() {
                 federation_options: None,
             },
         ],
-        federation: Some(FederationSettings {
-            page: Some(1),
-            hits_per_page: Some(3),
-            ..Default::default()
-        }),
+        federation: Some(
+            serde_json::from_value::<FederationSettings>(serde_json::json!({
+                "page": 1,
+                "hitsPerPage": 3,
+
+            }))
+            .unwrap(),
+        ),
     };
 
-    let result = ctx.engine.multi_search(&request).expect("federated search failed");
+    let result = ctx
+        .engine
+        .multi_search(&request)
+        .expect("federated search failed");
 
     match result {
         MultiSearchResult::Federated(fed) => {
-            assert!(fed.hits.len() <= 3, "expected at most 3 hits, got {}", fed.hits.len());
+            assert!(
+                fed.hits.len() <= 3,
+                "expected at most 3 hits, got {}",
+                fed.hits.len()
+            );
             assert_eq!(fed.page, Some(1));
             assert_eq!(fed.hits_per_page, Some(3));
             assert!(fed.total_hits.is_some());
@@ -548,28 +624,36 @@ fn test_federated_multi_search_pagination() {
 
     // Offset/limit pagination
     let request2 = MultiSearchRequest {
-        queries: vec![
-            MultiSearchQuery {
-                index_uid: "movies".to_string(),
-                search: SearchRequest {
-                    q: Some("the".to_string()),
-                    ..Default::default()
-                },
-                federation_options: None,
+        queries: vec![MultiSearchQuery {
+            index_uid: "movies".to_string(),
+            search: SearchRequest {
+                q: Some("the".to_string()),
+                ..Default::default()
             },
-        ],
-        federation: Some(FederationSettings {
-            limit: Some(2),
-            offset: Some(1),
-            ..Default::default()
-        }),
+            federation_options: None,
+        }],
+        federation: Some(
+            serde_json::from_value::<FederationSettings>(serde_json::json!({
+                "limit": 2,
+                "offset": 1,
+
+            }))
+            .unwrap(),
+        ),
     };
 
-    let result2 = ctx.engine.multi_search(&request2).expect("federated search failed");
+    let result2 = ctx
+        .engine
+        .multi_search(&request2)
+        .expect("federated search failed");
 
     match result2 {
         MultiSearchResult::Federated(fed) => {
-            assert!(fed.hits.len() <= 2, "expected at most 2 hits, got {}", fed.hits.len());
+            assert!(
+                fed.hits.len() <= 2,
+                "expected at most 2 hits, got {}",
+                fed.hits.len()
+            );
             assert_eq!(fed.offset, Some(1));
             assert_eq!(fed.limit, Some(2));
             assert!(fed.estimated_total_hits.is_some());
@@ -597,7 +681,10 @@ fn test_federated_multi_search_single_index() {
         federation: Some(FederationSettings::default()),
     };
 
-    let result = ctx.engine.multi_search(&request).expect("federated search failed");
+    let result = ctx
+        .engine
+        .multi_search(&request)
+        .expect("federated search failed");
 
     match result {
         MultiSearchResult::Federated(fed) => {
@@ -636,13 +723,26 @@ fn test_non_federated_multi_search_returns_per_index() {
         federation: None,
     };
 
-    let result = ctx.engine.multi_search(&request).expect("multi_search failed");
+    let result = ctx
+        .engine
+        .multi_search(&request)
+        .expect("multi_search failed");
 
     match result {
         MultiSearchResult::PerIndex(per_index) => {
-            assert_eq!(per_index.results.len(), 2, "expected 2 per-index result sets");
-            assert!(!per_index.results[0].hits.is_empty(), "movies should have hits for 'dark'");
-            assert!(!per_index.results[1].hits.is_empty(), "books should have hits for 'great'");
+            assert_eq!(
+                per_index.results.len(),
+                2,
+                "expected 2 per-index result sets"
+            );
+            assert!(
+                !per_index.results[0].hits.is_empty(),
+                "movies should have hits for 'dark'"
+            );
+            assert!(
+                !per_index.results[1].hits.is_empty(),
+                "books should have hits for 'great'"
+            );
         }
         MultiSearchResult::Federated(_) => {
             panic!("expected PerIndex variant, got Federated");

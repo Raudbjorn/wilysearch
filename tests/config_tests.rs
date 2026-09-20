@@ -6,8 +6,8 @@
 
 mod common;
 
-use figment::providers::Format;
 use figment::Figment;
+use figment::providers::Format;
 use tempfile::TempDir;
 use wilysearch::config::*;
 use wilysearch::engine::Engine;
@@ -51,7 +51,10 @@ fn test_engine_with_default_config() {
             },
         )
         .expect("search failed");
-    assert!(!results.hits.is_empty(), "search should return at least one hit");
+    assert!(
+        !results.hits.is_empty(),
+        "search should return at least one hit"
+    );
 }
 
 // ─── Test 2: Engine from config file ────────────────────────────────────────
@@ -297,7 +300,10 @@ fn test_reference_toml_parses() {
     );
 
     // Experimental flags should all be false (off by default)
-    assert!(!config.experimental.metrics, "reference TOML metrics should be false");
+    assert!(
+        !config.experimental.metrics,
+        "reference TOML metrics should be false"
+    );
     assert!(
         !config.experimental.logs_route,
         "reference TOML logs_route should be false"
@@ -307,7 +313,9 @@ fn test_reference_toml_parses() {
         "reference TOML contains_filter should be false"
     );
 
-    config.validate().expect("reference TOML should pass validation");
+    config
+        .validate()
+        .expect("reference TOML should pass validation");
 }
 
 // ─── Additional config integration tests ────────────────────────────────────
@@ -378,16 +386,20 @@ fn test_engine_config_converts_to_meilisearch_options() {
     use wilysearch::core::MeilisearchOptions;
 
     let temp = TempDir::new().unwrap();
-    let ec = EngineConfig {
-        db_path: temp.path().to_path_buf(),
-        max_index_size: 200 * 1024 * 1024,
-        max_task_db_size: 20 * 1024 * 1024,
-    };
-
-    let opts: MeilisearchOptions = ec.into();
-    assert_eq!(opts.db_path, temp.path().to_path_buf());
-    assert_eq!(opts.max_index_size, 200 * 1024 * 1024);
-    assert_eq!(opts.max_task_db_size, 20 * 1024 * 1024);
+    assert!(!EngineConfig::default().allow_local_provider_urls);
+    for allow_local_provider_urls in [false, true] {
+        let ec = EngineConfig {
+            allow_local_provider_urls,
+            db_path: temp.path().to_path_buf(),
+            max_index_size: 200 * 1024 * 1024,
+            max_task_db_size: 20 * 1024 * 1024,
+        };
+        let opts: MeilisearchOptions = ec.into();
+        assert_eq!(opts.db_path, temp.path().to_path_buf());
+        assert_eq!(opts.max_index_size, 200 * 1024 * 1024);
+        assert_eq!(opts.max_task_db_size, 20 * 1024 * 1024);
+        assert_eq!(opts.allow_local_provider_urls, allow_local_provider_urls);
+    }
 }
 
 /// Verify that a config built programmatically can be used as a figment
@@ -398,6 +410,7 @@ fn test_config_provider_round_trip() {
 
     let original = WilysearchConfig {
         engine: EngineConfig {
+            allow_local_provider_urls: false,
             db_path: "/round/trip/test".into(),
             max_index_size: 555,
             max_task_db_size: 111,
@@ -447,8 +460,7 @@ vector_store_setting = true
 "#;
     std::fs::write(&config_path, toml_content).expect("failed to write config");
 
-    let config =
-        WilysearchConfig::from_file(&config_path).expect("experimental TOML should parse");
+    let config = WilysearchConfig::from_file(&config_path).expect("experimental TOML should parse");
 
     assert!(config.experimental.metrics);
     assert!(config.experimental.logs_route);

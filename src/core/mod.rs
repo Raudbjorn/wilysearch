@@ -11,6 +11,7 @@ pub mod preprocessing;
 pub mod rag;
 pub mod search;
 pub mod settings;
+pub mod storage;
 pub mod vector;
 
 pub use error::{Error, Result};
@@ -21,16 +22,16 @@ pub use meilisearch::{
 };
 pub use options::MeilisearchOptions;
 pub use preprocessing::{
-    build_default_ttrpg_synonyms, CorrectionRecord, ExpandedQuery, ExpansionInfo, PipelineConfig,
-    PreprocessingResult, ProcessedQuery, QueryPipeline, QueryPipelineBuilder, SynonymConfig,
-    SynonymMap, SynonymType, TypoConfig, TypoCorrector,
+    CorrectionRecord, ExpandedQuery, ExpansionInfo, PipelineConfig, PreprocessingResult,
+    ProcessedQuery, QueryPipeline, QueryPipelineBuilder, SynonymConfig, SynonymMap, SynonymType,
+    TypoConfig, TypoCorrector, build_default_ttrpg_synonyms,
 };
 pub use search::{
     ComputedFacets, FacetHit, FacetSearchQuery, FacetSearchResult, FacetStats,
     FederatedMultiSearchQuery, FederatedSearchResult, Federation, FederationOptions,
-    GetDocumentsOptions, HitsInfo, HybridQuery, HybridSearchQuery, HybridSearchResult,
-    MatchBounds, MatchingStrategy, MergeFacets, MultiSearchQuery, MultiSearchResult,
-    SearchHit, SearchQuery, SearchResult, SearchResultWithIndex, SimilarQuery, SimilarResult,
+    GetDocumentsOptions, HitsInfo, HybridQuery, HybridSearchQuery, HybridSearchResult, MatchBounds,
+    MatchingStrategy, MergeFacets, MultiSearchQuery, MultiSearchResult, SearchHit, SearchQuery,
+    SearchResult, SearchResultWithIndex, SimilarQuery, SimilarResult,
 };
 pub use settings::{
     EmbedderSettings, EmbedderSource, FacetValuesSort, FacetingSettings, LocalizedAttributeRule,
@@ -41,11 +42,11 @@ pub use vector::{InMemoryVectorStore, NoOpVectorStore, VectorStore};
 #[cfg(feature = "surrealdb")]
 pub use vector::{SurrealDbVectorStore, SurrealDbVectorStoreConfig};
 
-pub use rag::{
-    Embedder, Generator, RagPipeline, RagPipelineBuilder, RagResponse, Reranker,
-    RetrievalQuery, RetrievalResult, Retriever, SearchType,
-};
 pub use rag::PipelineConfig as RagPipelineConfig;
+pub use rag::{
+    Embedder, Generator, RagPipeline, RagPipelineBuilder, RagResponse, Reranker, RetrievalQuery,
+    RetrievalResult, Retriever, SearchType,
+};
 
 /// Return the current UTC time as an RFC 3339 / ISO 8601 string.
 ///
